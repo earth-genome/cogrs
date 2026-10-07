@@ -403,3 +403,73 @@ async fn fully_covered_tiles_do_not_over_fetch() {
     assert!(whole.tiles_read + tile.tiles_read >= 64);
     assert!(whole.pixels.iter().all(|v| !v.is_nan()));
 }
+
+// --- Overviews whose size ratio is not an integer ---
+
+/// A 1030 x 770 raster whose pixel value is its full-resolution column (band 0). Overviews are
+/// 515 x 385, 258 x 193 and 129 x 97, so their ratios (7.984 and 7.938 for the /8 level) are not
+/// integers and differ per axis. Overview pixel `j` holds the value of full-resolution column
+/// `j * 2^level` (the encoder decimates).
+fn odd_size_spec() -> CogSpec {
+    let mut spec = patch_spec(3857, (0.0, 7700.0), 10.0, 1030, 64);
+    spec.height = 770;
+    spec.overviews = 3;
+    spec.pixel = |_, x, _| x as f64;
+    spec
+}
+
+#[tokio::test(start_paused = true)]
+async fn overview_with_a_non_integer_ratio_maps_geo_locations_correctly() {
+    let spec = odd_size_spec();
+    let reader = CogReader::from_reader_with_hint(
+        Arc::new(MemoryRangeReader::new(build_cog(&spec), "mem://plan/odd-size".to_string())),
+        OverviewQualityHint::AllUsable,
+    )
+    .unwrap();
+    let o = &reader.overviews[2];
+    assert_eq!((o.width, o.height), (129, 97));
+    assert!((o.scale_x - 1030.0 / 129.0).abs() < 1e-12 && (o.scale_y - 770.0 / 97.0).abs() < 1e-12);
+    assert_ne!(o.scale_x, o.scale_y, "ratios differ per axis");
+    assert_eq!(o.scale, 8);
+
+    // An output tile twice the raster's size is served from the /8 overview.
+    let (minx, maxx) = (-5665.0, 15965.0);
+    let maxy = 7700.0 + 5665.0;
+    let bounds = BoundingBox::new(minx, maxy - (maxx - minx), maxx, maxy);
+    let tile = TileExtractor::new(&reader).bounds(bounds).size(256).extract().await.unwrap();
+    assert_eq!(tile.overview_used, Some(2));
+
+    // Every output pixel reads the full-resolution column of its geo location, to within the
+    // overview's own quantisation (8 columns); the former integer scale (7 instead of 7.984)
+    // put pixels up to ~127 columns off.
+    let rx = (maxx - minx) / 256.0;
+    let (mut checked, mut worst) = (0, 0.0f64);
+    for oy in 0..256 {
+        for ox in 0..256 {
+            let cx = minx + (ox as f64 + 0.5) * rx;
+            let column = cx / 10.0;
+            let row = (7700.0 - (maxy - (oy as f64 + 0.5) * rx)) / 10.0;
+            let v = tile.pixels[oy * 256 + ox];
+            if (20.0..1000.0).contains(&column) && (5.0..765.0).contains(&row) {
+                assert!(!v.is_nan(), "pixel ({ox},{oy}) at column {column:.1} is fill");
+                worst = worst.max(f64::from(v - column as f32).abs());
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 2000, "only {checked} pixels checked");
+    assert!(worst <= 12.0, "worst column error {worst}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn overview_selection_uses_the_exact_ratio() {
+    let spec = odd_size_spec();
+    let reader = CogReader::from_reader_with_hint(
+        Arc::new(MemoryRangeReader::new(build_cog(&spec), "mem://plan/odd-size-select".to_string())),
+        OverviewQualityHint::AllUsable,
+    )
+    .unwrap();
+    // The /8 level is 7.984 full-resolution pixels per pixel: not usable below that, usable from it.
+    assert_eq!(reader.best_overview_for_resolution((7.95 * 256.0) as usize, 1), Some(1));
+    assert_eq!(reader.best_overview_for_resolution((8.0 * 256.0) as usize, 1), Some(2));
+}

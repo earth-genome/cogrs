@@ -1650,16 +1650,14 @@ fn level_params(
     // Get effective metadata for the level we're using
     let (eff_width, eff_height, eff_tile_width, eff_tile_height, eff_tiles_across, scale_factor) = if let Some(ovr_idx) = overview_idx {
         let ovr = &reader.overviews[ovr_idx];
-        // Scale factor is small (typically 2, 4, 8, etc.), so precision loss is acceptable
-        #[allow(clippy::cast_precision_loss)]
-        let ovr_scale = ovr.scale as f64;
-        (ovr.width, ovr.height, ovr.tile_width, ovr.tile_height, ovr.tiles_across, ovr_scale)
+        (ovr.width, ovr.height, ovr.tile_width, ovr.tile_height, ovr.tiles_across, (ovr.scale_x, ovr.scale_y))
     } else {
-        (metadata.width, metadata.height, metadata.tile_width, metadata.tile_height, metadata.tiles_across, 1.0)
+        (metadata.width, metadata.height, metadata.tile_width, metadata.tile_height, metadata.tiles_across, (1.0, 1.0))
     };
 
-    // Adjust scale for overview level
-    let scale = [base_scale[0] * scale_factor, base_scale[1] * scale_factor, base_scale[2]];
+    // Overview pixel size is the full-resolution pixel size times the exact (per-axis) ratio of
+    // the sizes, i.e. extent / overview size as GDAL derives it
+    let scale = [base_scale[0] * scale_factor.0, base_scale[1] * scale_factor.1, base_scale[2]];
 
     // Output tile pixel resolution in the output CRS
     #[allow(clippy::cast_precision_loss)]

@@ -297,8 +297,17 @@ pub struct OverviewMetadata {
     pub tiles_down: usize,
     pub tile_offsets: Vec<u64>,
     pub tile_byte_counts: Vec<u64>,
-    /// Scale factor relative to full resolution (2, 4, 8, etc.)
+    /// Approximate integer scale factor relative to full resolution (2, 4, 8, ...): the x ratio
+    /// `full_width / width` rounded to the nearest integer. Informational only; every coordinate
+    /// mapping uses the exact [`scale_x`](Self::scale_x) / [`scale_y`](Self::scale_y).
     pub scale: usize,
+    /// Exact ratio of full-resolution width to this overview's width (e.g. `10980 / 1373`). An
+    /// overview pixel is `scale_x` full-resolution pixels wide, as in GDAL, which derives an
+    /// overview's geotransform as `extent / overview size`.
+    pub scale_x: f64,
+    /// Exact ratio of full-resolution height to this overview's height. Can differ from
+    /// `scale_x` when the two dimensions round differently.
+    pub scale_y: f64,
 }
 
 impl OverviewMetadata {
@@ -757,7 +766,7 @@ impl CogReader {
         // We want the overview with the largest scale that's still <= needed_scale
         // (i.e., the smallest overview that still has enough detail)
         let mut best_idx = None;
-        let mut best_scale = 0usize;
+        let mut best_scale = 0.0f64;
 
         for (idx, ovr) in self.overviews.iter().enumerate() {
             // Skip overviews that have been determined to have insufficient data
@@ -772,10 +781,10 @@ impl CogReader {
             // We can use it if the overview has at least as many pixels as we need
             // needed_scale = extent_pixels / output_pixels
             // If needed_scale = 84 and overview scale = 64, overview has enough resolution
-            // Safe cast: needed_scale is always positive (checked above) and represents overview scale (<1000)
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            if ovr.scale <= (needed_scale as usize) && ovr.scale > best_scale {
-                best_scale = ovr.scale;
+            // (the coarser axis decides)
+            let ovr_scale = ovr.scale_x.max(ovr.scale_y);
+            if ovr_scale <= needed_scale && ovr_scale > best_scale {
+                best_scale = ovr_scale;
                 best_idx = Some(idx);
             }
         }
@@ -1255,16 +1264,18 @@ async fn parse_cog_structure(io: &dyn AsyncRangeReader) -> AnyResult<CogStructur
     .await;
 
     // An overview that cannot be parsed ends the chain (it and the ones after it are dropped).
-    let full_width = metadata.width;
+    let (full_width, full_height) = (metadata.width, metadata.height);
     let mut overviews = Vec::with_capacity(headers.len());
     for ((header, _), arrays) in headers.into_iter().zip(arrays) {
         let Ok((tile_offsets, tile_byte_counts)) = arrays else {
             break;
         };
-        // Calculate actual scale from dimensions using floor division
-        // This matches GDAL's behavior: scale = full_width / ovr_width
-        // For 20966/1310 this gives 16, not 17 (ceiling would be wrong)
-        let actual_scale = full_width / header.width;
+        // Exact per-axis ratios, as GDAL derives an overview's geotransform (extent / size):
+        // 10980 / 1373 is 7.997 (a rounded-up overview of a /8 level), not 7.
+        #[allow(clippy::cast_precision_loss)]
+        let (scale_x, scale_y) = (full_width as f64 / header.width as f64, full_height as f64 / header.height as f64);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let approx_scale = scale_x.round() as usize;
         overviews.push(OverviewMetadata {
             width: header.width,
             height: header.height,
@@ -1274,7 +1285,9 @@ async fn parse_cog_structure(io: &dyn AsyncRangeReader) -> AnyResult<CogStructur
             tiles_down: header.tiles_down,
             tile_offsets,
             tile_byte_counts,
-            scale: actual_scale,
+            scale: approx_scale,
+            scale_x,
+            scale_y,
         });
     }
 
@@ -1496,7 +1509,7 @@ fn parse_overview_header(tags: &HashMap<u16, IfdEntry>, little_endian: bool) -> 
         .ok_or("Overview missing TileWidth tag")? as usize;
     let tile_height = get_tag_value(tags, TAG_TILE_LENGTH, little_endian)
         .ok_or("Overview missing TileLength tag")? as usize;
-    if width == 0 || tile_width == 0 || tile_height == 0 {
+    if width == 0 || height == 0 || tile_width == 0 || tile_height == 0 {
         return Err("Overview has a zero dimension".into());
     }
 
@@ -2878,16 +2891,15 @@ fn test_gray_3857_crs_detection() {
     assert_eq!(reader.metadata.crs_code, Some(3857), "CRS should be detected as 3857");
 }
 
-/// TEST: Overview scale calculation uses FLOOR division
+/// TEST: Overview geometry and pixel values match GDAL
 ///
-/// This test catches the bug where we used ceiling division instead of floor.
-/// For gray_3857-cog.tif (20966x20966), overview 3 (1310x1310):
-/// - WRONG (ceiling): (20966 + 1310 - 1) / 1310 = 17
-/// - CORRECT (floor): 20966 / 1310 = 16
-///
-/// The scale affects coordinate calculations, causing ~6% pixel position errors.
+/// An overview's pixel size is the full-resolution pixel size times `full_size / overview_size`
+/// per axis (GDAL derives an overview's geotransform as `extent / overview size`); that ratio is
+/// generally not an integer (gray_3857-cog.tif: 20966 / 1310 = 16.005, and a /8 level of a
+/// 10980 px scene is 1373 px wide, 7.997). Compares sizes, ratios and sampled pixel values of
+/// every overview with GDAL.
 #[test]
-fn test_overview_scale_uses_floor_division() {
+fn test_overview_geometry_matches_gdal() {
     let path = "data/grayscale/gray_3857-cog.tif";
     if !std::path::Path::new(path).exists() {
         println!("Skipping - file not found: {}", path);
@@ -2895,43 +2907,50 @@ fn test_overview_scale_uses_floor_division() {
     }
 
     let reader = CogReader::open(path).expect("Failed to open COG");
+    let ds = gdal::Dataset::open(path).expect("GDAL failed to open");
+    let band = ds.rasterband(1).expect("Failed to get band 1");
+    let (full_w, full_h) = band.size();
+    let gdal_gt = ds.geo_transform().expect("geotransform");
+    let pixel_scale = reader.metadata.geo_transform.pixel_scale.expect("pixel scale");
 
-    // Verify we have overviews
     assert!(!reader.overviews.is_empty(), "Should have overviews");
-
-    // Check that scale calculation matches GDAL behavior (floor division)
-    let full_width = reader.metadata.width;
+    assert_eq!(band.overview_count().expect("overview count") as usize, reader.overviews.len());
 
     for (i, ovr) in reader.overviews.iter().enumerate() {
-        // Calculate expected scale using floor division (GDAL's method)
-        let expected_scale = full_width / ovr.width;
+        let gdal_ovr = band.overview(i).expect("GDAL overview");
+        let (gw, gh) = gdal_ovr.size();
+        assert_eq!((ovr.width, ovr.height), (gw, gh), "overview {i} size");
 
-        // Verify our scale matches
-        assert_eq!(
-            ovr.scale, expected_scale,
-            "Overview {} scale mismatch: got {}, expected {} (floor of {}/{})",
-            i, ovr.scale, expected_scale, full_width, ovr.width
-        );
+        // Exact per-axis ratios; the integer `scale` is just their rounding.
+        assert!((ovr.scale_x - full_w as f64 / gw as f64).abs() < 1e-12, "overview {i} scale_x");
+        assert!((ovr.scale_y - full_h as f64 / gh as f64).abs() < 1e-12, "overview {i} scale_y");
+        assert_eq!(ovr.scale, ovr.scale_x.round() as usize, "overview {i} integer scale");
 
-        // Also verify it's NOT using ceiling division
-        let ceiling_scale = full_width.div_ceil(ovr.width);
-        if ceiling_scale != expected_scale {
-            // If ceiling would give different result, make sure we're using floor
-            assert_ne!(
-                ovr.scale, ceiling_scale,
-                "Overview {} appears to use ceiling division (got {}), should use floor ({})",
-                i, ceiling_scale, expected_scale
-            );
+        // Overview pixel size = GDAL's extent / overview size
+        let gdal_pixel_x = gdal_gt[1].abs() * full_w as f64 / gw as f64;
+        let gdal_pixel_y = gdal_gt[5].abs() * full_h as f64 / gh as f64;
+        assert!((pixel_scale[0] * ovr.scale_x - gdal_pixel_x).abs() < 1e-6 * gdal_pixel_x, "overview {i} pixel width");
+        assert!((pixel_scale[1] * ovr.scale_y - gdal_pixel_y).abs() < 1e-6 * gdal_pixel_y, "overview {i} pixel height");
+
+        // Sampled pixels decode to GDAL's values
+        for fx in [0.03, 0.31, 0.5, 0.77, 0.97] {
+            for fy in [0.04, 0.45, 0.66, 0.95] {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let (px, py) = ((fx * gw as f64) as usize, (fy * gh as f64) as usize);
+                let want: gdal::raster::Buffer<f32> =
+                    gdal_ovr.read_as((px as isize, py as isize), (1, 1), (1, 1), None).expect("GDAL read");
+                let tile_index = ovr.tile_index_for_pixel(px, py).expect("pixel in overview");
+                let tile = reader.read_overview_tile(i, tile_index).expect("overview tile");
+                let got = tile[(py % ovr.tile_height) * ovr.tile_width + px % ovr.tile_width];
+                assert!((got - want.data()[0]).abs() < 0.001, "overview {i} pixel ({px},{py}): ours {got}, GDAL {}", want.data()[0]);
+            }
         }
     }
 
-    // Specific check for overview 3 which caused the original bug
-    if reader.overviews.len() > 3 {
-        let ovr3 = &reader.overviews[3];
-        assert_eq!(
-            ovr3.scale, 16,
-            "Overview 3 (1310x1310) scale should be 16 (floor), not 17 (ceiling)"
-        );
+    // gray_3857: overview 3 is 1310 px, ratio 16.005 (rounds to 16)
+    if let Some(ovr3) = reader.overviews.get(3) {
+        assert_eq!(ovr3.scale, 16);
+        assert!((ovr3.scale_x - 20966.0 / 1310.0).abs() < 1e-12);
     }
 }
 
@@ -3010,16 +3029,13 @@ fn test_scale_factor_coordinate_mapping() {
 
         for (i, ovr) in reader.overviews.iter().enumerate() {
             // Calculate effective scale for this overview
-            let effective_scale_x = base_scale_x * (ovr.scale as f64);
+            // Effective pixel size of this overview: exactly full extent / overview width
+            let effective_scale_x = base_scale_x * ovr.scale_x;
 
-            // The effective scale should roughly equal full_extent / overview_width
-            // For a COG covering ~20 million meters in 1310 pixels at overview 3:
-            // effective_scale ≈ 20e6 / 1310 ≈ 15267 meters/pixel
             let full_extent_x = base_scale_x * (reader.metadata.width as f64);
             let expected_effective_scale = full_extent_x / (ovr.width as f64);
 
-            // Allow 1% tolerance for rounding
-            let tolerance = expected_effective_scale * 0.01;
+            let tolerance = expected_effective_scale * 1e-9;
             assert!(
                 (effective_scale_x - expected_effective_scale).abs() < tolerance,
                 "Overview {} effective scale mismatch: got {}, expected {} (within {})",

@@ -356,6 +356,30 @@ fn u16_utm_spec() -> CogSpec {
     }
 }
 
+/// 1030 x 770: the /2, /4 and /8 overviews are 515x385, 258x193 and 129x97, so their size
+/// ratios are not integers and differ per axis (7.984 and 7.938 at /8).
+fn odd_size_spec() -> CogSpec {
+    let ext = BoundingBox::from_xyz(3, 2, 3);
+    let px = (ext.maxx - ext.minx) / 1030.0;
+    CogSpec {
+        width: 1030,
+        height: 770,
+        tile: 64,
+        bands: 1,
+        sample: Sample::U16,
+        deflate: true,
+        predictor: false,
+        epsg: 3857,
+        origin: (ext.minx, ext.maxy),
+        pixel_size: (px, px),
+        nodata: None,
+        overviews: 3,
+        sparse: vec![],
+        corrupt: vec![],
+        pixel: |_, x, y| ((x * 7 + y * 13) % 4000) as f64 + 1.0,
+    }
+}
+
 fn corrupt_spec() -> CogSpec {
     let ext = BoundingBox::from_xyz(3, 2, 3);
     let px = (ext.maxx - ext.minx) / 256.0;
@@ -449,6 +473,17 @@ async fn golden_synthetic() {
     record_tile_reads(&mut g, case, &r);
     record_samples(&mut g, case, &r, &[(-122.4, 37.8), (-122.3, 37.75)], &[(32610, 550_000.0, 4_190_000.0)]);
     record_reproject(&mut g, case, &r, 4326, (64, 64)).await;
+
+    // --- overviews with non-integer size ratios -----------------------------------------------
+    let case = "u16_odd_size_overviews";
+    let r = open_memory(case, &odd_size_spec(), OverviewQualityHint::AllUsable);
+    record_metadata(&mut g, case, &r);
+    for (i, o) in r.overviews.iter().enumerate() {
+        g.rec(format!("{case}/ratio{i}"), format!("{}x{} scale={} x={:.9} y={:.9}", o.width, o.height, o.scale, o.scale_x, o.scale_y));
+    }
+    let tiles = [(2, 1, 1), (3, 2, 3), (4, 4, 6), (4, 5, 7), (5, 8, 12), (5, 9, 13)];
+    record_extracts(&mut g, case, &r, &tiles, &[]).await;
+    record_tile_reads(&mut g, case, &r);
 
     // --- read errors keep their text ----------------------------------------------------------
     let case = "corrupt_tile";
