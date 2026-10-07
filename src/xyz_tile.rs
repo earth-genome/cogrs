@@ -55,10 +55,14 @@ pub enum ResamplingMethod {
     #[default]
     Nearest,
     /// Bilinear interpolation - smoother results, good balance of quality and speed.
-    /// Linearly interpolates between the 4 nearest source pixels.
+    /// Linearly interpolates between the 4 nearest source pixels. Where an output pixel
+    /// covers more than about one source pixel the kernel is stretched by that ratio
+    /// (anti-aliasing, like `gdalwarp`), so it reads proportionally more source pixels.
     Bilinear,
     /// Bicubic interpolation - highest quality, but slower.
-    /// Uses a 4x4 grid of source pixels with cubic weighting.
+    /// Uses a 4x4 grid of source pixels with cubic weighting (Mitchell-Netravali,
+    /// B = C = 1/3; `gdalwarp -r cubic` uses Catmull-Rom), stretched like [`Self::Bilinear`]
+    /// when downsampling.
     Bicubic,
 }
 
@@ -71,7 +75,10 @@ pub struct TileData {
     /// source tiles) hold [`TileData::nodata`] if the COG declares one, else
     /// `NaN`. With bilinear/bicubic resampling, any output pixel whose
     /// interpolation window touches `NaN`/nodata falls back to the nearest
-    /// source sample rather than blending it in.
+    /// source sample rather than blending it in. When downsampling (output pixels
+    /// covering more than about one source pixel) the window is much wider, so
+    /// `NaN`/nodata source pixels are left out and the rest renormalised instead,
+    /// unless the nearest source pixel itself is invalid: then that sample is kept.
     pub pixels: Vec<f32>,
     /// Number of bands (1 for grayscale, 3 for RGB, 4 for RGBA)
     pub bands: usize,
@@ -152,6 +159,75 @@ fn bicubic_weight(x: f64) -> f64 {
         B0 * x2 * x + B1 * x2 + B2 * x + B3
     } else {
         0.0
+    }
+}
+
+/// Bilinear (tent) weight: `1 - |x|` on `[-1, 1]`.
+#[inline(always)]
+fn bilinear_weight(x: f64) -> f64 {
+    (1.0 - x.abs()).max(0.0)
+}
+
+/// Kernel of one axis when an output pixel covers several source pixels.
+///
+/// GDAL's warper (`GDALWarpKernel::PerformWarp`, `alg/gdalwarpkernel.cpp`) stretches the
+/// resampling kernel by the downsampling ratio so it low-pass filters instead of sampling a
+/// fixed 2x2 / 4x4 footprint: `nXRadius = ceil(filter radius / scale)` and the weight of source
+/// pixel `i` is `kernel((i - x) * scale)` with `scale = dst size / src size < 1`, normalised by
+/// the sum of the weights of the taps used.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AxisKernel {
+    /// `min(1, output pixel size / source pixel size)`.
+    scale: f64,
+    /// Taps read on each side of the sample position: `ceil(support / scale)`.
+    radius: isize,
+}
+
+/// Scaled kernels of an extraction that downsamples with `Bilinear` or `Bicubic`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DownsampleKernel {
+    x: AxisKernel,
+    y: AxisKernel,
+}
+
+/// Below this scale on either axis GDAL leaves its fixed-footprint formulas and uses the scaled
+/// kernel (`bUse4SamplesFormula = dfXScale >= 0.95 && dfYScale >= 0.95`).
+const GDAL_FIXED_FOOTPRINT_MIN_SCALE: f64 = 0.95;
+
+/// GDAL's per-axis scale from the source pixels per output pixel `ratio`: `1` unless
+/// downsampling, and a ratio within `0.05` of a whole number snaps to it.
+fn axis_scale(ratio: f64) -> f64 {
+    if !ratio.is_finite() || ratio <= 1.0 {
+        return 1.0;
+    }
+    let whole = ratio.round();
+    if (ratio - whole).abs() < 0.05 { 1.0 / whole } else { 1.0 / ratio }
+}
+
+impl DownsampleKernel {
+    /// Kernel for `resampling` at `ratio` source pixels per output pixel on `(x, y)`; `None` when
+    /// the fixed-footprint interpolation applies (nearest, upsampling, or a ratio below ~1.05).
+    #[allow(clippy::cast_possible_truncation)]
+    fn new(ratio: [f64; 2], resampling: ResamplingMethod) -> Option<Self> {
+        let support = match resampling {
+            ResamplingMethod::Nearest => return None,
+            ResamplingMethod::Bilinear => 1.0,
+            ResamplingMethod::Bicubic => 2.0,
+        };
+        let (sx, sy) = (axis_scale(ratio[0]), axis_scale(ratio[1]));
+        if sx >= GDAL_FIXED_FOOTPRINT_MIN_SCALE && sy >= GDAL_FIXED_FOOTPRINT_MIN_SCALE {
+            return None;
+        }
+        let axis = |scale: f64| AxisKernel { scale, radius: (support / scale).ceil() as isize };
+        Some(Self { x: axis(sx), y: axis(sy) })
+    }
+
+    /// Source pixels `floor(v) + 1 - radius ..= floor(v) + radius` along an axis are weighted
+    /// (for an unscaled axis that is `floor(v)..=floor(v)+1` / `floor(v)-1..=floor(v)+2`).
+    #[allow(clippy::cast_possible_truncation)]
+    fn span(axis: AxisKernel, v: f64) -> (isize, isize) {
+        let f = v.floor() as isize;
+        (f + 1 - axis.radius, f + axis.radius)
     }
 }
 
@@ -1642,6 +1718,9 @@ struct ExtractionPlan {
     overview_idx: Option<usize>,
     /// Source tile indexes within the level selected by `overview_idx`, ascending.
     needed_tiles: Vec<usize>,
+    /// Scaled interpolation kernel when the output pixels cover several source pixels of the
+    /// level (`None` for nearest, upsampling and ratios below ~1.05).
+    kernel: Option<DownsampleKernel>,
     /// Where each output pixel samples the source level.
     mapping: SourceMapping,
 }
@@ -1747,6 +1826,10 @@ struct SourceMapping {
     /// `NaN` where the transform failed). `None` for the separable cases.
     ys: Option<Vec<f64>>,
     x: SourceX,
+    /// Source pixels of the level per output pixel on `(x, y)`: how much an output pixel
+    /// downsamples. Measured like GDAL's warp window: the span the whole tile maps to over the
+    /// tile size, so a rotated grid widens it.
+    ratio: [f64; 2],
 }
 
 /// Whether a pixel-centre coordinate lies inside the level: the level spans `[-0.5, size - 0.5]`
@@ -1764,26 +1847,36 @@ fn nearest_pixel(v: f64, size: usize) -> usize {
 
 /// First and last source pixel (clamped to the level) that `resampling` reads along one axis
 /// for pixel-centre coordinate `v`: the nearest pixel, the bilinear pair `floor(v)..=floor(v)+1`
-/// or the bicubic quad `floor(v)-1..=floor(v)+2`. Must match the taps in `render_extraction`.
+/// or the bicubic quad `floor(v)-1..=floor(v)+2` and, when `axis` carries a downsampling kernel,
+/// its widened footprint (`DownsampleKernel::span`). Must match the taps in `render_extraction`.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-fn tap_span(v: f64, size: usize, resampling: ResamplingMethod) -> (usize, usize) {
-    let (lo, hi) = match resampling {
-        ResamplingMethod::Nearest => {
+fn tap_span(v: f64, size: usize, resampling: ResamplingMethod, axis: Option<AxisKernel>) -> (usize, usize) {
+    let (lo, hi) = match (resampling, axis) {
+        (ResamplingMethod::Nearest, _) => {
             let n = nearest_pixel(v, size);
             return (n, n);
         }
-        ResamplingMethod::Bilinear => (0, 1),
-        ResamplingMethod::Bicubic => (-1, 2),
+        (_, Some(axis)) => DownsampleKernel::span(axis, v),
+        (ResamplingMethod::Bilinear, None) => (v.floor() as isize, v.floor() as isize + 1),
+        (ResamplingMethod::Bicubic, None) => (v.floor() as isize - 1, v.floor() as isize + 2),
     };
-    let f = v.floor() as isize;
     let clamp = |i: isize| i.max(0).min(size as isize - 1) as usize;
-    (clamp(f + lo), clamp(f + hi))
+    (clamp(lo), clamp(hi))
 }
 
 /// True when the source column of an output pixel needs one coordinate transform per pixel
 /// (anything but identity and the Web Mercator to WGS84 fast path).
 fn needs_per_pixel_x(output_crs: u32, source_epsg: u32) -> bool {
     output_crs != source_epsg && !(output_crs == EPSG_WEB_MERCATOR && source_epsg == EPSG_WGS84)
+}
+
+/// Source pixels per output pixel along an axis of `n` output pixels: the extent of the finite
+/// source coordinates `values` over the `n - 1` steps between output pixel centres; `1` when
+/// nothing maps or `n < 2`.
+#[allow(clippy::cast_precision_loss)]
+fn span_ratio(values: &[f64], n: usize) -> f64 {
+    let (min, max) = values.iter().filter(|v| v.is_finite()).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    if n < 2 || max < min { 1.0 } else { (max - min) / (n - 1) as f64 }
 }
 
 impl SourceMapping {
@@ -1794,19 +1887,18 @@ impl SourceMapping {
         let inv_scale_y = 1.0 / p.scale[1];
         let origin = p.origin;
 
-        // Source rows of all output rows, from the transform of the tile's left edge. Exact where
-        // a row does not depend on the column (3857 and 4326 sources); per-pixel transforms
-        // compute each pixel's own row below.
-        let rows: Vec<Option<f64>> = (0..height)
-            .map(|out_y| {
-                #[allow(clippy::cast_precision_loss)]
-                let merc_y = extent.maxy - (out_y as f64 + 0.5) * p.out_res_y;
-                let (_, world_y) = strategy.transform(extent.minx, merc_y).ok()?;
-                // corner-based `v`, shifted to pixel-centre coordinates
-                let src_pixel_y = (origin.1 - world_y) * inv_scale_y - 0.5;
-                within_level(src_pixel_y, p.eff_height).then_some(src_pixel_y)
-            })
-            .collect();
+        // Source row (pixel-centre coordinates) of an output row, from the transform of the
+        // tile's left edge. Exact where a row does not depend on the column (3857 and 4326
+        // sources); per-pixel transforms compute each pixel's own row below.
+        let row_coord = |out_y: usize| -> Option<f64> {
+            #[allow(clippy::cast_precision_loss)]
+            let merc_y = extent.maxy - (out_y as f64 + 0.5) * p.out_res_y;
+            let (_, world_y) = strategy.transform(extent.minx, merc_y).ok()?;
+            // corner-based `v`, shifted to pixel-centre coordinates
+            Some((origin.1 - world_y) * inv_scale_y - 0.5)
+        };
+        let rows: Vec<Option<f64>> =
+            (0..height).map(|out_y| row_coord(out_y).filter(|&v| within_level(v, p.eff_height))).collect();
 
         let mut per_pixel_ys = None;
         let x = match strategy {
@@ -1845,7 +1937,20 @@ impl SourceMapping {
                 SourceX::PerPixel(xs)
             }
         };
-        Self { rows, ys: per_pixel_ys, x }
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = match (&x, &per_pixel_ys) {
+            (SourceX::PerPixel(xs), Some(ys)) => [span_ratio(xs, width), span_ratio(ys, height)],
+            (SourceX::Linear { delta, .. }, _) => {
+                // rows are exact per row: the span between the first and last row centres
+                let ratio_y = match (row_coord(0), row_coord(height - 1)) {
+                    (Some(first), Some(last)) if height > 1 => (last - first).abs() / (height - 1) as f64,
+                    _ => 1.0,
+                };
+                [delta.abs(), ratio_y]
+            }
+            (SourceX::PerPixel(_), None) => [1.0, 1.0],
+        };
+        Self { rows, ys: per_pixel_ys, x, ratio }
     }
 
     /// Source row (pixel-centre coordinates) of output pixel `(out_x, out_y)`; `NaN` if it has none.
@@ -1867,21 +1972,23 @@ impl SourceMapping {
 
     /// Tiles of the level holding every source pixel `resampling` reads for an output pixel that
     /// samples inside the level (the nearest pixel for `Nearest`, the interpolation taps
-    /// otherwise), as indexes below `max_tile_count`, ascending.
+    /// otherwise, widened to the `kernel` footprint when downsampling), as indexes below
+    /// `max_tile_count`, ascending.
     fn needed_tiles(
         &self,
         tile_size: (usize, usize),
         p: &LevelParams,
         max_tile_count: usize,
         resampling: ResamplingMethod,
+        kernel: Option<DownsampleKernel>,
     ) -> Vec<usize> {
         let width = tile_size.0;
         let mut needed = vec![false; max_tile_count];
         // Tile columns/rows spanned by the taps, as `(first, last)`. Clamped taps stay contiguous,
         // so the tiles touched are exactly this rectangle.
         let tile_span = |x: f64, y: f64| {
-            let (x0, x1) = tap_span(x, p.eff_width, resampling);
-            let (y0, y1) = tap_span(y, p.eff_height, resampling);
+            let (x0, x1) = tap_span(x, p.eff_width, resampling, kernel.map(|k| k.x));
+            let (y0, y1) = tap_span(y, p.eff_height, resampling, kernel.map(|k| k.y));
             ((x0 / p.eff_tile_width, x1 / p.eff_tile_width), (y0 / p.eff_tile_height, y1 / p.eff_tile_height))
         };
         let mut mark = |(cols, rows): ((usize, usize), (usize, usize))| {
@@ -2024,7 +2131,8 @@ fn plan_extraction(
     } else {
         metadata.tile_offsets.len()
     };
-    let needed_tiles = mapping.needed_tiles(tile_size, &params, max_tile_count, resampling);
+    let kernel = DownsampleKernel::new(mapping.ratio, resampling);
+    let needed_tiles = mapping.needed_tiles(tile_size, &params, max_tile_count, resampling, kernel);
 
     Ok(ExtractionPlan {
         extent,
@@ -2033,6 +2141,7 @@ fn plan_extraction(
         selected_bands: bands,
         overview_idx,
         needed_tiles,
+        kernel,
         mapping,
     })
 }
@@ -2123,6 +2232,27 @@ fn render_extraction(
         tile_data.get(pixel_idx).copied()
     };
 
+    // Downsampling with bilinear/bicubic: the scaled kernel reads whole source footprints
+    let mut scaled = plan.kernel.map(|kernel| ScaledSampler {
+        tiles: &tile_data_cache,
+        resampling,
+        kernel,
+        size: (eff_width, eff_height),
+        tile: (eff_tile_width, eff_tile_height),
+        tiles_across: eff_tiles_across,
+        source_bands,
+        output_bands: &output_bands,
+        nodata: nodata_f32,
+        fill,
+        wx: Vec::new(),
+        wy: Vec::new(),
+        row_sum: Vec::new(),
+        row_weight: Vec::new(),
+        sum: Vec::new(),
+        weight: Vec::new(),
+        centre: Vec::new(),
+    });
+
     // Source row/column of every output pixel come from the plan (the same coordinates that
     // decided which source tiles were fetched).
 
@@ -2148,6 +2278,11 @@ fn render_extraction(
             let y0_floor = src_pixel_y.floor() as isize;
 
             let out_idx = (out_y * tile_size_x + out_x) * num_output_bands;
+
+            if let Some(sampler) = scaled.as_mut() {
+                sampler.sample(src_pixel_x, src_pixel_y, &mut pixel_data[out_idx..out_idx + num_output_bands]);
+                continue;
+            }
 
             // Nearest source pixel column (also the fallback for interpolation near invalid data)
             #[allow(clippy::cast_possible_truncation)]
@@ -2344,6 +2479,134 @@ fn bicubic_masked(
         }
     }
     if weight_sum > 0.0 { sum / weight_sum } else { fill }
+}
+
+/// Weights of the source pixels one scaled kernel reads along an axis, written to `out`
+/// (replacing its contents). Returns the first and last source pixel, clamped to the level (an
+/// empty range, `(1, 0)`, if none): taps outside the level are dropped, not replicated from the
+/// edge, and the sampler renormalises, as GDAL does.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+fn axis_weights(resampling: ResamplingMethod, axis: AxisKernel, v: f64, size: usize, out: &mut Vec<f64>) -> (usize, usize) {
+    let (first, last) = DownsampleKernel::span(axis, v);
+    let (lo, hi) = (first.max(0), last.min(size as isize - 1));
+    out.clear();
+    for i in lo..=hi {
+        let x = (i as f64 - v) * axis.scale;
+        out.push(match resampling {
+            ResamplingMethod::Bilinear => bilinear_weight(x),
+            _ => bicubic_weight(x),
+        });
+    }
+    if lo > hi { (1, 0) } else { (lo as usize, hi as usize) }
+}
+
+/// Bilinear / bicubic interpolation with a kernel stretched by the downsampling ratio (see
+/// [`AxisKernel`]): every valid source pixel inside the kernel footprint is weighted and the
+/// result is normalised by the weights actually used.
+///
+/// Invalid taps (`NaN`, nodata, unread tiles) are left out and the rest renormalised, which is
+/// what GDAL's masked warp does (`GWKResample` skips zero-density pixels and divides by the
+/// accumulated weight). The fixed-footprint path falls back to the nearest pixel instead, but a
+/// scaled footprint spans tens of pixels, so near any nodata edge that fallback would turn the
+/// edge into a staircase of nearest samples.
+struct ScaledSampler<'a> {
+    tiles: &'a ahash::AHashMap<usize, std::sync::Arc<Vec<f32>>>,
+    resampling: ResamplingMethod,
+    kernel: DownsampleKernel,
+    /// Level size, source tile size and tiles per row.
+    size: (usize, usize),
+    tile: (usize, usize),
+    tiles_across: usize,
+    source_bands: usize,
+    output_bands: &'a [usize],
+    nodata: Option<f32>,
+    fill: f32,
+    // Scratch, reused across pixels.
+    wx: Vec<f64>,
+    wy: Vec<f64>,
+    row_sum: Vec<f64>,
+    row_weight: Vec<f64>,
+    sum: Vec<f64>,
+    weight: Vec<f64>,
+    /// Per output band: `Some(value)` when the nearest source pixel is invalid.
+    centre: Vec<Option<f32>>,
+}
+
+/// A weight total below this means no usable data (GDAL: `dfAccumulatorWeight < 0.000001`).
+const MIN_KERNEL_WEIGHT: f64 = 0.000_001;
+
+impl ScaledSampler<'_> {
+    /// Interpolate every output band at source position `(vx, vy)` (pixel-centre coordinates)
+    /// into `out`, which holds one value per output band.
+    #[allow(clippy::cast_possible_truncation)]
+    fn sample(&mut self, vx: f64, vy: f64, out: &mut [f32]) {
+        let bands = self.output_bands.len();
+        let (x_lo, x_hi) = axis_weights(self.resampling, self.kernel.x, vx, self.size.0, &mut self.wx);
+        let (y_lo, y_hi) = axis_weights(self.resampling, self.kernel.y, vy, self.size.1, &mut self.wy);
+        let (tile_w, tile_h) = self.tile;
+        self.sum.clear();
+        self.sum.resize(bands, 0.0);
+        self.weight.clear();
+        self.weight.resize(bands, 0.0);
+
+        // GDAL never writes a pixel whose own (nearest) source pixel is nodata, however many
+        // valid pixels the kernel reaches: such a band gets that sample, or fill if its tile is
+        // missing. Without this the valid area would grow by half a kernel width at nodata edges.
+        let nearest = (nearest_pixel(vx, self.size.0), nearest_pixel(vy, self.size.1));
+        let tile = self.tiles.get(&(nearest.1 / tile_h * self.tiles_across + nearest.0 / tile_w));
+        let pixel = (nearest.1 % tile_h * tile_w + nearest.0 % tile_w) * self.source_bands;
+        self.centre.clear();
+        for &source_band in self.output_bands {
+            let sample = tile.and_then(|t| t.get(pixel + source_band)).copied();
+            self.centre.push(match sample {
+                Some(v) if is_invalid_sample(v, self.nodata) => Some(v),
+                Some(_) => None,
+                None => Some(self.fill),
+            });
+        }
+
+        for py in y_lo..=y_hi {
+            self.row_sum.clear();
+            self.row_sum.resize(bands, 0.0);
+            self.row_weight.clear();
+            self.row_weight.resize(bands, 0.0);
+            let (tile_row, row_base) = (py / tile_h, (py % tile_h) * tile_w);
+            // One tile lookup per run of taps inside the same source tile
+            let mut px = x_lo;
+            while px <= x_hi {
+                let tile_col = px / tile_w;
+                let run_end = x_hi.min((tile_col + 1) * tile_w - 1);
+                if let Some(tile) = self.tiles.get(&(tile_row * self.tiles_across + tile_col)) {
+                    for x in px..=run_end {
+                        let w = self.wx[x - x_lo];
+                        let pixel = (row_base + x - tile_col * tile_w) * self.source_bands;
+                        for (b, &source_band) in self.output_bands.iter().enumerate() {
+                            if let Some(&v) = tile.get(pixel + source_band)
+                                && !is_invalid_sample(v, self.nodata)
+                            {
+                                self.row_sum[b] += f64::from(v) * w;
+                                self.row_weight[b] += w;
+                            }
+                        }
+                    }
+                }
+                px = run_end + 1;
+            }
+            let wy = self.wy[py - y_lo];
+            for b in 0..bands {
+                self.sum[b] += wy * self.row_sum[b];
+                self.weight[b] += wy * self.row_weight[b];
+            }
+        }
+
+        for (b, value) in out.iter_mut().enumerate() {
+            *value = match self.centre[b] {
+                Some(passthrough) => passthrough,
+                None if self.weight[b] > MIN_KERNEL_WEIGHT => (self.sum[b] / self.weight[b]) as f32,
+                None => self.fill,
+            };
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3498,5 +3761,185 @@ mod global_cog_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod downsample_tests {
+    use super::*;
+    use ahash::AHashMap;
+    use std::sync::Arc;
+
+    fn kernel(ratio: [f64; 2], resampling: ResamplingMethod) -> Option<DownsampleKernel> {
+        DownsampleKernel::new(ratio, resampling)
+    }
+
+    #[test]
+    fn kernel_follows_gdalwarp_scale_rules() {
+        use ResamplingMethod::{Bicubic, Bilinear, Nearest};
+        // nearest never scales; upsampling and ratios below 1/0.95 keep the fixed footprint
+        assert_eq!(kernel([4.0, 4.0], Nearest), None);
+        for ratio in [0.3, 1.0, 1.04, 1.0526] {
+            assert_eq!(kernel([ratio, ratio], Bilinear), None, "ratio {ratio}");
+            assert_eq!(kernel([ratio, ratio], Bicubic), None, "ratio {ratio}");
+        }
+        // radius = ceil(support / scale): bilinear 1 / s, bicubic 2 / s
+        let k = kernel([2.5, 2.5], Bilinear).unwrap();
+        assert_eq!((k.x.scale, k.x.radius), (0.4, 3));
+        let k = kernel([2.5, 2.5], Bicubic).unwrap();
+        assert_eq!((k.x.scale, k.x.radius), (0.4, 5));
+        // a ratio within 0.05 of a whole number snaps to it
+        let k = kernel([2.03, 3.96], Bilinear).unwrap();
+        assert_eq!((k.x.scale, k.y.scale), (0.5, 0.25));
+        assert_eq!((k.x.radius, k.y.radius), (2, 4));
+        // one scaled axis switches the other to the general path, unscaled: support radius
+        let k = kernel([3.0, 1.0], Bicubic).unwrap();
+        assert_eq!((k.y.scale, k.y.radius), (1.0, 2));
+        assert_eq!(kernel([1.0, 3.0], Bilinear).unwrap().x.radius, 1);
+        // bad ratios never scale
+        assert_eq!(kernel([f64::NAN, f64::INFINITY], Bilinear), None);
+    }
+
+    #[test]
+    fn tap_span_covers_the_scaled_footprint() {
+        use ResamplingMethod::{Bicubic, Bilinear};
+        let k = kernel([4.0, 4.0], Bilinear).unwrap();
+        // floor(v) + 1 - radius ..= floor(v) + radius, clamped to the level
+        assert_eq!(tap_span(10.3, 100, Bilinear, Some(k.x)), (7, 14));
+        assert_eq!(tap_span(1.0, 100, Bilinear, Some(k.x)), (0, 5));
+        assert_eq!(tap_span(98.6, 100, Bilinear, Some(k.x)), (95, 99));
+        let k = kernel([4.0, 4.0], Bicubic).unwrap();
+        assert_eq!(tap_span(10.3, 100, Bicubic, Some(k.x)), (3, 18));
+        // without a kernel: the fixed pairs and quads
+        assert_eq!(tap_span(10.3, 100, Bilinear, None), (10, 11));
+        assert_eq!(tap_span(10.3, 100, Bicubic, None), (9, 12));
+        // an unscaled axis of a scaled extraction reads the same taps
+        let k = kernel([4.0, 1.0], Bicubic).unwrap();
+        assert_eq!(tap_span(10.3, 100, Bicubic, Some(k.y)), tap_span(10.3, 100, Bicubic, None));
+    }
+
+    /// 8x4 level in one tile, one band, value `x * x + 3 * y`.
+    fn level(nodata: Option<f32>) -> (AHashMap<usize, Arc<Vec<f32>>>, Option<f32>) {
+        let data: Vec<f32> = (0..4).flat_map(|y| (0..8).map(move |x| (x * x + 3 * y) as f32)).collect();
+        let mut tiles = AHashMap::new();
+        tiles.insert(0, Arc::new(data));
+        (tiles, nodata)
+    }
+
+    fn sample(tiles: &AHashMap<usize, Arc<Vec<f32>>>, nodata: Option<f32>, v: (f64, f64)) -> f32 {
+        let mut sampler = ScaledSampler {
+            tiles,
+            resampling: ResamplingMethod::Bilinear,
+            kernel: kernel([2.0, 2.0], ResamplingMethod::Bilinear).unwrap(),
+            size: (8, 4),
+            tile: (8, 4),
+            tiles_across: 1,
+            source_bands: 1,
+            output_bands: &[0],
+            nodata,
+            fill: -7.0,
+            wx: vec![],
+            wy: vec![],
+            row_sum: vec![],
+            row_weight: vec![],
+            sum: vec![],
+            weight: vec![],
+            centre: vec![],
+        };
+        let mut out = [0.0f32];
+        sampler.sample(v.0, v.1, &mut out);
+        out[0]
+    }
+
+    #[test]
+    fn scaled_bilinear_weights_a_stretched_tent() {
+        let (tiles, nodata) = level(None);
+        // ratio 2: scale 1/2, radius 2: taps 2..=5 weigh .25 .75 .75 .25 around x = 3.5 and
+        // 0..=3 weigh the same around y = 1.5: (4 * .25 + 9 * .75 + 16 * .75 + 25 * .25) / 2 = 13
+        // plus 3 * 1.5
+        assert!((sample(&tiles, nodata, (3.5, 1.5)) - 17.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn scaled_kernel_drops_taps_outside_the_level_and_renormalises() {
+        let (tiles, nodata) = level(None);
+        // x = 0: taps 0..=2 (left of it is outside the level) weigh 1, .5, 0: (0 + .5 + 0) / 1.5
+        // and y = 1.5 as above
+        assert!((sample(&tiles, nodata, (0.0, 1.5)) - (1.0 / 3.0 + 4.5)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn scaled_kernel_skips_invalid_taps_and_renormalises() {
+        let (mut tiles, _) = level(None);
+        // column 4 is NaN: the taps 2, 3, 5 weigh .3, .8, .2 around x = 3.4 (the nearest pixel, 3,
+        // is valid)
+        let data = Arc::make_mut(tiles.get_mut(&0).unwrap());
+        for y in 0..4 {
+            data[y * 8 + 4] = f32::NAN;
+        }
+        let got = sample(&tiles, None, (3.4, 1.5));
+        assert!((got - ((0.3 * 4.0 + 0.8 * 9.0 + 0.2 * 25.0) / 1.3 + 4.5)).abs() < 1e-4, "{got}");
+        // nodata is skipped the same way
+        let data = Arc::make_mut(tiles.get_mut(&0).unwrap());
+        for y in 0..4 {
+            data[y * 8 + 4] = -1.0;
+        }
+        assert!((sample(&tiles, Some(-1.0), (3.4, 1.5)) - got).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scaled_kernel_keeps_nodata_edges_where_the_nearest_pixel_is_invalid() {
+        let (mut tiles, _) = level(None);
+        let data = Arc::make_mut(tiles.get_mut(&0).unwrap());
+        for y in 0..4 {
+            data[y * 8 + 4] = -1.0;
+        }
+        // the nearest pixel (x = 4) is nodata: it is passed through, not blended from its valid
+        // neighbours
+        assert_eq!(sample(&tiles, Some(-1.0), (4.1, 1.5)), -1.0);
+        let data = Arc::make_mut(tiles.get_mut(&0).unwrap());
+        data[4 + 8] = f32::NAN;
+        assert!(sample(&tiles, None, (4.0, 1.0)).is_nan());
+        // unread tile: fill
+        assert_eq!(sample(&AHashMap::new(), None, (3.5, 1.5)), -7.0);
+    }
+
+    /// A downsampled extraction must fetch every source tile its widened kernels read, or the
+    /// rim of the output tile would silently lose those taps.
+    #[tokio::test]
+    async fn downsampling_fetches_the_tiles_the_widened_kernel_reaches() {
+        use crate::test_support::{build_cog, CogSpec, Sample};
+        use crate::{CogReader, TileExtractor};
+        // 4 x 1 source tiles of 256 px: 100 left of x = 512, 200 from there on
+        let spec = CogSpec {
+            width: 1024,
+            height: 256,
+            tile: 256,
+            bands: 1,
+            sample: Sample::U8,
+            deflate: true,
+            predictor: false,
+            epsg: 3857,
+            origin: (0.0, 2560.0),
+            pixel_size: (10.0, 10.0),
+            nodata: None,
+            overviews: 0,
+            sparse: vec![],
+            corrupt: vec![],
+            pixel: |_, x, _| if x < 512 { 100.0 } else { 200.0 },
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge.tif");
+        std::fs::write(&path, build_cog(&spec)).unwrap();
+        let reader = CogReader::open(path.to_str().unwrap()).unwrap();
+        // 64 px of 4 source pixels from source column 255: the first output pixel is centred on
+        // column 256.5 and the last on 508.5, whose radius-4 kernel reaches column 512 (tile 2)
+        // and, on the left, column 253 (tile 0); the nearest pixels all lie in tile 1
+        let bounds = BoundingBox::new(2550.0, 0.0, 2550.0 + 2560.0, 2560.0);
+        let bilinear = TileExtractor::new(&reader).bounds(bounds).size(64).resampling(ResamplingMethod::Bilinear).extract().await.unwrap();
+        assert_eq!(bilinear.tiles_read, 3);
+        // taps 505..=512 weigh .125 .375 .625 .875 .875 .625 .375 .125; only the last is 200
+        let last = bilinear.pixels[64 * 10 + 63];
+        assert!((last - (100.0 + 100.0 * 0.125 / 4.0)).abs() < 1e-3, "{last}");
     }
 }

@@ -146,6 +146,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outside the file are errors (they used to be read as is), and an IFD larger than the first
   4 KiB read is read in full instead of being truncated. The synchronous chunked and LZW file
   readers report BigTIFF files as unsupported (`Invalid TIFF version: N` for other versions)
+- When bilinear/bicubic downsample (see Fixed), `NaN`/nodata source pixels inside the kernel
+  are left out and the remaining weights renormalised, as `gdalwarp` does, instead of falling
+  back to the nearest sample; a pixel whose own nearest source pixel is invalid still takes
+  that sample. Upsampling keeps the nearest-sample fallback
 
 ### Removed
 
@@ -197,6 +201,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   meridian, more at low zoom). Each pixel's source row now comes from its own transform;
   nearest output for a Sentinel-2 UTM 18N source is bit-identical to `gdalwarp -r near` on
   z14 and z8 tiles (14.8% and 0.6% before)
+- Bilinear and bicubic extraction downsampled without anti-aliasing: an output pixel covering
+  several source pixels (low zoom, or a source level coarser than the output grid) read a
+  fixed 2x2 / 4x4 neighbourhood and ignored the rest, so tiles were aliased and differed
+  strongly from `gdalwarp`. Like GDAL's warper (`alg/gdalwarpkernel.cpp`), the kernel is now
+  stretched by the ratio of source pixels per output pixel on each axis (radius
+  `ceil(support * ratio)`, weights `kernel((i - x) / ratio)` normalised by the weights used;
+  ratios within 0.05 of a whole number snap to it; below a ratio of about 1.05 on both axes the
+  fixed footprint is kept, so upsampling is unchanged), and source tile planning fetches the
+  widened footprint. Same-CRS bilinear output is bit-identical to `gdalwarp -r bilinear` at
+  ratios 1.5 to 4; on a Sentinel-2 UTM 18N z8 tile the share of identical pixels went from
+  11% to 54% and the mean absolute difference from 6.8 to 0.6 (levels of 255). `bicubic`
+  stays Mitchell-Netravali (B = C = 1/3) while `gdalwarp -r cubic` is Catmull-Rom, so cubic
+  output still differs from GDAL's by the difference of the kernels. Cost grows with the
+  square of the ratio (a 256x256 RGB tile at ratio 4 takes 24 ms bilinear / 73 ms bicubic,
+  4 / 14 ms before); sources with few overviews pay it at low zooms
 - `cargo bench` now works: benchmarks ported to the `TileExtractor` API, the library
   target sets `bench = false` so criterion flags are not passed to libtest, and the
   benchmarks use a synthetic COG generated at startup (or a file given by the
