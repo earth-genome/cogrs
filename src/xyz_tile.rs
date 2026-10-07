@@ -658,7 +658,7 @@ impl<'a> TileExtractor<'a> {
     /// Returns an error if bounds were not set, or if tile extraction fails.
     pub async fn extract(self) -> AnyResult<TileData> {
         let bounds = self.bounds.ok_or("Bounds not set: use .xyz() or .bounds()")?;
-        let reader_clone = self.reader.clone_for_async();
+        let reader_clone = self.reader.clone();
         let resampling = self.resampling;
         let output_size = self.output_size;
         let output_crs = self.output_crs;
@@ -936,7 +936,7 @@ impl<'a> Reprojector<'a> {
     /// - The extraction fails
     pub async fn extract(self) -> AnyResult<ReprojectedRaster> {
         let target_crs = self.target_crs.ok_or("Target CRS not set: use .to_crs()")?;
-        let reader_clone = self.reader.clone_for_async();
+        let reader_clone = self.reader.clone();
         let output_bounds = self.output_bounds;
         let output_resolution = self.output_resolution;
         let output_size = self.output_size;
@@ -1106,7 +1106,7 @@ pub struct RasterChunk<'a> {
 impl<'a> RasterChunk<'a> {
     /// Extract this chunk's pixel data
     pub async fn extract(&self) -> AnyResult<ReprojectedRaster> {
-        let reader_clone = self.reader.clone_for_async();
+        let reader_clone = self.reader.clone();
         let bounds = self.bounds;
         let dimensions = self.dimensions;
         let target_crs = self.target_crs;

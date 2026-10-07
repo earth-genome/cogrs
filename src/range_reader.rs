@@ -86,13 +86,6 @@ pub trait RangeReader: Send + Sync {
     fn reads_inline(&self) -> bool {
         false
     }
-
-    /// Whether this reader already serves the start of the file from memory.
-    ///
-    /// Used to avoid wrapping a reader in [`PrefixCachedRangeReader`] twice.
-    fn has_prefix_cache(&self) -> bool {
-        false
-    }
 }
 
 /// Local file range reader
@@ -183,73 +176,6 @@ impl RangeReader for MemoryRangeReader {
     }
 
     fn reads_inline(&self) -> bool {
-        true
-    }
-}
-
-/// Number of leading bytes [`PrefixCachedRangeReader`] fetches in one request.
-///
-/// Sized to cover the header, the IFD chain and the out-of-line tag values of a
-/// typical COG, which are all placed at the start of the file.
-const PREFIX_CACHE_BYTES: u64 = 16 * 1024;
-
-/// Range reader that fetches the first 16 KiB of the source once and serves
-/// every read lying fully inside it from memory.
-///
-/// A COG keeps its header, IFDs and tag values at the start of the file, so
-/// opening one through a remote reader would otherwise cost many small
-/// sequential requests. Reads that are not fully inside the prefix (including
-/// reads straddling its end) are delegated to the inner reader unchanged.
-/// The identifier is the inner reader's, so identifier-keyed caches are shared.
-pub struct PrefixCachedRangeReader {
-    inner: Arc<dyn RangeReader>,
-    prefix: Vec<u8>,
-}
-
-impl PrefixCachedRangeReader {
-    /// Wrap `inner`, reading `min(16 KiB, size)` leading bytes up front.
-    ///
-    /// # Errors
-    /// Returns an error if reading the prefix from `inner` fails.
-    pub fn new(inner: Arc<dyn RangeReader>) -> AnyResult<Self> {
-        let len = PREFIX_CACHE_BYTES.min(inner.size());
-        let prefix = if len == 0 {
-            Vec::new()
-        } else {
-            // Safe cast: len <= PREFIX_CACHE_BYTES
-            #[allow(clippy::cast_possible_truncation)]
-            inner.read_range(0, len as usize)?
-        };
-        Ok(Self { inner, prefix })
-    }
-}
-
-impl RangeReader for PrefixCachedRangeReader {
-    fn read_range(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
-        let end = offset.checked_add(length as u64);
-        if let Some(end) = end
-            && end <= self.prefix.len() as u64
-        {
-            // Safe casts: end <= prefix.len(), which fits in usize
-            #[allow(clippy::cast_possible_truncation)]
-            return Ok(self.prefix[offset as usize..end as usize].to_vec());
-        }
-        self.inner.read_range(offset, length)
-    }
-
-    fn size(&self) -> u64 {
-        self.inner.size()
-    }
-
-    fn identifier(&self) -> &str {
-        self.inner.identifier()
-    }
-
-    fn is_local(&self) -> bool {
-        self.inner.is_local()
-    }
-
-    fn has_prefix_cache(&self) -> bool {
         true
     }
 }
@@ -490,88 +416,5 @@ mod tests {
         assert_eq!(reader.size(), 9);
         let result = reader.read_range(0, 4).unwrap();
         assert_eq!(&result, b"Test");
-    }
-
-    /// In-memory reader that counts calls to `read_range`.
-    struct CountingReader {
-        data: Vec<u8>,
-        calls: std::sync::Mutex<Vec<(u64, usize)>>,
-    }
-
-    impl CountingReader {
-        fn new(len: usize) -> Arc<Self> {
-            // Non-repeating-ish pattern so offset errors show up
-            let data = (0..len).map(|i| (i % 251) as u8).collect();
-            Arc::new(Self { data, calls: std::sync::Mutex::new(Vec::new()) })
-        }
-
-        fn calls(&self) -> Vec<(u64, usize)> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl RangeReader for CountingReader {
-        fn read_range(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
-            self.calls.lock().unwrap().push((offset, length));
-            let start = offset as usize;
-            let end = (start + length).min(self.data.len());
-            Ok(self.data[start..end].to_vec())
-        }
-
-        fn size(&self) -> u64 {
-            self.data.len() as u64
-        }
-
-        fn identifier(&self) -> &str {
-            "https://example.test/counting.tif"
-        }
-    }
-
-    #[test]
-    fn prefix_reads_inside_prefix_make_no_inner_calls() {
-        let inner = CountingReader::new(100_000);
-        let reader = PrefixCachedRangeReader::new(inner.clone()).unwrap();
-        let prefix_len = PREFIX_CACHE_BYTES as usize;
-        assert_eq!(inner.calls(), vec![(0, prefix_len)]);
-
-        assert_eq!(reader.read_range(0, 8).unwrap(), inner.data[0..8]);
-        assert_eq!(reader.read_range(192, 4096).unwrap(), inner.data[192..4288]);
-        // Last byte of the prefix is still inside
-        assert_eq!(
-            reader.read_range(prefix_len as u64 - 10, 10).unwrap(),
-            inner.data[prefix_len - 10..prefix_len]
-        );
-        assert_eq!(inner.calls().len(), 1, "only the initial prefix fetch");
-        assert_eq!(reader.size(), 100_000);
-        assert_eq!(reader.identifier(), inner.identifier());
-        assert!(!reader.is_local());
-        assert!(reader.has_prefix_cache());
-    }
-
-    #[test]
-    fn prefix_straddling_and_later_reads_delegate() {
-        let inner = CountingReader::new(100_000);
-        let reader = PrefixCachedRangeReader::new(inner.clone()).unwrap();
-        let p = PREFIX_CACHE_BYTES;
-
-        let straddle = reader.read_range(p - 4, 8).unwrap();
-        assert_eq!(straddle, inner.data[(p as usize - 4)..(p as usize + 4)]);
-
-        let after = reader.read_range(50_000, 100).unwrap();
-        assert_eq!(after, inner.data[50_000..50_100]);
-
-        assert_eq!(inner.calls()[1..], [(p - 4, 8), (50_000, 100)]);
-    }
-
-    #[test]
-    fn prefix_file_smaller_than_prefix() {
-        let inner = CountingReader::new(1000);
-        let reader = PrefixCachedRangeReader::new(inner.clone()).unwrap();
-        assert_eq!(inner.calls(), vec![(0, 1000)]);
-
-        assert_eq!(reader.read_range(0, 1000).unwrap(), inner.data);
-        assert_eq!(reader.read_range(990, 10).unwrap(), inner.data[990..]);
-        assert_eq!(inner.calls().len(), 1);
-        assert_eq!(reader.size(), 1000);
     }
 }

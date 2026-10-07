@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -21,6 +21,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::http::HttpBuilder;
 use object_store::path::Path as ObjectPath;
 use object_store::{ClientOptions, GetOptions, GetRange, ObjectStore, RetryConfig};
+use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
 use crate::async_io::{AsyncRangeReader, IoOptions, SyncToAsync};
@@ -69,7 +70,7 @@ fn shared_store(
     options: &IoOptions,
     build: impl FnOnce() -> AnyResult<Arc<dyn ObjectStore>>,
 ) -> AnyResult<Arc<StoreEntry>> {
-    let mut stores = STORES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut stores = STORES.lock();
     if let Some(entry) = stores.get(key) {
         return Ok(Arc::clone(entry));
     }
@@ -85,7 +86,7 @@ fn shared_store(
 #[doc(hidden)]
 #[must_use]
 pub fn registered_store_count() -> usize {
-    STORES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+    STORES.lock().len()
 }
 
 /// Async range reader over one S3 or HTTP(S) object.
@@ -417,56 +418,11 @@ mod tests {
 #[cfg(test)]
 mod local_server_tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
+    use crate::test_support::serve_bytes;
+    use std::time::Duration;
 
-    /// Minimal range-capable HTTP/1.1 server over a byte buffer that records request lines.
     fn serve(data: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let log2 = Arc::clone(&log);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let data = data.clone();
-                let log = Arc::clone(&log2);
-                std::thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    loop {
-                        let mut request_line = String::new();
-                        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
-                            return;
-                        }
-                        let mut range = None;
-                        loop {
-                            let mut line = String::new();
-                            reader.read_line(&mut line).unwrap();
-                            if line.trim().is_empty() {
-                                break;
-                            }
-                            if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
-                                let (a, b) = v.trim().split_once('-').unwrap();
-                                range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
-                            }
-                        }
-                        log.lock().unwrap().push(request_line.trim().to_string());
-                        let (start, end) = range.map_or((0, data.len() - 1), |(a, b)| (a, b.min(data.len() - 1)));
-                        let body = &data[start..=end];
-                        let head = format!(
-                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\n\
-                             ETag: \"abc\"\r\nLast-Modified: Tue, 06 Oct 2026 18:56:17 GMT\r\n\r\n",
-                            body.len(),
-                            data.len()
-                        );
-                        if stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body)).is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-        });
-        (format!("http://{addr}"), log)
+        serve_bytes(data, Duration::ZERO)
     }
 
     fn data(n: usize) -> Vec<u8> {
@@ -481,17 +437,17 @@ mod local_server_tests {
         assert_eq!(r.size(), 100_000);
         assert_eq!(r.etag(), Some("\"abc\""));
         assert!(r.last_modified_unix().is_some());
-        assert_eq!(log.lock().unwrap().len(), 1, "open is a single request (no HEAD)");
-        assert!(log.lock().unwrap()[0].starts_with("GET /dir/with%20space/file.tif "), "{:?}", log.lock().unwrap());
+        assert_eq!(log.lock().len(), 1, "open is a single request (no HEAD)");
+        assert!(log.lock()[0].starts_with("GET /dir/with%20space/file.tif "), "{:?}", log.lock());
 
         // Inside the prefix: no request. Outside: one request.
         assert_eq!(&r.read_range(10, 100).await.unwrap()[..], &d[10..110]);
-        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(log.lock().len(), 1);
         assert_eq!(&r.read_range(50_000, 1000).await.unwrap()[..], &d[50_000..51_000]);
-        assert_eq!(log.lock().unwrap().len(), 2);
+        assert_eq!(log.lock().len(), 2);
         // A read straddling the prefix end is fetched whole from the server.
         assert_eq!(&r.read_range(PREFIX_BYTES - 10, 20).await.unwrap()[..], &d[16374..16394]);
-        assert_eq!(log.lock().unwrap().len(), 3);
+        assert_eq!(log.lock().len(), 3);
     }
 
     #[tokio::test]
@@ -501,7 +457,7 @@ mod local_server_tests {
         let r = ObjectStoreRangeReader::open(&format!("{base}/a/b.tif?X-Amz-Signature=s1g%2Bn&x=1")).await.unwrap();
         assert!(!r.identifier().contains('?'));
         r.read_range(60_000, 10).await.unwrap();
-        let log = log.lock().unwrap();
+        let log = log.lock();
         assert_eq!(log.len(), 2);
         for line in log.iter() {
             assert!(line.starts_with("GET /a/b.tif?X-Amz-Signature=s1g%2Bn&x=1 "), "{line}");

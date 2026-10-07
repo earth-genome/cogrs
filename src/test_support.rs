@@ -284,7 +284,7 @@ pub(crate) fn build_cog(spec: &CogSpec) -> Vec<u8> {
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -328,16 +328,16 @@ impl MockReader {
     }
 
     pub(crate) fn fail_on(&self, range: Range<u64>) {
-        self.fail_ranges.lock().unwrap().push(range);
+        self.fail_ranges.lock().push(range);
     }
 
     /// Ranges requested so far, in call order.
     pub(crate) fn calls(&self) -> Vec<Range<u64>> {
-        self.calls.lock().unwrap().clone()
+        self.calls.lock().clone()
     }
 
     pub(crate) fn call_count(&self) -> usize {
-        self.calls.lock().unwrap().len()
+        self.calls.lock().len()
     }
 
     pub(crate) fn max_in_flight(&self) -> usize {
@@ -345,7 +345,7 @@ impl MockReader {
     }
 
     pub(crate) fn reset(&self) {
-        self.calls.lock().unwrap().clear();
+        self.calls.lock().clear();
         self.max_in_flight.store(0, Ordering::SeqCst);
     }
 }
@@ -354,12 +354,12 @@ impl AsyncRangeReader for MockReader {
     fn read_range(&self, offset: u64, len: usize) -> BoxFuture<'_, AnyResult<Bytes>> {
         Box::pin(async move {
             let range = offset..offset + len as u64;
-            self.calls.lock().unwrap().push(range.clone());
+            self.calls.lock().push(range.clone());
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(self.latency).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            if self.fail_ranges.lock().unwrap().iter().any(|f| f.start < range.end && range.start < f.end) {
+            if self.fail_ranges.lock().iter().any(|f| f.start < range.end && range.start < f.end) {
                 return Err(format!("injected failure for {range:?}").into());
             }
             if range.end > self.data.len() as u64 {
@@ -384,4 +384,70 @@ impl AsyncRangeReader for MockReader {
     fn io_options(&self) -> &IoOptions {
         &self.options
     }
+}
+
+// ============================================================================
+// Local HTTP range server
+// ============================================================================
+
+/// Minimal range-capable HTTP/1.1 server over a byte buffer on 127.0.0.1.
+///
+/// Returns its base URL (`http://127.0.0.1:port`, any path is served) and a log of request
+/// lines. Every response is delayed by `delay`, which stands in for network latency.
+pub(crate) fn serve_bytes(data: Vec<u8>, delay: Duration) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = Arc::clone(&log);
+    let data = Arc::new(data);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let data = Arc::clone(&data);
+            let log = Arc::clone(&log2);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut range = None;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                            let (a, b) = v.trim().split_once('-').unwrap();
+                            range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
+                        }
+                    }
+                    log.lock().push(format!(
+                        "{} range={:?}",
+                        request_line.trim(),
+                        range
+                    ));
+                    std::thread::sleep(delay);
+                    let (start, end) = range.map_or((0, data.len() - 1), |(a, b)| (a, b.min(data.len() - 1)));
+                    let body = &data[start..=end];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\n\
+                         ETag: \"abc\"\r\nLast-Modified: Tue, 06 Oct 2026 18:56:17 GMT\r\n\r\n",
+                        body.len(),
+                        data.len()
+                    );
+                    if stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), log)
 }

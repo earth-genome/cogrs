@@ -44,6 +44,7 @@ tokio = { version = "1.44.2", features = ["rt", "rt-multi-thread", "fs", "sync",
 object_store = { version = "0.12.3", features = ["http", "aws"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 futures = "0.3"
+parking_lot = "0.12"
 
 # Error handling and utilities
 anyhow = "1.0.98"

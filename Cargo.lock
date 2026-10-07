@@ -412,6 +412,7 @@ dependencies = [
  "ndarray",
  "object_store",
  "once_cell",
+ "parking_lot",
  "proj4rs",
  "rand",
  "reqwest",

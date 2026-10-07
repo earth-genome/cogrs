@@ -13,9 +13,12 @@
 //! - Single transform inversion per tile (not per pixel)
 //! - Global LRU tile cache for decompressed data
 
-use crate::range_reader::{create_range_reader, PrefixCachedRangeReader, RangeReader};
+use crate::async_io::{block_on_io, AsyncRangeReader, AsyncToSync, IoOptions, SyncToAsync};
+use crate::range_reader::{create_range_reader, RangeReader};
+use crate::remote::create_async_range_reader;
 use crate::tile_cache;
 use crate::tiff_utils::AnyResult;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -363,12 +366,39 @@ impl OverviewQualityHint {
     }
 }
 
+/// Identifies one source tile: an overview level (`None` = full resolution) and the tile's
+/// index within that level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TileRef {
+    pub overview: Option<usize>,
+    pub index: usize,
+}
+
+/// Where a source tile's compressed bytes live, and its pixel dimensions.
+///
+/// `len == 0` marks a sparse tile that was never written.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TileSpan {
+    pub offset: u64,
+    pub len: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
 /// COG Reader - efficient COG access with range requests
+///
+/// Cloning is cheap: the I/O handles and the parsed metadata are shared (`Arc`), so a clone
+/// can be moved into a task or cached per source without copying tile offset tables.
+#[derive(Clone)]
 pub struct CogReader {
-    reader: Arc<dyn RangeReader>,
-    pub metadata: CogMetadata,
+    /// Asynchronous reads (the network path).
+    async_io: Arc<dyn AsyncRangeReader>,
+    /// Blocking reads for the synchronous API (`read_tile`, `sample`, ...).
+    sync_io: Arc<dyn RangeReader>,
+    /// Parsed header and full-resolution IFD.
+    pub metadata: Arc<CogMetadata>,
     /// Overview levels (sorted by scale factor, smallest to largest)
-    pub overviews: Vec<OverviewMetadata>,
+    pub overviews: Arc<[OverviewMetadata]>,
     /// Minimum usable overview index - overviews beyond this have insufficient data
     /// None means all overviews are usable, Some(n) means only overviews 0..n are usable
     pub min_usable_overview: Option<usize>,
@@ -377,26 +407,22 @@ pub struct CogReader {
 impl CogReader {
     /// Open a COG from any source (local file, HTTP URL, or S3)
     ///
-    /// This is a **blocking** call. For HTTP and S3 sources it must not run on an async
-    /// worker thread; always use [`CogReader::open_async`] from async code. If it is called
-    /// there anyway, unwinding panics are converted to an error on a best-effort basis
-    /// (tokio still prints its panic message), `panic = "abort"` builds abort, and in release
-    /// builds the HTTP reader may silently block the worker. S3 sources additionally need
-    /// to run inside a tokio runtime context (e.g. a `spawn_blocking` thread).
+    /// This is the **blocking** entry point, for plain threads and `spawn_blocking`. Remote
+    /// sources are driven on a private I/O runtime, so no ambient tokio runtime is needed
+    /// (and calling it on an async worker thread blocks that worker but does not deadlock).
+    /// From async code use [`CogReader::open_async`].
     ///
     /// # Errors
     /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
     /// or required metadata tags are missing or invalid.
     pub fn open(source: &str) -> AnyResult<Self> {
-        let reader = create_range_reader(source)?;
-        Self::from_reader(reader)
+        Self::open_with_hint(source, OverviewQualityHint::ComputeAtRuntime)
     }
 
     /// Open a COG without blocking the async runtime (local file, HTTP URL, or S3)
     ///
-    /// The blocking work (region detection, header and IFD reads, overview analysis) runs on
-    /// tokio's blocking thread pool, so this is safe on `multi_thread` and `current_thread`
-    /// runtimes alike. Prefer this over [`CogReader::open`] anywhere inside an `async fn`.
+    /// Remote I/O is natively asynchronous: the header and IFDs arrive in one ranged request
+    /// and no thread is held while waiting on the network.
     ///
     /// ```rust,no_run
     /// use cogrs::CogReader;
@@ -409,7 +435,7 @@ impl CogReader {
     ///
     /// # Errors
     /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
-    /// required metadata tags are missing or invalid, or the blocking task fails.
+    /// or required metadata tags are missing or invalid.
     pub async fn open_async(source: &str) -> AnyResult<Self> {
         Self::open_async_with_hint(source, OverviewQualityHint::ComputeAtRuntime).await
     }
@@ -418,12 +444,24 @@ impl CogReader {
     ///
     /// # Errors
     /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
-    /// required metadata tags are missing or invalid, or the blocking task fails.
+    /// or required metadata tags are missing or invalid.
     pub async fn open_async_with_hint(source: &str, hint: OverviewQualityHint) -> AnyResult<Self> {
-        let source = source.to_string();
-        tokio::task::spawn_blocking(move || Self::open_with_hint(&source, hint))
-            .await
-            .map_err(|e| format!("Task join error: {e}"))?
+        Self::open_async_with_options(source, hint, &IoOptions::default()).await
+    }
+
+    /// Like [`CogReader::open_async_with_hint`] with explicit I/O tuning (concurrency limits,
+    /// range coalescing, retries and timeouts); see [`IoOptions`].
+    ///
+    /// # Errors
+    /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
+    /// or required metadata tags are missing or invalid.
+    pub async fn open_async_with_options(
+        source: &str,
+        hint: OverviewQualityHint,
+        options: &IoOptions,
+    ) -> AnyResult<Self> {
+        let reader = create_async_range_reader(source, options).await?;
+        Self::from_async_reader_with_hint(reader, hint).await
     }
 
     /// Run a synchronous operation on this reader (point queries, tile reads, ...) on tokio's
@@ -446,7 +484,7 @@ impl CogReader {
         F: FnOnce(&CogReader) -> AnyResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let reader = self.clone_for_async();
+        let reader = self.clone();
         tokio::task::spawn_blocking(move || f(&reader))
             .await
             .map_err(|e| format!("Task join error: {e}"))?
@@ -464,8 +502,12 @@ impl CogReader {
     /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
     /// or required metadata tags are missing or invalid.
     pub fn open_with_hint(source: &str, hint: OverviewQualityHint) -> AnyResult<Self> {
-        let reader = create_range_reader(source)?;
-        Self::from_reader_with_hint(reader, hint)
+        if is_remote_source(source) {
+            let source = source.to_string();
+            block_on_io(async move { Self::open_async_with_hint(&source, hint).await })?
+        } else {
+            Self::from_reader_with_hint(create_range_reader(source)?, hint)
+        }
     }
 
     /// Open from an existing range reader
@@ -475,6 +517,81 @@ impl CogReader {
     /// are missing or invalid.
     pub fn from_reader(reader: Arc<dyn RangeReader>) -> AnyResult<Self> {
         Self::from_reader_with_hint(reader, OverviewQualityHint::ComputeAtRuntime)
+    }
+
+    /// Open from an existing asynchronous range reader
+    ///
+    /// # Errors
+    /// Returns an error if the file is not a valid TIFF/COG, or required metadata tags
+    /// are missing or invalid, or if reading the IFD data fails.
+    pub async fn from_async_reader(reader: Arc<dyn AsyncRangeReader>) -> AnyResult<Self> {
+        Self::from_async_reader_with_hint(reader, OverviewQualityHint::ComputeAtRuntime).await
+    }
+
+    /// Open from an existing asynchronous range reader with an overview quality hint (see
+    /// [`CogReader::from_reader_with_hint`] for the hint values).
+    ///
+    /// # Errors
+    /// Returns an error if the file is not a valid TIFF/COG, or required metadata tags
+    /// are missing or invalid, or if reading the IFD data fails.
+    pub async fn from_async_reader_with_hint(
+        reader: Arc<dyn AsyncRangeReader>,
+        hint: OverviewQualityHint,
+    ) -> AnyResult<Self> {
+        let structure = parse_cog_structure(&*reader).await?;
+        let sync_io: Arc<dyn RangeReader> = Arc::new(AsyncToSync::new(Arc::clone(&reader)));
+        let mut cog = Self::assemble(reader, sync_io, structure, hint);
+        if matches!(hint, OverviewQualityHint::ComputeAtRuntime) {
+            cog.min_usable_overview = cog.analyze_overview_quality_async().await;
+        }
+        Ok(cog)
+    }
+
+    /// Build a reader from already-parsed metadata, without any I/O.
+    ///
+    /// This lets a caller keep the (shared, immutable) `metadata` and `overviews` of a source in
+    /// its own cache and attach a fresh reader to them on later requests.
+    #[must_use]
+    pub fn from_parts(
+        reader: Arc<dyn AsyncRangeReader>,
+        metadata: Arc<CogMetadata>,
+        overviews: Arc<[OverviewMetadata]>,
+        min_usable_overview: Option<usize>,
+    ) -> Self {
+        let sync_io: Arc<dyn RangeReader> = Arc::new(AsyncToSync::new(Arc::clone(&reader)));
+        Self { async_io: reader, sync_io, metadata, overviews, min_usable_overview }
+    }
+
+    /// Source identifier (path or URL); also the tile-cache key.
+    #[must_use]
+    pub fn identifier(&self) -> &str {
+        self.async_io.identifier()
+    }
+
+    fn assemble(
+        async_io: Arc<dyn AsyncRangeReader>,
+        sync_io: Arc<dyn RangeReader>,
+        structure: CogStructure,
+        hint: OverviewQualityHint,
+    ) -> Self {
+        let CogStructure { metadata, overviews } = structure;
+        // Apply the overview quality hint
+        // min_usable_overview = Some(n) means overviews 0..=n are usable
+        // min_usable_overview = None means NO overviews are usable (force full resolution)
+        let min_usable_overview = match hint {
+            // All overviews are usable - set to last overview index
+            OverviewQualityHint::AllUsable => overviews.len().checked_sub(1),
+            // Force full resolution, or computed by the caller afterwards
+            OverviewQualityHint::NoneUsable | OverviewQualityHint::ComputeAtRuntime => None,
+            OverviewQualityHint::MinUsable(n) => Some(n),
+        };
+        Self {
+            async_io,
+            sync_io,
+            metadata: Arc::new(metadata),
+            overviews: overviews.into(),
+            min_usable_overview,
+        }
     }
 
     /// Open from an existing range reader with a pre-computed overview quality hint
@@ -494,116 +611,16 @@ impl CogReader {
     /// Returns an error if the file is not a valid TIFF/COG, required metadata tags
     /// are missing or invalid, or if reading the IFD data fails.
     pub fn from_reader_with_hint(reader: Arc<dyn RangeReader>, hint: OverviewQualityHint) -> AnyResult<Self> {
-        // Remote COGs keep header, IFDs and tag values at the start of the file;
-        // fetch that prefix once instead of issuing many small sequential reads.
-        let reader: Arc<dyn RangeReader> = if reader.is_local() || reader.has_prefix_cache() {
-            reader
-        } else {
-            Arc::new(PrefixCachedRangeReader::new(reader)?)
-        };
-
-        // Read header to get IFD offset and byte order
-        let header_bytes = reader.read_range(0, 8)?;
-
-        let little_endian = match &header_bytes[0..2] {
-            b"II" => true,
-            b"MM" => false,
-            _ => return Err("Invalid TIFF signature".into()),
-        };
-
-        let version = read_u16(&header_bytes[2..4], little_endian);
-        if version != 42 {
-            return Err(format!("Invalid TIFF version: {version}").into());
-        }
-
-        let ifd_offset = read_u32(&header_bytes[4..8], little_endian);
-        let file_size = reader.size();
-
-        // Read IFD entries - estimate size based on typical COG (usually < 4KB)
-        // Clamp to available bytes if IFD is near end of file
-        // Safe cast: clamped to 4096, well within usize range on all platforms
-        #[allow(clippy::cast_possible_truncation)]
-        let ifd_size_estimate = 4096.min((file_size - u64::from(ifd_offset)) as usize);
-        let ifd_bytes = reader.read_range(u64::from(ifd_offset), ifd_size_estimate)?;
-
-        let (metadata, next_ifd_offset) = parse_ifd_with_next(&ifd_bytes, &reader, u64::from(ifd_offset), little_endian)?;
-
-        // Read overview IFDs (subsequent IFDs in the chain)
-        let mut overviews = Vec::new();
-        let mut current_ifd_offset = next_ifd_offset;
-        let full_width = metadata.width;
-
-        while current_ifd_offset != 0 {
-            // Safe cast: clamped to 4096, well within usize range on all platforms
-            #[allow(clippy::cast_possible_truncation)]
-            let ovr_ifd_size = 4096.min((file_size - u64::from(current_ifd_offset)) as usize);
-            let ovr_ifd_bytes = reader.read_range(u64::from(current_ifd_offset), ovr_ifd_size)?;
-
-            if let Ok((ovr_meta, next_offset)) = parse_overview_ifd(&ovr_ifd_bytes, &reader, u64::from(current_ifd_offset), little_endian, &metadata) {
-                // Calculate actual scale from dimensions using floor division
-                // This matches GDAL's behavior: scale = full_width / ovr_width
-                // For 20966/1310 this gives 16, not 17 (ceiling would be wrong)
-                let actual_scale = full_width / ovr_meta.width;
-
-                overviews.push(OverviewMetadata {
-                    width: ovr_meta.width,
-                    height: ovr_meta.height,
-                    tile_width: ovr_meta.tile_width,
-                    tile_height: ovr_meta.tile_height,
-                    tiles_across: ovr_meta.tiles_across,
-                    tiles_down: ovr_meta.tiles_down,
-                    tile_offsets: ovr_meta.tile_offsets,
-                    tile_byte_counts: ovr_meta.tile_byte_counts,
-                    scale: actual_scale,
-                });
-
-                current_ifd_offset = next_offset;
-            } else {
-                break;
-            }
-
-            // Safety limit - COGs typically have at most 10 overviews
-            if overviews.len() > 10 {
-                break;
-            }
-        }
-
-        // Apply the overview quality hint
-        // min_usable_overview = Some(n) means overviews 0..=n are usable
-        // min_usable_overview = None means NO overviews are usable (force full resolution)
-        let min_usable_overview = match hint {
-            OverviewQualityHint::AllUsable => {
-                // All overviews are usable - set to last overview index
-                if overviews.is_empty() {
-                    None
-                } else {
-                    Some(overviews.len() - 1)
-                }
-            }
-            OverviewQualityHint::NoneUsable => {
-                // Force full resolution - no overviews are usable
-                None
-            }
-            OverviewQualityHint::MinUsable(n) => Some(n),
-            OverviewQualityHint::ComputeAtRuntime => {
-                // Will be computed below, start with None
-                None
-            }
-        };
-
-        let mut cog_reader = Self {
-            reader,
-            metadata,
-            overviews,
-            min_usable_overview,
-        };
-
-        // Only analyze at runtime if hint says to compute
+        // The parse runs inline on this thread: the reader is synchronous anyway, and the
+        // futures it produces are always ready, so no runtime is involved.
+        let inline = SyncToAsync::inline(Arc::clone(&reader));
+        let structure = futures::executor::block_on(parse_cog_structure(&inline))?;
+        let async_io: Arc<dyn AsyncRangeReader> = Arc::new(SyncToAsync::new(Arc::clone(&reader)));
+        let mut cog = Self::assemble(async_io, reader, structure, hint);
         if matches!(hint, OverviewQualityHint::ComputeAtRuntime) {
-            cog_reader.analyze_overview_quality();
+            cog.min_usable_overview = cog.analyze_overview_quality_impl();
         }
-
-        Ok(cog_reader)
+        Ok(cog)
     }
 
     /// Analyze overview quality by sampling tiles to find valid data density
@@ -636,64 +653,61 @@ impl CogReader {
         }
     }
 
-    /// Internal: Run overview analysis and set `min_usable_overview`
-    fn analyze_overview_quality(&mut self) {
-        self.min_usable_overview = self.analyze_overview_quality_impl();
+    /// Async counterpart of [`CogReader::compute_overview_quality_hint`]; sample tiles are
+    /// fetched concurrently without blocking a thread.
+    pub async fn compute_overview_quality_hint_async(&self) -> OverviewQualityHint {
+        if self.overviews.is_empty() {
+            return OverviewQualityHint::AllUsable;
+        }
+        match self.analyze_overview_quality_async().await {
+            None => OverviewQualityHint::NoneUsable,
+            Some(idx) => OverviewQualityHint::MinUsable(idx),
+        }
     }
 
     /// Internal implementation of overview quality analysis
     /// Returns None if all overviews are too sparse, Some(n) for minimum usable index
     fn analyze_overview_quality_impl(&self) -> Option<usize> {
-        if self.overviews.is_empty() {
-            return None;
-        }
-
-        // For each overview (from smallest/coarsest to largest/finest), check if it has enough data
-        // We sample a few tiles from each overview and check data density
-        //
-        // Use 5% threshold - this is aggressive but ensures good visual results for sparse data.
-        // For a file with 6% valid data at full res, overviews with <5% are significantly degraded.
-        // The trade-off is that sparse datasets will read more tiles at low zoom, but the visual
-        // quality improvement is dramatic (see barley crop data as example).
-        let min_density_threshold = 0.05; // 5% - require good data density for visual quality
-
-        // Iterate from smallest overview (highest index, coarsest) to largest (index 0, finest)
+        // For each overview (from smallest/coarsest to largest/finest), check if it has enough
+        // data. We sample a few tiles from each overview and check data density.
         for (idx, ovr) in self.overviews.iter().enumerate().rev() {
-            // Sample up to 3 tiles from this overview
-            let num_tiles = ovr.tile_offsets.len();
-            let sample_indices: Vec<usize> = if num_tiles <= 3 {
-                (0..num_tiles).collect()
-            } else {
-                // Sample first, middle, and last tiles
-                vec![0, num_tiles / 2, num_tiles - 1]
-            };
-
             let mut total_pixels = 0usize;
             let mut valid_pixels = 0usize;
-
-            for &tile_idx in &sample_indices {
-                if let Ok(data) = self.read_overview_tile(idx, tile_idx) {
+            for tile_idx in overview_sample_indices(ovr.tile_offsets.len()) {
+                if let Ok((data, _)) = self.read_tile_sync(TileRef { overview: Some(idx), index: tile_idx }) {
                     total_pixels += data.len();
-                    valid_pixels += data.iter().filter(|v| !v.is_nan() && **v != 0.0).count();
+                    valid_pixels += valid_sample_count(&data);
                 }
             }
-
-            let density = if total_pixels > 0 {
-                // Safe cast: usize to f64 precision loss acceptable for pixel counts (ratios still accurate)
-                #[allow(clippy::cast_precision_loss)]
-                let density_value = valid_pixels as f64 / total_pixels as f64;
-                density_value
-            } else {
-                0.0
-            };
-
-            if density >= min_density_threshold {
+            if overview_density(valid_pixels, total_pixels) >= MIN_OVERVIEW_DENSITY {
                 // Found a good overview, return it as the minimum usable
                 return Some(idx);
             }
         }
 
         // No good overview found - all are too sparse
+        None
+    }
+
+    /// Same analysis as [`Self::analyze_overview_quality_impl`], fetching each level's sample
+    /// tiles concurrently.
+    async fn analyze_overview_quality_async(&self) -> Option<usize> {
+        for (idx, ovr) in self.overviews.iter().enumerate().rev() {
+            let samples = overview_sample_indices(ovr.tile_offsets.len());
+            let reads = futures::future::join_all(
+                samples.iter().map(|&i| self.read_tile_async_ref(TileRef { overview: Some(idx), index: i })),
+            )
+            .await;
+            let mut total_pixels = 0usize;
+            let mut valid_pixels = 0usize;
+            for (data, _) in reads.into_iter().flatten() {
+                total_pixels += data.len();
+                valid_pixels += valid_sample_count(&data);
+            }
+            if overview_density(valid_pixels, total_pixels) >= MIN_OVERVIEW_DENSITY {
+                return Some(idx);
+            }
+        }
         None
     }
 
@@ -761,6 +775,104 @@ impl CogReader {
         best_idx
     }
 
+    /// Location and shape of a source tile. Errors if the overview or tile index is out of
+    /// range.
+    pub(crate) fn tile_span(&self, tile: TileRef) -> AnyResult<TileSpan> {
+        let (offsets, counts, width, height) = if let Some(overview_idx) = tile.overview {
+            let ovr = self
+                .overviews
+                .get(overview_idx)
+                .ok_or_else(|| format!("Overview index {overview_idx} out of range"))?;
+            (&ovr.tile_offsets, &ovr.tile_byte_counts, ovr.tile_width, ovr.tile_height)
+        } else {
+            (
+                &self.metadata.tile_offsets,
+                &self.metadata.tile_byte_counts,
+                self.metadata.tile_width,
+                self.metadata.tile_height,
+            )
+        };
+        if tile.index >= offsets.len() {
+            return Err(format!("Tile index {} out of range (max {})", tile.index, offsets.len()).into());
+        }
+        // Safe cast: tile byte counts are always < 100MB, well within usize range
+        #[allow(clippy::cast_possible_truncation)]
+        let len = counts.get(tile.index).copied().unwrap_or(0) as usize;
+        Ok(TileSpan { offset: offsets[tile.index], len, width, height })
+    }
+
+    /// All-NaN data for a sparse tile.
+    pub(crate) fn sparse_tile(&self, span: &TileSpan) -> Arc<Vec<f32>> {
+        Arc::new(vec![f32::NAN; span.width * span.height * self.metadata.bands])
+    }
+
+    /// Decompress, un-predict and convert a tile's compressed bytes to `f32` samples (CPU only).
+    pub(crate) fn decode_tile(&self, span: &TileSpan, compressed: &[u8]) -> AnyResult<Vec<f32>> {
+        let meta = &*self.metadata;
+        let decompressed = decompress_tile(
+            compressed,
+            meta.compression,
+            span.width,
+            span.height,
+            meta.bands,
+            meta.data_type.bytes_per_sample(),
+        )?;
+        let unpredicted = apply_predictor(
+            &decompressed,
+            meta.predictor,
+            span.width,
+            meta.bands,
+            meta.data_type.bytes_per_sample(),
+        )?;
+        Ok(convert_to_f32(&unpredicted, meta.data_type, meta.little_endian))
+    }
+
+    /// Tile from the process-wide decompressed-tile cache.
+    pub(crate) fn cached_tile(&self, tile: TileRef) -> Option<Arc<Vec<f32>>> {
+        tile_cache::get(self.identifier(), tile.index, tile.overview)
+    }
+
+    pub(crate) fn cache_tile(&self, tile: TileRef, data: Arc<Vec<f32>>) {
+        tile_cache::insert(self.identifier(), tile.index, tile.overview, data);
+    }
+
+    /// Read, decode and cache one tile on the calling thread (blocking I/O).
+    ///
+    /// Returns the data and the compressed bytes fetched (0 for cache hits and sparse tiles).
+    pub(crate) fn read_tile_sync(&self, tile: TileRef) -> AnyResult<(Arc<Vec<f32>>, usize)> {
+        if let Some(cached) = self.cached_tile(tile) {
+            return Ok((cached, 0));
+        }
+        let span = self.tile_span(tile)?;
+        if span.len == 0 {
+            return Ok((self.sparse_tile(&span), 0));
+        }
+        let compressed = self.sync_io.read_range(span.offset, span.len)?;
+        let data = Arc::new(self.decode_tile(&span, &compressed)?);
+        self.cache_tile(tile, Arc::clone(&data));
+        Ok((data, span.len))
+    }
+
+    /// Read, decode and cache one tile without blocking: the fetch is awaited and the decode
+    /// runs on tokio's blocking pool.
+    pub(crate) async fn read_tile_async_ref(&self, tile: TileRef) -> AnyResult<(Arc<Vec<f32>>, usize)> {
+        if let Some(cached) = self.cached_tile(tile) {
+            return Ok((cached, 0));
+        }
+        let span = self.tile_span(tile)?;
+        if span.len == 0 {
+            return Ok((self.sparse_tile(&span), 0));
+        }
+        let compressed = self.async_io.read_range(span.offset, span.len).await?;
+        let this = self.clone();
+        let data = tokio::task::spawn_blocking(move || this.decode_tile(&span, &compressed))
+            .await
+            .map_err(|e| format!("Task join error: {e}"))??;
+        let data = Arc::new(data);
+        self.cache_tile(tile, Arc::clone(&data));
+        Ok((data, span.len))
+    }
+
     /// Read a tile from a specific overview level
     /// Uses global LRU cache to avoid re-decompressing tiles
     ///
@@ -768,63 +880,8 @@ impl CogReader {
     /// Returns an error if the overview or tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
     pub fn read_overview_tile(&self, overview_idx: usize, tile_index: usize) -> AnyResult<Vec<f32>> {
-        let source_id = self.reader.identifier();
-
-        // Check cache first
-        if let Some(cached) = tile_cache::get(source_id, tile_index, Some(overview_idx)) {
-            return Ok((*cached).clone());
-        }
-
-        let ovr = self.overviews.get(overview_idx)
-            .ok_or_else(|| format!("Overview index {overview_idx} out of range"))?;
-
-        if tile_index >= ovr.tile_offsets.len() {
-            return Err(format!(
-                "Tile index {} out of range (max {})",
-                tile_index,
-                ovr.tile_offsets.len()
-            ).into());
-        }
-
-        let offset = ovr.tile_offsets[tile_index];
-        // Safe cast: tile byte counts are always < 100MB, well within usize range
-        #[allow(clippy::cast_possible_truncation)]
-        let byte_count = ovr.tile_byte_counts[tile_index] as usize;
-
-        if byte_count == 0 {
-            let pixel_count = ovr.tile_width * ovr.tile_height * self.metadata.bands;
-            return Ok(vec![f32::NAN; pixel_count]);
-        }
-
-        let compressed = self.reader.read_range(offset, byte_count)?;
-
-        let decompressed = decompress_tile(
-            &compressed,
-            self.metadata.compression,
-            ovr.tile_width,
-            ovr.tile_height,
-            self.metadata.bands,
-            self.metadata.data_type.bytes_per_sample(),
-        )?;
-
-        let unpredicted = apply_predictor(
-            &decompressed,
-            self.metadata.predictor,
-            ovr.tile_width,
-            self.metadata.bands,
-            self.metadata.data_type.bytes_per_sample(),
-        )?;
-
-        let result = convert_to_f32(
-            &unpredicted,
-            self.metadata.data_type,
-            self.metadata.little_endian,
-        );
-
-        // Cache the result
-        tile_cache::insert(source_id, tile_index, Some(overview_idx), Arc::new(result.clone()));
-
-        Ok(result)
+        let (data, _) = self.read_tile_sync(TileRef { overview: Some(overview_idx), index: tile_index })?;
+        Ok((*data).clone())
     }
 
     /// Read a single tile's raw data and decompress
@@ -834,65 +891,8 @@ impl CogReader {
     /// Returns an error if the tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
     pub fn read_tile(&self, tile_index: usize) -> AnyResult<Vec<f32>> {
-        let source_id = self.reader.identifier();
-
-        // Check cache first (None for overview_idx means full resolution)
-        if let Some(cached) = tile_cache::get(source_id, tile_index, None) {
-            return Ok((*cached).clone());
-        }
-
-        if tile_index >= self.metadata.tile_offsets.len() {
-            return Err(format!(
-                "Tile index {} out of range (max {})",
-                tile_index,
-                self.metadata.tile_offsets.len()
-            )
-            .into());
-        }
-
-        let offset = self.metadata.tile_offsets[tile_index];
-        // Safe cast: tile byte counts are always < 100MB, well within usize range
-        #[allow(clippy::cast_possible_truncation)]
-        let byte_count = self.metadata.tile_byte_counts[tile_index] as usize;
-
-        if byte_count == 0 {
-            // Empty tile - return NaN-filled data
-            let pixel_count = self.metadata.tile_width * self.metadata.tile_height * self.metadata.bands;
-            return Ok(vec![f32::NAN; pixel_count]);
-        }
-
-        let compressed = self.reader.read_range(offset, byte_count)?;
-
-        // Decompress
-        let decompressed = decompress_tile(
-            &compressed,
-            self.metadata.compression,
-            self.metadata.tile_width,
-            self.metadata.tile_height,
-            self.metadata.bands,
-            self.metadata.data_type.bytes_per_sample(),
-        )?;
-
-        // Apply predictor if needed
-        let unpredicted = apply_predictor(
-            &decompressed,
-            self.metadata.predictor,
-            self.metadata.tile_width,
-            self.metadata.bands,
-            self.metadata.data_type.bytes_per_sample(),
-        )?;
-
-        // Convert to f32
-        let result = convert_to_f32(
-            &unpredicted,
-            self.metadata.data_type,
-            self.metadata.little_endian,
-        );
-
-        // Cache the result
-        tile_cache::insert(source_id, tile_index, None, Arc::new(result.clone()));
-
-        Ok(result)
+        let (data, _) = self.read_tile_sync(TileRef { overview: None, index: tile_index })?;
+        Ok((*data).clone())
     }
 
     /// Read a single tile and return both data and bytes fetched from source
@@ -903,59 +903,8 @@ impl CogReader {
     /// Returns an error if the tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
     pub fn read_tile_with_bytes(&self, tile_index: usize) -> AnyResult<(Vec<f32>, usize)> {
-        let source_id = self.reader.identifier();
-
-        // Check cache first
-        if let Some(cached) = tile_cache::get(source_id, tile_index, None) {
-            return Ok(((*cached).clone(), 0)); // Cache hit = 0 bytes fetched
-        }
-
-        if tile_index >= self.metadata.tile_offsets.len() {
-            return Err(format!(
-                "Tile index {} out of range (max {})",
-                tile_index,
-                self.metadata.tile_offsets.len()
-            ).into());
-        }
-
-        let offset = self.metadata.tile_offsets[tile_index];
-        // Safe cast: tile byte counts are always < 100MB, well within usize range
-        #[allow(clippy::cast_possible_truncation)]
-        let byte_count = self.metadata.tile_byte_counts[tile_index] as usize;
-
-        if byte_count == 0 {
-            let pixel_count = self.metadata.tile_width * self.metadata.tile_height * self.metadata.bands;
-            return Ok((vec![f32::NAN; pixel_count], 0));
-        }
-
-        let compressed = self.reader.read_range(offset, byte_count)?;
-
-        let decompressed = decompress_tile(
-            &compressed,
-            self.metadata.compression,
-            self.metadata.tile_width,
-            self.metadata.tile_height,
-            self.metadata.bands,
-            self.metadata.data_type.bytes_per_sample(),
-        )?;
-
-        let unpredicted = apply_predictor(
-            &decompressed,
-            self.metadata.predictor,
-            self.metadata.tile_width,
-            self.metadata.bands,
-            self.metadata.data_type.bytes_per_sample(),
-        )?;
-
-        let result = convert_to_f32(
-            &unpredicted,
-            self.metadata.data_type,
-            self.metadata.little_endian,
-        );
-
-        tile_cache::insert(source_id, tile_index, None, Arc::new(result.clone()));
-
-        Ok((result, byte_count))
+        let (data, bytes) = self.read_tile_sync(TileRef { overview: None, index: tile_index })?;
+        Ok(((*data).clone(), bytes))
     }
 
     /// Read an overview tile and return both data and bytes fetched from source
@@ -966,62 +915,31 @@ impl CogReader {
     /// Returns an error if the overview or tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
     pub fn read_overview_tile_with_bytes(&self, overview_idx: usize, tile_index: usize) -> AnyResult<(Vec<f32>, usize)> {
-        let source_id = self.reader.identifier();
+        let (data, bytes) = self.read_tile_sync(TileRef { overview: Some(overview_idx), index: tile_index })?;
+        Ok(((*data).clone(), bytes))
+    }
 
-        // Check cache first
-        if let Some(cached) = tile_cache::get(source_id, tile_index, Some(overview_idx)) {
-            return Ok(((*cached).clone(), 0)); // Cache hit = 0 bytes fetched
-        }
+    /// Async counterpart of [`CogReader::read_tile`]: the fetch is awaited and decoding runs on
+    /// the blocking pool.
+    ///
+    /// # Errors
+    /// Returns an error if the tile index is out of range, if reading tile data fails,
+    /// or if decompression fails.
+    pub async fn read_tile_async(&self, tile_index: usize) -> AnyResult<Vec<f32>> {
+        let (data, _) = self.read_tile_async_ref(TileRef { overview: None, index: tile_index }).await?;
+        Ok((*data).clone())
+    }
 
-        let ovr = self.overviews.get(overview_idx)
-            .ok_or_else(|| format!("Overview index {overview_idx} out of range"))?;
-
-        if tile_index >= ovr.tile_offsets.len() {
-            return Err(format!(
-                "Tile index {} out of range (max {})",
-                tile_index,
-                ovr.tile_offsets.len()
-            ).into());
-        }
-
-        let offset = ovr.tile_offsets[tile_index];
-        // Safe cast: tile byte counts are always < 100MB, well within usize range
-        #[allow(clippy::cast_possible_truncation)]
-        let byte_count = ovr.tile_byte_counts[tile_index] as usize;
-
-        if byte_count == 0 {
-            let pixel_count = ovr.tile_width * ovr.tile_height * self.metadata.bands;
-            return Ok((vec![f32::NAN; pixel_count], 0));
-        }
-
-        let compressed = self.reader.read_range(offset, byte_count)?;
-
-        let decompressed = decompress_tile(
-            &compressed,
-            self.metadata.compression,
-            ovr.tile_width,
-            ovr.tile_height,
-            self.metadata.bands,
-            self.metadata.data_type.bytes_per_sample(),
-        )?;
-
-        let unpredicted = apply_predictor(
-            &decompressed,
-            self.metadata.predictor,
-            ovr.tile_width,
-            self.metadata.bands,
-            self.metadata.data_type.bytes_per_sample(),
-        )?;
-
-        let result = convert_to_f32(
-            &unpredicted,
-            self.metadata.data_type,
-            self.metadata.little_endian,
-        );
-
-        tile_cache::insert(source_id, tile_index, Some(overview_idx), Arc::new(result.clone()));
-
-        Ok((result, byte_count))
+    /// Async counterpart of [`CogReader::read_overview_tile`].
+    ///
+    /// # Errors
+    /// Returns an error if the overview or tile index is out of range, if reading tile data fails,
+    /// or if decompression fails.
+    pub async fn read_overview_tile_async(&self, overview_idx: usize, tile_index: usize) -> AnyResult<Vec<f32>> {
+        let (data, _) = self
+            .read_tile_async_ref(TileRef { overview: Some(overview_idx), index: tile_index })
+            .await?;
+        Ok((*data).clone())
     }
 
     /// Sample a single pixel value
@@ -1062,7 +980,7 @@ impl CogReader {
 
         // For local files, do a full scan for accuracy
         // For remote files, use fast sampling to minimize network requests
-        if self.reader.is_local() {
+        if self.async_io.is_local() {
             self.estimate_min_max_full_scan()
         } else {
             self.estimate_min_max_fast()
@@ -1173,34 +1091,10 @@ impl CogReader {
         }
     }
 
-    /// Clone the reader for use in async tasks
-    ///
-    /// This creates a new `CogReader` that shares the same underlying `RangeReader`
-    /// and metadata, suitable for moving into async tasks or threads.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use cogrs::CogReader;
-    ///
-    /// fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ///     let reader = CogReader::open("path/to/cog.tif")?;
-    ///     let reader_clone = reader.clone_for_async();
-    ///
-    ///     tokio::spawn(async move {
-    ///         // Use reader_clone in async context
-    ///     });
-    ///     Ok(())
-    /// }
-    /// ```
+    /// True if the source is a network resource (S3 or HTTP).
     #[must_use]
-    pub fn clone_for_async(&self) -> Self {
-        Self {
-            reader: Arc::clone(&self.reader),
-            metadata: self.metadata.clone(),
-            overviews: self.overviews.clone(),
-            min_usable_overview: self.min_usable_overview,
-        }
+    pub fn is_remote(&self) -> bool {
+        !self.async_io.is_local()
     }
 }
 
@@ -1256,14 +1150,198 @@ fn read_f64(bytes: &[u8], little_endian: bool) -> f64 {
     }
 }
 
+/// True for sources that are fetched over the network (`s3://`, `http://`, `https://`).
+fn is_remote_source(source: &str) -> bool {
+    source.starts_with("s3://") || source.starts_with("http://") || source.starts_with("https://")
+}
+
+/// Minimum fraction of valid samples for an overview to count as usable.
+///
+/// 5% is aggressive but ensures good visual results for sparse data: for a file with 6% valid
+/// data at full resolution, overviews with <5% are significantly degraded. The trade-off is
+/// that sparse datasets read more tiles at low zoom, but the visual quality improvement is
+/// dramatic (see barley crop data as example).
+const MIN_OVERVIEW_DENSITY: f64 = 0.05;
+
+/// Tiles sampled from an overview to judge its data density: first, middle and last.
+fn overview_sample_indices(num_tiles: usize) -> Vec<usize> {
+    if num_tiles <= 3 {
+        (0..num_tiles).collect()
+    } else {
+        vec![0, num_tiles / 2, num_tiles - 1]
+    }
+}
+
+/// Samples that are neither NaN nor zero.
+fn valid_sample_count(data: &[f32]) -> usize {
+    data.iter().filter(|v| !v.is_nan() && **v != 0.0).count()
+}
+
+fn overview_density(valid_pixels: usize, total_pixels: usize) -> f64 {
+    if total_pixels > 0 {
+        // Safe cast: usize to f64 precision loss acceptable for pixel counts (ratios still accurate)
+        #[allow(clippy::cast_precision_loss)]
+        let density = valid_pixels as f64 / total_pixels as f64;
+        density
+    } else {
+        0.0
+    }
+}
+
+/// What `open` learns from the file structure (header and IFD chain), before any overview
+/// quality hint is applied.
+struct CogStructure {
+    metadata: CogMetadata,
+    overviews: Vec<OverviewMetadata>,
+}
+
+/// One IFD's entries (value bytes not yet fetched) and the offset of the next IFD.
+struct Ifd {
+    tags: HashMap<u16, IfdEntry>,
+    next: u32,
+}
+
+/// Read the TIFF header, the full-resolution IFD and the overview IFD chain.
+///
+/// IFD tables are read first; the (possibly large) tile offset/byte-count arrays and other tag
+/// values are then fetched concurrently, so a COG with many overviews costs one round trip
+/// for them rather than one per array.
+async fn parse_cog_structure(io: &dyn AsyncRangeReader) -> AnyResult<CogStructure> {
+    // Read header to get IFD offset and byte order
+    let header_bytes = io.read_range(0, 8).await?;
+
+    let little_endian = match &header_bytes[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return Err("Invalid TIFF signature".into()),
+    };
+
+    let version = read_u16(&header_bytes[2..4], little_endian);
+    if version != 42 {
+        return Err(format!("Invalid TIFF version: {version}").into());
+    }
+
+    let ifd_offset = read_u32(&header_bytes[4..8], little_endian);
+    let file_size = io.size();
+
+    let first = read_ifd(io, u64::from(ifd_offset), file_size, little_endian).await?;
+
+    // Overview IFDs (subsequent IFDs in the chain)
+    let walk_chain = async {
+        let mut headers: Vec<(OverviewHeader, HashMap<u16, IfdEntry>)> = Vec::new();
+        let mut next = first.next;
+        while next != 0 {
+            let ifd = read_ifd(io, u64::from(next), file_size, little_endian).await?;
+            let Ok(header) = parse_overview_header(&ifd.tags, little_endian) else {
+                break;
+            };
+            headers.push((header, ifd.tags));
+            next = ifd.next;
+
+            // Safety limit - COGs typically have at most 10 overviews
+            if headers.len() > 10 {
+                break;
+            }
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(headers)
+    };
+    let (metadata, headers) = futures::try_join!(parse_ifd(&first.tags, io, little_endian), walk_chain)?;
+
+    let arrays = futures::future::join_all(
+        headers
+            .iter()
+            .map(|(header, tags)| read_overview_arrays(io, tags, header.tiles_across * header.tiles_down, little_endian)),
+    )
+    .await;
+
+    // An overview that cannot be parsed ends the chain (it and the ones after it are dropped).
+    let full_width = metadata.width;
+    let mut overviews = Vec::with_capacity(headers.len());
+    for ((header, _), arrays) in headers.into_iter().zip(arrays) {
+        let Ok((tile_offsets, tile_byte_counts)) = arrays else {
+            break;
+        };
+        // Calculate actual scale from dimensions using floor division
+        // This matches GDAL's behavior: scale = full_width / ovr_width
+        // For 20966/1310 this gives 16, not 17 (ceiling would be wrong)
+        let actual_scale = full_width / header.width;
+        overviews.push(OverviewMetadata {
+            width: header.width,
+            height: header.height,
+            tile_width: header.tile_width,
+            tile_height: header.tile_height,
+            tiles_across: header.tiles_across,
+            tiles_down: header.tiles_down,
+            tile_offsets,
+            tile_byte_counts,
+            scale: actual_scale,
+        });
+    }
+
+    Ok(CogStructure { metadata, overviews })
+}
+
+/// Read one IFD table (entries and next-IFD offset) at `offset`.
+async fn read_ifd(io: &dyn AsyncRangeReader, offset: u64, file_size: u64, little_endian: bool) -> AnyResult<Ifd> {
+    // Read IFD entries - estimate size based on typical COG (usually < 4KB)
+    // Clamp to available bytes if IFD is near end of file
+    // Safe cast: clamped to 4096, well within usize range on all platforms
+    #[allow(clippy::cast_possible_truncation)]
+    let size = file_size.saturating_sub(offset).min(4096) as usize;
+    if size < 2 {
+        return Err(format!("IFD offset {offset} lies outside the file ({file_size} bytes)").into());
+    }
+    let ifd_bytes = io.read_range(offset, size).await?;
+    let entry_count = read_u16(&ifd_bytes[0..2], little_endian) as usize;
+
+    // Parse all IFD entries into a map
+    let mut tags: HashMap<u16, IfdEntry> = HashMap::new();
+
+    for i in 0..entry_count {
+        let entry_offset = 2 + i * 12;
+        if entry_offset + 12 > ifd_bytes.len() {
+            break;
+        }
+
+        let tag = read_u16(&ifd_bytes[entry_offset..entry_offset + 2], little_endian);
+        let field_type = read_u16(&ifd_bytes[entry_offset + 2..entry_offset + 4], little_endian);
+        let count = read_u32(&ifd_bytes[entry_offset + 4..entry_offset + 8], little_endian);
+        let value_offset = read_u32(&ifd_bytes[entry_offset + 8..entry_offset + 12], little_endian);
+
+        tags.insert(
+            tag,
+            IfdEntry {
+                field_type,
+                count,
+                value_offset,
+                raw_bytes: [
+                    ifd_bytes[entry_offset + 8],
+                    ifd_bytes[entry_offset + 9],
+                    ifd_bytes[entry_offset + 10],
+                    ifd_bytes[entry_offset + 11],
+                ],
+            },
+        );
+    }
+
+    // The next IFD offset is right after all entries
+    let next_ifd_pos = 2 + entry_count * 12;
+    let next = if next_ifd_pos + 4 <= ifd_bytes.len() {
+        read_u32(&ifd_bytes[next_ifd_pos..next_ifd_pos + 4], little_endian)
+    } else {
+        0
+    };
+
+    Ok(Ifd { tags, next })
+}
+
 /// Parse tile or strip layout from IFD tags
 ///
 /// Returns (`tile_width`, `tile_height`, `tiles_across`, `tiles_down`, `is_tiled`, `tile_offsets`, `tile_byte_counts`)
 #[allow(clippy::type_complexity)] // Return tuple is clear from context and used locally
-fn parse_tile_layout(
+async fn parse_tile_layout(
     tags: &HashMap<u16, IfdEntry>,
-    reader: &Arc<dyn RangeReader>,
-    ifd_offset: u64,
+    io: &dyn AsyncRangeReader,
     little_endian: bool,
     width: usize,
     height: usize,
@@ -1283,22 +1361,9 @@ fn parse_tile_layout(
         let td = height.div_ceil(th);
         let total_tiles = ta * td;
 
-        let offsets = read_tag_array_u64(
-            tags,
-            TAG_TILE_OFFSETS,
-            reader,
-            ifd_offset,
-            little_endian,
-            total_tiles,
-        )?;
-
-        let byte_counts = read_tag_array_u64(
-            tags,
-            TAG_TILE_BYTE_COUNTS,
-            reader,
-            ifd_offset,
-            little_endian,
-            total_tiles,
+        let (offsets, byte_counts) = futures::try_join!(
+            read_tag_array_u64(tags, TAG_TILE_OFFSETS, io, little_endian, total_tiles),
+            read_tag_array_u64(tags, TAG_TILE_BYTE_COUNTS, io, little_endian, total_tiles),
         )?;
 
         Ok((tw, th, ta, td, is_tiled, offsets, byte_counts))
@@ -1315,22 +1380,9 @@ fn parse_tile_layout(
         let td = height.div_ceil(rows_per_strip);
         let total_strips = td;
 
-        let offsets = read_tag_array_u64(
-            tags,
-            TAG_STRIP_OFFSETS,
-            reader,
-            ifd_offset,
-            little_endian,
-            total_strips,
-        )?;
-
-        let byte_counts = read_tag_array_u64(
-            tags,
-            TAG_STRIP_BYTE_COUNTS,
-            reader,
-            ifd_offset,
-            little_endian,
-            total_strips,
+        let (offsets, byte_counts) = futures::try_join!(
+            read_tag_array_u64(tags, TAG_STRIP_OFFSETS, io, little_endian, total_strips),
+            read_tag_array_u64(tags, TAG_STRIP_BYTE_COUNTS, io, little_endian, total_strips),
         )?;
 
         Ok((tw, th, ta, td, false, offsets, byte_counts))
@@ -1339,62 +1391,29 @@ fn parse_tile_layout(
     }
 }
 
-/// Parse IFD and extract all COG metadata
-fn parse_ifd(
-    ifd_bytes: &[u8],
-    reader: &Arc<dyn RangeReader>,
-    ifd_offset: u64,
+/// Parse the full-resolution IFD and extract all COG metadata
+async fn parse_ifd(
+    tags: &HashMap<u16, IfdEntry>,
+    io: &dyn AsyncRangeReader,
     little_endian: bool,
 ) -> AnyResult<CogMetadata> {
-    let entry_count = read_u16(&ifd_bytes[0..2], little_endian) as usize;
-
-    // Parse all IFD entries into a map
-    let mut tags: HashMap<u16, IfdEntry> = HashMap::new();
-
-    for i in 0..entry_count {
-        let offset = 2 + i * 12;
-        if offset + 12 > ifd_bytes.len() {
-            break;
-        }
-
-        let tag = read_u16(&ifd_bytes[offset..offset + 2], little_endian);
-        let field_type = read_u16(&ifd_bytes[offset + 2..offset + 4], little_endian);
-        let count = read_u32(&ifd_bytes[offset + 4..offset + 8], little_endian);
-        let value_offset = read_u32(&ifd_bytes[offset + 8..offset + 12], little_endian);
-
-        tags.insert(
-            tag,
-            IfdEntry {
-                field_type,
-                count,
-                value_offset,
-                raw_bytes: [
-                    ifd_bytes[offset + 8],
-                    ifd_bytes[offset + 9],
-                    ifd_bytes[offset + 10],
-                    ifd_bytes[offset + 11],
-                ],
-            },
-        );
-    }
-
     // Extract required tags
-    let width = get_tag_value(&tags, TAG_IMAGE_WIDTH, little_endian)
+    let width = get_tag_value(tags, TAG_IMAGE_WIDTH, little_endian)
         .ok_or("Missing ImageWidth tag")? as usize;
-    let height = get_tag_value(&tags, TAG_IMAGE_LENGTH, little_endian)
+    let height = get_tag_value(tags, TAG_IMAGE_LENGTH, little_endian)
         .ok_or("Missing ImageLength tag")? as usize;
 
     // Safe casts: these tag values are small constants (<100), well within u16/usize range
     #[allow(clippy::cast_possible_truncation)]
-    let bits_per_sample = get_tag_value(&tags, TAG_BITS_PER_SAMPLE, little_endian).unwrap_or(8) as u16;
+    let bits_per_sample = get_tag_value(tags, TAG_BITS_PER_SAMPLE, little_endian).unwrap_or(8) as u16;
     #[allow(clippy::cast_possible_truncation)]
-    let sample_format = get_tag_value(&tags, TAG_SAMPLE_FORMAT, little_endian).unwrap_or(1) as u16;
+    let sample_format = get_tag_value(tags, TAG_SAMPLE_FORMAT, little_endian).unwrap_or(1) as u16;
     #[allow(clippy::cast_possible_truncation)]
-    let bands = get_tag_value(&tags, TAG_SAMPLES_PER_PIXEL, little_endian).unwrap_or(1) as usize;
+    let bands = get_tag_value(tags, TAG_SAMPLES_PER_PIXEL, little_endian).unwrap_or(1) as usize;
     #[allow(clippy::cast_possible_truncation)]
-    let compression_val = get_tag_value(&tags, TAG_COMPRESSION, little_endian).unwrap_or(1) as u16;
+    let compression_val = get_tag_value(tags, TAG_COMPRESSION, little_endian).unwrap_or(1) as u16;
     #[allow(clippy::cast_possible_truncation)]
-    let predictor = get_tag_value(&tags, TAG_PREDICTOR, little_endian).unwrap_or(1) as u16;
+    let predictor = get_tag_value(tags, TAG_PREDICTOR, little_endian).unwrap_or(1) as u16;
 
     let data_type = CogDataType::from_tags(bits_per_sample, sample_format)
         .ok_or_else(|| format!("Unsupported data type: bits={bits_per_sample}, format={sample_format}"))?;
@@ -1402,23 +1421,27 @@ fn parse_ifd(
     let compression = Compression::from_tag(compression_val)
         .ok_or_else(|| format!("Unsupported compression: {compression_val}"))?;
 
-    // Parse tile or strip layout
-    let (tile_width, tile_height, tiles_across, tiles_down, is_tiled, tile_offsets, tile_byte_counts) =
-        parse_tile_layout(&tags, reader, ifd_offset, little_endian, width, height)?;
-
-    // Read geo transform
-    let pixel_scale = read_tag_f64_array(&tags, TAG_MODEL_PIXEL_SCALE, reader, ifd_offset, little_endian, 3)?;
-    let tiepoint = read_tag_f64_array(&tags, TAG_MODEL_TIEPOINT, reader, ifd_offset, little_endian, 6)?;
+    // Everything below reads tag values that may live outside the IFD table; fetch them
+    // concurrently. Order of the results matches the order of the calls.
+    let (layout, pixel_scale, tiepoint, geokeys, gdal_metadata, nodata) = futures::try_join!(
+        parse_tile_layout(tags, io, little_endian, width, height),
+        read_tag_f64_array(tags, TAG_MODEL_PIXEL_SCALE, io, little_endian, 3),
+        read_tag_f64_array(tags, TAG_MODEL_TIEPOINT, io, little_endian, 6),
+        read_geokey_directory(tags, io),
+        read_gdal_metadata_info(tags, io),
+        read_gdal_nodata(tags, io),
+    )?;
+    let (tile_width, tile_height, tiles_across, tiles_down, is_tiled, tile_offsets, tile_byte_counts) = layout;
 
     // Read CRS from GeoKey directory
-    let crs_code = read_crs_from_geokeys(&tags, reader, ifd_offset, little_endian)?;
+    let crs_code = crs_from_geokeys(geokeys.as_deref(), little_endian);
 
     // Check if pixels are Point registered (from GTRasterTypeGeoKey or GDAL metadata)
     // GeoKey takes precedence as it's the GeoTIFF standard way
-    let is_point_from_geokey = read_raster_type_from_geokeys(&tags, reader, little_endian)?;
+    let is_point_from_geokey = raster_type_is_point(geokeys.as_deref(), little_endian);
 
-    // Read GDAL metadata (stats and AREA_OR_POINT fallback)
-    let (stats_min, stats_max, is_point_from_gdal) = read_gdal_metadata_info(&tags, reader, ifd_offset, little_endian)?;
+    // GDAL metadata (stats and AREA_OR_POINT fallback)
+    let (stats_min, stats_max, is_point_from_gdal) = gdal_metadata;
 
     // Use GeoKey value if available, otherwise fall back to GDAL metadata
     let is_point_registered = is_point_from_geokey || is_point_from_gdal;
@@ -1428,9 +1451,6 @@ fn parse_ifd(
         tiepoint: tiepoint.map(|v| [v[0], v[1], v[2], v[3], v[4], v[5]]),
         is_point_registered,
     };
-
-    // Read nodata
-    let nodata = read_gdal_nodata(&tags, reader, ifd_offset, little_endian)?;
 
     Ok(CogMetadata {
         width,
@@ -1455,131 +1475,52 @@ fn parse_ifd(
     })
 }
 
-/// Parse IFD and return metadata plus next IFD offset
-fn parse_ifd_with_next(
-    ifd_bytes: &[u8],
-    reader: &Arc<dyn RangeReader>,
-    ifd_offset: u64,
-    little_endian: bool,
-) -> AnyResult<(CogMetadata, u32)> {
-    let entry_count = read_u16(&ifd_bytes[0..2], little_endian) as usize;
-
-    // The next IFD offset is right after all entries
-    let next_ifd_pos = 2 + entry_count * 12;
-    let next_ifd_offset = if next_ifd_pos + 4 <= ifd_bytes.len() {
-        read_u32(&ifd_bytes[next_ifd_pos..next_ifd_pos + 4], little_endian)
-    } else {
-        0
-    };
-
-    let metadata = parse_ifd(ifd_bytes, reader, ifd_offset, little_endian)?;
-    Ok((metadata, next_ifd_offset))
-}
-
-/// Simplified metadata for overview IFDs
-struct OverviewIfdData {
+/// Dimensions and tiling of an overview IFD (simpler than full IFD parsing)
+struct OverviewHeader {
     width: usize,
     height: usize,
     tile_width: usize,
     tile_height: usize,
     tiles_across: usize,
     tiles_down: usize,
-    tile_offsets: Vec<u64>,
-    tile_byte_counts: Vec<u64>,
 }
 
-/// Parse an overview IFD (simpler than full IFD parsing)
-fn parse_overview_ifd(
-    ifd_bytes: &[u8],
-    reader: &Arc<dyn RangeReader>,
-    ifd_offset: u64,
-    little_endian: bool,
-    _full_meta: &CogMetadata, // For inheriting compression, data type, etc.
-) -> AnyResult<(OverviewIfdData, u32)> {
-    let entry_count = read_u16(&ifd_bytes[0..2], little_endian) as usize;
-
-    // Parse all IFD entries into a map
-    let mut tags: HashMap<u16, IfdEntry> = HashMap::new();
-
-    for i in 0..entry_count {
-        let offset = 2 + i * 12;
-        if offset + 12 > ifd_bytes.len() {
-            break;
-        }
-
-        let tag = read_u16(&ifd_bytes[offset..offset + 2], little_endian);
-        let field_type = read_u16(&ifd_bytes[offset + 2..offset + 4], little_endian);
-        let count = read_u32(&ifd_bytes[offset + 4..offset + 8], little_endian);
-        let value_offset = read_u32(&ifd_bytes[offset + 8..offset + 12], little_endian);
-
-        tags.insert(
-            tag,
-            IfdEntry {
-                field_type,
-                count,
-                value_offset,
-                raw_bytes: [
-                    ifd_bytes[offset + 8],
-                    ifd_bytes[offset + 9],
-                    ifd_bytes[offset + 10],
-                    ifd_bytes[offset + 11],
-                ],
-            },
-        );
-    }
-
-    // Get next IFD offset
-    let next_ifd_pos = 2 + entry_count * 12;
-    let next_ifd_offset = if next_ifd_pos + 4 <= ifd_bytes.len() {
-        read_u32(&ifd_bytes[next_ifd_pos..next_ifd_pos + 4], little_endian)
-    } else {
-        0
-    };
-
+fn parse_overview_header(tags: &HashMap<u16, IfdEntry>, little_endian: bool) -> AnyResult<OverviewHeader> {
     // Extract dimensions and tile info
-    let width = get_tag_value(&tags, TAG_IMAGE_WIDTH, little_endian)
+    let width = get_tag_value(tags, TAG_IMAGE_WIDTH, little_endian)
         .ok_or("Overview missing ImageWidth tag")? as usize;
-    let height = get_tag_value(&tags, TAG_IMAGE_LENGTH, little_endian)
+    let height = get_tag_value(tags, TAG_IMAGE_LENGTH, little_endian)
         .ok_or("Overview missing ImageLength tag")? as usize;
 
-    let tile_width = get_tag_value(&tags, TAG_TILE_WIDTH, little_endian)
+    let tile_width = get_tag_value(tags, TAG_TILE_WIDTH, little_endian)
         .ok_or("Overview missing TileWidth tag")? as usize;
-    let tile_height = get_tag_value(&tags, TAG_TILE_LENGTH, little_endian)
+    let tile_height = get_tag_value(tags, TAG_TILE_LENGTH, little_endian)
         .ok_or("Overview missing TileLength tag")? as usize;
+    if width == 0 || tile_width == 0 || tile_height == 0 {
+        return Err("Overview has a zero dimension".into());
+    }
 
-    let tiles_across = width.div_ceil(tile_width);
-    let tiles_down = height.div_ceil(tile_height);
-    let total_tiles = tiles_across * tiles_down;
-
-    // Read tile offsets and byte counts
-    let tile_offsets = read_tag_array_u64(
-        &tags,
-        TAG_TILE_OFFSETS,
-        reader,
-        ifd_offset,
-        little_endian,
-        total_tiles,
-    )?;
-
-    let tile_byte_counts = read_tag_array_u64(
-        &tags,
-        TAG_TILE_BYTE_COUNTS,
-        reader,
-        ifd_offset,
-        little_endian,
-        total_tiles,
-    )?;
-
-    Ok((OverviewIfdData {
+    Ok(OverviewHeader {
         width,
         height,
         tile_width,
         tile_height,
-        tiles_across,
-        tiles_down,
-        tile_offsets,
-        tile_byte_counts,
-    }, next_ifd_offset))
+        tiles_across: width.div_ceil(tile_width),
+        tiles_down: height.div_ceil(tile_height),
+    })
+}
+
+/// Read an overview's tile offset and byte-count arrays.
+async fn read_overview_arrays(
+    io: &dyn AsyncRangeReader,
+    tags: &HashMap<u16, IfdEntry>,
+    total_tiles: usize,
+    little_endian: bool,
+) -> AnyResult<(Vec<u64>, Vec<u64>)> {
+    futures::try_join!(
+        read_tag_array_u64(tags, TAG_TILE_OFFSETS, io, little_endian, total_tiles),
+        read_tag_array_u64(tags, TAG_TILE_BYTE_COUNTS, io, little_endian, total_tiles),
+    )
 }
 
 struct IfdEntry {
@@ -1611,11 +1552,19 @@ fn get_tag_value(tags: &HashMap<u16, IfdEntry>, tag: u16, little_endian: bool) -
     }
 }
 
-fn read_tag_array_u64(
+/// Bytes of a tag value: inline in the IFD entry when it fits in 4 bytes, else fetched.
+async fn tag_value_bytes(entry: &IfdEntry, total_bytes: usize, io: &dyn AsyncRangeReader) -> AnyResult<Bytes> {
+    if total_bytes <= 4 {
+        Ok(Bytes::copy_from_slice(&entry.raw_bytes[..total_bytes]))
+    } else {
+        io.read_range(u64::from(entry.value_offset), total_bytes).await
+    }
+}
+
+async fn read_tag_array_u64(
     tags: &HashMap<u16, IfdEntry>,
     tag: u16,
-    reader: &Arc<dyn RangeReader>,
-    _ifd_offset: u64,
+    io: &dyn AsyncRangeReader,
     little_endian: bool,
     expected_count: usize,
 ) -> AnyResult<Vec<u64>> {
@@ -1629,12 +1578,7 @@ fn read_tag_array_u64(
     };
 
     let total_bytes = entry.count as usize * type_size;
-
-    let raw_bytes = if total_bytes <= 4 {
-        entry.raw_bytes[..total_bytes].to_vec()
-    } else {
-        reader.read_range(u64::from(entry.value_offset), total_bytes)?
-    };
+    let raw_bytes = tag_value_bytes(entry, total_bytes, io).await?;
 
     let mut values = Vec::with_capacity(entry.count as usize);
     for i in 0..entry.count as usize {
@@ -1656,11 +1600,10 @@ fn read_tag_array_u64(
     Ok(values)
 }
 
-fn read_tag_f64_array(
+async fn read_tag_f64_array(
     tags: &HashMap<u16, IfdEntry>,
     tag: u16,
-    reader: &Arc<dyn RangeReader>,
-    _ifd_offset: u64,
+    io: &dyn AsyncRangeReader,
     little_endian: bool,
     min_count: usize,
 ) -> AnyResult<Option<Vec<f64>>> {
@@ -1678,7 +1621,7 @@ fn read_tag_f64_array(
     }
 
     let total_bytes = entry.count as usize * 8;
-    let raw_bytes = reader.read_range(u64::from(entry.value_offset), total_bytes)?;
+    let raw_bytes = io.read_range(u64::from(entry.value_offset), total_bytes).await?;
 
     let mut values = Vec::with_capacity(entry.count as usize);
     for i in 0..entry.count as usize {
@@ -1692,18 +1635,12 @@ fn read_tag_f64_array(
 /// GeoKey constants
 const GEO_KEY_RASTER_TYPE: u16 = 1025;  // GTRasterTypeGeoKey: 1=PixelIsArea, 2=PixelIsPoint
 
-fn read_crs_from_geokeys(
-    tags: &HashMap<u16, IfdEntry>,
-    reader: &Arc<dyn RangeReader>,
-    _ifd_offset: u64,
-    little_endian: bool,
-) -> AnyResult<Option<i32>> {
-    let Some(raw_bytes) = read_geokey_directory(tags, reader, little_endian)? else {
-        return Ok(None);
-    };
+/// CRS code from the `GeoKey` directory (ProjectedCSTypeGeoKey or GeographicTypeGeoKey)
+fn crs_from_geokeys(raw_bytes: Option<&[u8]>, little_endian: bool) -> Option<i32> {
+    let raw_bytes = raw_bytes?;
 
     if raw_bytes.len() < 8 {
-        return Ok(None);
+        return None;
     }
 
     let num_keys = read_u16(&raw_bytes[6..8], little_endian) as usize;
@@ -1721,29 +1658,25 @@ fn read_crs_from_geokeys(
 
         // Check for ProjectedCSTypeGeoKey (3072) or GeographicTypeGeoKey (2048)
         if key_id == GEO_KEY_PROJECTED_CRS && value > 0 {
-            return Ok(Some(i32::from(value)));
+            return Some(i32::from(value));
         }
         if key_id == GEO_KEY_GEOGRAPHIC_TYPE && value > 0 {
-            return Ok(Some(i32::from(value)));
+            return Some(i32::from(value));
         }
     }
 
-    Ok(None)
+    None
 }
 
 /// Read GTRasterTypeGeoKey to determine if pixels are Point or Area registered
 /// Returns true if PixelIsPoint (value = 2), false otherwise (Area or missing)
-fn read_raster_type_from_geokeys(
-    tags: &HashMap<u16, IfdEntry>,
-    reader: &Arc<dyn RangeReader>,
-    little_endian: bool,
-) -> AnyResult<bool> {
-    let Some(raw_bytes) = read_geokey_directory(tags, reader, little_endian)? else {
-        return Ok(false);
+fn raster_type_is_point(raw_bytes: Option<&[u8]>, little_endian: bool) -> bool {
+    let Some(raw_bytes) = raw_bytes else {
+        return false;
     };
 
     if raw_bytes.len() < 8 {
-        return Ok(false);
+        return false;
     }
 
     let num_keys = read_u16(&raw_bytes[6..8], little_endian) as usize;
@@ -1761,19 +1694,18 @@ fn read_raster_type_from_geokeys(
 
         // GTRasterTypeGeoKey (1025): 1 = PixelIsArea, 2 = PixelIsPoint
         if key_id == GEO_KEY_RASTER_TYPE && tiff_tag_location == 0 {
-            return Ok(value == 2);  // true if PixelIsPoint
+            return value == 2; // true if PixelIsPoint
         }
     }
 
-    Ok(false)
+    false
 }
 
 /// Helper to read raw `GeoKey` directory bytes
-fn read_geokey_directory(
+async fn read_geokey_directory(
     tags: &HashMap<u16, IfdEntry>,
-    reader: &Arc<dyn RangeReader>,
-    _little_endian: bool,
-) -> AnyResult<Option<Vec<u8>>> {
+    io: &dyn AsyncRangeReader,
+) -> AnyResult<Option<Bytes>> {
     let Some(entry) = tags.get(&TAG_GEO_KEY_DIRECTORY) else {
         return Ok(None);
     };
@@ -1784,37 +1716,21 @@ fn read_geokey_directory(
     }
 
     let total_bytes = entry.count as usize * 2;
-    let raw_bytes = if total_bytes <= 4 {
-        entry.raw_bytes[..total_bytes].to_vec()
-    } else {
-        reader.read_range(u64::from(entry.value_offset), total_bytes)?
-    };
-
-    Ok(Some(raw_bytes))
+    Ok(Some(tag_value_bytes(entry, total_bytes, io).await?))
 }
-
-#[allow(dead_code)]
-fn read_geokey_directory_unused(_little_endian: bool) {}
 
 /// Read GDAL metadata: stats and AREA_OR_POINT
 /// Returns (min, max, is_point_registered)
-fn read_gdal_metadata_info(
+async fn read_gdal_metadata_info(
     tags: &HashMap<u16, IfdEntry>,
-    reader: &Arc<dyn RangeReader>,
-    _ifd_offset: u64,
-    _little_endian: bool,
+    io: &dyn AsyncRangeReader,
 ) -> AnyResult<(Option<f32>, Option<f32>, bool)> {
     let Some(entry) = tags.get(&TAG_GDAL_METADATA) else {
         return Ok((None, None, false));
     };
 
     // GDAL metadata is ASCII/UTF-8 XML
-    let total_bytes = entry.count as usize;
-    let raw_bytes = if total_bytes <= 4 {
-        entry.raw_bytes[..total_bytes].to_vec()
-    } else {
-        reader.read_range(u64::from(entry.value_offset), total_bytes)?
-    };
+    let raw_bytes = tag_value_bytes(entry, entry.count as usize, io).await?;
 
     let metadata_str = String::from_utf8_lossy(&raw_bytes);
 
@@ -1844,22 +1760,15 @@ fn extract_gdal_str(metadata: &str, key: &str) -> Option<String> {
     Some(rest[..end].trim().to_string())
 }
 
-fn read_gdal_nodata(
+async fn read_gdal_nodata(
     tags: &HashMap<u16, IfdEntry>,
-    reader: &Arc<dyn RangeReader>,
-    _ifd_offset: u64,
-    _little_endian: bool,
+    io: &dyn AsyncRangeReader,
 ) -> AnyResult<Option<f64>> {
     let Some(entry) = tags.get(&TAG_GDAL_NODATA) else {
         return Ok(None);
     };
 
-    let total_bytes = entry.count as usize;
-    let raw_bytes = if total_bytes <= 4 {
-        entry.raw_bytes[..total_bytes].to_vec()
-    } else {
-        reader.read_range(u64::from(entry.value_offset), total_bytes)?
-    };
+    let raw_bytes = tag_value_bytes(entry, entry.count as usize, io).await?;
 
     let nodata_str = String::from_utf8_lossy(&raw_bytes);
     let nodata_str = nodata_str.trim_end_matches('\0').trim();
@@ -3605,11 +3514,168 @@ mod async_open_tests {
         check_open_async().await;
     }
 
+    // Remote open over a local HTTP server (no external network).
+
+    use crate::test_support::{build_cog, serve_bytes, CogSpec, Sample};
+    use std::time::{Duration, Instant};
+
+    fn http_spec(width: usize, tile: usize, overviews: usize) -> CogSpec {
+        CogSpec {
+            width,
+            height: width,
+            tile,
+            bands: 1,
+            sample: Sample::U8,
+            deflate: true,
+            predictor: false,
+            epsg: 3857,
+            origin: (0.0, 1000.0),
+            pixel_size: (1.0, 1.0),
+            nodata: None,
+            overviews,
+            sparse: vec![],
+            corrupt: vec![],
+            pixel: |_, x, y| ((x + y) % 250) as f64 + 1.0,
+        }
+    }
+
+    fn assert_same_structure(a: &CogReader, b: &CogReader) {
+        assert_eq!(a.metadata.tile_offsets, b.metadata.tile_offsets);
+        assert_eq!(a.metadata.tile_byte_counts, b.metadata.tile_byte_counts);
+        assert_eq!(a.metadata.geo_transform.pixel_scale, b.metadata.geo_transform.pixel_scale);
+        assert_eq!(a.metadata.crs_code, b.metadata.crs_code);
+        assert_eq!(a.overviews.len(), b.overviews.len());
+        for (x, y) in a.overviews.iter().zip(b.overviews.iter()) {
+            assert_eq!((x.width, x.scale, &x.tile_offsets), (y.width, y.scale, &y.tile_offsets));
+        }
+    }
+
+    #[tokio::test]
+    async fn open_async_over_http_costs_one_request_and_matches_local_parse() {
+        let bytes = build_cog(&http_spec(256, 64, 2));
+        let (base, log) = serve_bytes(bytes.clone(), Duration::ZERO);
+
+        let remote = CogReader::open_async_with_hint(&format!("{base}/x.tif"), OverviewQualityHint::NoneUsable)
+            .await
+            .unwrap();
+        assert_eq!(log.lock().len(), 1, "{:?}", log.lock());
+        assert!(remote.is_remote());
+
+        let local = CogReader::from_reader_with_hint(
+            Arc::new(crate::range_reader::MemoryRangeReader::new(bytes, "mem://open-parity".into())),
+            OverviewQualityHint::NoneUsable,
+        )
+        .unwrap();
+        assert_same_structure(&remote, &local);
+    }
+
+    #[tokio::test]
+    async fn open_async_fetches_large_tag_arrays_concurrently() {
+        // 16384 tiles: the offset and byte-count arrays (64 KiB each) lie beyond the prefix.
+        let delay = Duration::from_millis(150);
+        let bytes = build_cog(&http_spec(2048, 16, 0));
+        let (base, log) = serve_bytes(bytes.clone(), delay);
+
+        let start = Instant::now();
+        let remote = CogReader::open_async_with_hint(&format!("{base}/big.tif"), OverviewQualityHint::NoneUsable)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(log.lock().len() >= 3, "arrays were not fetched remotely: {:?}", log.lock());
+        // prefix round trip + one round trip for all the arrays together
+        assert!(elapsed < delay * 5 / 2, "open took {elapsed:?}; arrays are being fetched serially");
+
+        let local = CogReader::from_reader_with_hint(
+            Arc::new(crate::range_reader::MemoryRangeReader::new(bytes, "mem://open-parity-big".into())),
+            OverviewQualityHint::NoneUsable,
+        )
+        .unwrap();
+        assert_same_structure(&remote, &local);
+    }
+
+    #[tokio::test]
+    async fn computed_overview_hint_matches_between_sync_and_async_paths() {
+        let bytes = build_cog(&http_spec(512, 64, 3));
+        let (base, _log) = serve_bytes(bytes.clone(), Duration::ZERO);
+        let remote = CogReader::open_async(&format!("{base}/h.tif")).await.unwrap();
+        let local = CogReader::from_reader(Arc::new(crate::range_reader::MemoryRangeReader::new(
+            bytes,
+            "mem://hint-parity".into(),
+        )))
+        .unwrap();
+        assert_eq!(remote.min_usable_overview, local.min_usable_overview);
+        assert_eq!(
+            remote.compute_overview_quality_hint_async().await,
+            local.compute_overview_quality_hint()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_tile_async_matches_sync_read() {
+        let bytes = build_cog(&http_spec(256, 64, 1));
+        let (base, _log) = serve_bytes(bytes.clone(), Duration::ZERO);
+        let remote = CogReader::open_async_with_hint(&format!("{base}/t.tif"), OverviewQualityHint::NoneUsable)
+            .await
+            .unwrap();
+        let local = CogReader::from_reader_with_hint(
+            Arc::new(crate::range_reader::MemoryRangeReader::new(bytes, "mem://tile-parity".into())),
+            OverviewQualityHint::NoneUsable,
+        )
+        .unwrap();
+        for idx in [0, 5, 15] {
+            assert_eq!(remote.read_tile_async(idx).await.unwrap(), local.read_tile(idx).unwrap());
+        }
+        assert_eq!(
+            remote.read_overview_tile_async(0, 1).await.unwrap(),
+            local.read_overview_tile(0, 1).unwrap()
+        );
+        assert!(remote.read_tile_async(999).await.is_err());
+    }
+
+    #[test]
+    fn sync_open_of_a_remote_source_works_from_a_plain_thread() {
+        let bytes = build_cog(&http_spec(256, 64, 1));
+        let (base, _log) = serve_bytes(bytes, Duration::ZERO);
+        let reader = CogReader::open_with_hint(&format!("{base}/p.tif"), OverviewQualityHint::NoneUsable).unwrap();
+        assert_eq!(reader.metadata.width, 256);
+        // The sync read API works on a remotely opened reader too.
+        assert_eq!(reader.read_tile(0).unwrap().len(), 64 * 64);
+    }
+
+    /// Opening synchronously from inside a runtime blocks that worker but must neither panic
+    /// nor deadlock, including on a single-threaded runtime.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_sync_s3_open_inside_async_is_an_error_not_a_panic() {
-        // No network is needed: the guard fires before any request is made.
-        let err = CogReader::open("s3://cogrs-test-bucket/file.tif").err().expect("must fail");
-        let msg = err.to_string();
-        assert!(msg.contains("open_async"), "unexpected error: {msg}");
+    async fn sync_open_of_a_remote_source_inside_a_current_thread_runtime() {
+        let bytes = build_cog(&http_spec(256, 64, 1));
+        let (base, _log) = serve_bytes(bytes, Duration::from_millis(20));
+        let url = format!("{base}/c.tif");
+        let reader = CogReader::open_with_hint(&url, OverviewQualityHint::NoneUsable).unwrap();
+        assert_eq!(reader.metadata.width, 256);
+        let tile = reader.read_tile(1).unwrap();
+        assert_eq!(tile.len(), 64 * 64);
+        // ... and with the runtime-measured hint (reads sample tiles).
+        let computed = CogReader::open(&url).unwrap();
+        assert_eq!(computed.metadata.height, 256);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_open_of_a_remote_source_inside_a_multi_thread_runtime() {
+        let bytes = build_cog(&http_spec(256, 64, 1));
+        let (base, _log) = serve_bytes(bytes, Duration::from_millis(20));
+        let reader = CogReader::open_with_hint(&format!("{base}/m.tif"), OverviewQualityHint::AllUsable).unwrap();
+        assert_eq!(reader.min_usable_overview, Some(0));
+    }
+
+    #[test]
+    fn clones_share_metadata() {
+        let bytes = build_cog(&http_spec(128, 64, 1));
+        let a = CogReader::from_reader(Arc::new(crate::range_reader::MemoryRangeReader::new(
+            bytes,
+            "mem://clone-share".into(),
+        )))
+        .unwrap();
+        let b = a.clone();
+        assert!(Arc::ptr_eq(&a.metadata, &b.metadata));
+        assert!(Arc::ptr_eq(&a.overviews, &b.overviews));
     }
 }

@@ -120,7 +120,6 @@ pub use range_reader::{
     LocalRangeReader,
     HttpRangeReader,
     MemoryRangeReader,
-    PrefixCachedRangeReader,
     create_range_reader,
 };
 
