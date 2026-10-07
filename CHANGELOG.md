@@ -87,6 +87,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   one object at a time, and no longer downloads overview tiles per object (entries only need
   the IFDs)
 - `S3CogSource::scan` and S3 opens share one client per bucket
+- The synchronous and asynchronous point queries share one implementation (pixel lookup,
+  per-band extraction, result construction). `PointQuery::sample_crs` and `CogReader::sample`
+  now read a tile once and no longer copy it per band
 
 ### Removed
 
@@ -112,6 +115,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `S3CogSource::scan` ignored `AWS_SKIP_SIGNATURE` (anonymous listing of public buckets
   failed) and panicked when called from async code; it is now fully async
 - `S3CogSource::scan` honors `AWS_DEFAULT_REGION` and bucket region detection like `S3Config`
+- `TileExtractor` / `Reprojector` fetched too few source tiles when the raster covered only
+  part of an output tile: the tiles to read were the bounding box of 9 sample points that
+  happened to fall inside the raster, so a raster covering a small interior patch or a corner
+  of the tile left most of its pixels as nodata/`NaN` (a low-zoom tile containing a whole scene
+  rendered as a few tiles' worth of pixels). The source tiles are now derived from the source
+  location of every output pixel, the same coordinates rendering samples through, so every
+  output pixel that samples inside the raster has its tile fetched. Fully covered tiles read
+  the same tiles as before. Output changes only for tiles that were previously missing data
+  (nodata/`NaN` becomes data) and, with bilinear/bicubic resampling, for pixels that used the
+  nearest-sample fallback because a neighbouring tile had not been fetched
 
 ## [0.0.4] - 2025-12-10
 
