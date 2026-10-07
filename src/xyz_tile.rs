@@ -1710,9 +1710,13 @@ enum SourceX {
 /// what rendering samples through, so the two cannot disagree: every output pixel whose source
 /// location lies inside the level has the tile of its nearest source pixel fetched.
 struct SourceMapping {
-    /// Source pixel row (centre coordinates) per output row; `None` if that row lies outside the
-    /// level.
+    /// Source pixel row (centre coordinates) per output row, valid when the transform keeps rows
+    /// independent of columns (`Linear` columns); `None` if that row lies outside the level.
     rows: Vec<Option<f64>>,
+    /// For transforms where a pixel's row also depends on its column (a rotated or skewed grid,
+    /// e.g. UTM with its meridian convergence): the source row of every output pixel (row-major,
+    /// `NaN` where the transform failed). `None` for the separable cases.
+    ys: Option<Vec<f64>>,
     x: SourceX,
 }
 
@@ -1743,7 +1747,9 @@ impl SourceMapping {
         let inv_scale_y = 1.0 / p.scale[1];
         let origin = p.origin;
 
-        // Source rows for all output rows, from the transform of the tile's left edge.
+        // Source rows of all output rows, from the transform of the tile's left edge. Exact where
+        // a row does not depend on the column (3857 and 4326 sources); per-pixel transforms
+        // compute each pixel's own row below.
         let rows: Vec<Option<f64>> = (0..height)
             .map(|out_y| {
                 #[allow(clippy::cast_precision_loss)]
@@ -1755,6 +1761,7 @@ impl SourceMapping {
             })
             .collect();
 
+        let mut per_pixel_ys = None;
         let x = match strategy {
             // For 4326: lon = merc_x * 180 / HALF_EARTH, then convert to pixels
             TransformStrategy::FastMerc2Geo => {
@@ -1769,27 +1776,37 @@ impl SourceMapping {
                 base: (extent.minx + 0.5 * p.out_res_x - origin.0) * inv_scale_x - 0.5,
                 delta: p.out_res_x * inv_scale_x,
             },
-            // Other CRS combinations: one transform per pixel (rows outside the level skipped)
+            // Other CRS combinations: one transform per pixel. The transformed point gives both
+            // coordinates; the source row of a pixel depends on its column here (meridian
+            // convergence skews rows by several source pixels across a tile).
             TransformStrategy::Proj4rs(_) => {
                 let mut xs = vec![f64::NAN; width * height];
-                for (out_y, row) in rows.iter().enumerate() {
-                    if row.is_none() {
-                        continue;
-                    }
+                let mut ys = vec![f64::NAN; width * height];
+                for out_y in 0..height {
                     #[allow(clippy::cast_precision_loss)]
                     let merc_y = extent.maxy - (out_y as f64 + 0.5) * p.out_res_y;
                     for out_x in 0..width {
                         #[allow(clippy::cast_precision_loss)]
                         let merc_x = extent.minx + (out_x as f64 + 0.5) * p.out_res_x;
-                        if let Ok((world_x, _)) = strategy.transform(merc_x, merc_y) {
+                        if let Ok((world_x, world_y)) = strategy.transform(merc_x, merc_y) {
                             xs[out_y * width + out_x] = (world_x - origin.0) * inv_scale_x - 0.5;
+                            ys[out_y * width + out_x] = (origin.1 - world_y) * inv_scale_y - 0.5;
                         }
                     }
                 }
+                per_pixel_ys = Some(ys);
                 SourceX::PerPixel(xs)
             }
         };
-        Self { rows, x }
+        Self { rows, ys: per_pixel_ys, x }
+    }
+
+    /// Source row (pixel-centre coordinates) of output pixel `(out_x, out_y)`; `NaN` if it has none.
+    fn src_y(&self, out_x: usize, out_y: usize, width: usize) -> f64 {
+        match &self.ys {
+            Some(ys) => ys[out_y * width + out_x],
+            None => self.rows[out_y].unwrap_or(f64::NAN),
+        }
     }
 
     /// Source column of output pixel `(out_x, out_y)`; `NaN` if it has none.
@@ -1829,20 +1846,17 @@ impl SourceMapping {
                 }
             }
             SourceX::PerPixel(xs) => {
+                let ys = self.ys.as_deref().expect("per-pixel columns come with per-pixel rows");
                 let mut last = None;
-                for (out_y, row) in self.rows.iter().enumerate() {
-                    let Some(y) = row else { continue };
-                    let ny = nearest_pixel(*y, p.eff_height);
-                    for x in &xs[out_y * width..(out_y + 1) * width] {
-                        if !within_level(*x, p.eff_width) {
-                            continue;
-                        }
-                        let idx = tile_of(nearest_pixel(*x, p.eff_width), ny);
-                        if last != Some(idx) && idx < max_tile_count {
-                            needed[idx] = true;
-                        }
-                        last = Some(idx);
+                for (x, y) in xs.iter().zip(ys) {
+                    if !within_level(*x, p.eff_width) || !within_level(*y, p.eff_height) {
+                        continue;
                     }
+                    let idx = tile_of(nearest_pixel(*x, p.eff_width), nearest_pixel(*y, p.eff_height));
+                    if last != Some(idx) && idx < max_tile_count {
+                        needed[idx] = true;
+                    }
+                    last = Some(idx);
                 }
             }
         }
@@ -2048,23 +2062,22 @@ fn render_extraction(
     // Note: We use range loop because out_y is needed for out_idx calculation, not just indexing
     #[allow(clippy::needless_range_loop)]
     for out_y in 0..tile_size_y {
-        // Use pre-computed Y coordinate
-        let Some(src_pixel_y) = mapping.rows[out_y] else {
-            continue; // Row is out of bounds
-        };
-
-        // Pre-compute Y-related values for this row (only calculated once per row)
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-        let src_pixel_y_nearest = src_pixel_y.round().max(0.0).min(eff_height as f64 - 1.0) as usize;
-        #[allow(clippy::cast_possible_truncation)]
-        let y0_floor = src_pixel_y.floor() as isize;
-
         for out_x in 0..tile_size_x {
             let src_pixel_x = mapping.src_x(out_x, out_y, tile_size_x);
             // Same test as planning (NaN: no source column)
             if !within_level(src_pixel_x, eff_width) {
                 continue;
             }
+
+            // Source row of this pixel (per pixel for skewed transforms, else per row)
+            let src_pixel_y = mapping.src_y(out_x, out_y, tile_size_x);
+            if !within_level(src_pixel_y, eff_height) {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            let src_pixel_y_nearest = src_pixel_y.round().max(0.0).min(eff_height as f64 - 1.0) as usize;
+            #[allow(clippy::cast_possible_truncation)]
+            let y0_floor = src_pixel_y.floor() as isize;
 
             let out_idx = (out_y * tile_size_x + out_x) * num_output_bands;
 

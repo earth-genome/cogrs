@@ -104,31 +104,31 @@ u16_utm10/overview0	300x300 tile=64x64 across=5 down=5 scale=2 offsets=a87d2f03e
 u16_utm10/overview1	150x150 tile=64x64 across=3 down=3 scale=4 offsets=561ff14834f571ee counts=b78fe399cc538633
 u16_utm10/min_usable	Some(1)
 u16_utm10/hint	MinUsable(1)
-u16_utm10/xyz/10/163/395/nearest	128x128x1 bytes=49152 tiles=6 ovr=Some(1) nodata=None n=16384 valid=5410 digest=06509c52c2a92150
-u16_utm10/xyz/10/163/395/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5410 digest=c21e8baf1b9052da
-u16_utm10/xyz/10/163/395/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5410 digest=63e4a111a979e142
+u16_utm10/xyz/10/163/395/nearest	128x128x1 bytes=49152 tiles=6 ovr=Some(1) nodata=None n=16384 valid=5484 digest=36b42c6f387f249e
+u16_utm10/xyz/10/163/395/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5484 digest=c5db742aa88f680c
+u16_utm10/xyz/10/163/395/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5484 digest=2e4cd5f505a7dabd
 u16_utm10/xyz/10/164/395/nearest	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=996506f8006395e8
-u16_utm10/xyz/10/164/395/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=174b3698ffc5b2bc
-u16_utm10/xyz/10/164/395/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=c5b7e355183c2db3
-u16_utm10/xyz/11/327/791/nearest	128x128x1 bytes=122880 tiles=15 ovr=Some(0) nodata=None n=16384 valid=8576 digest=41d1309ff0794240
-u16_utm10/xyz/11/327/791/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8576 digest=f00959f2ee6ff90f
-u16_utm10/xyz/11/327/791/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8576 digest=e8bc85c9d617b26b
+u16_utm10/xyz/10/164/395/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=e240af56238ba9bf
+u16_utm10/xyz/10/164/395/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=ea3f41830c3e476d
+u16_utm10/xyz/11/327/791/nearest	128x128x1 bytes=122880 tiles=15 ovr=Some(0) nodata=None n=16384 valid=8688 digest=af9b804e45bacf5d
+u16_utm10/xyz/11/327/791/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8688 digest=dc98c020aabad019
+u16_utm10/xyz/11/327/791/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8688 digest=3d282685977532dc
 u16_utm10/xyz/11/328/791/nearest	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=355d7e065ac1b76c
-u16_utm10/xyz/11/328/791/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=16e3ec830e81ecfa
-u16_utm10/xyz/11/328/791/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=42ccf244b2838b99
-u16_utm10/xyz/12/655/1582/nearest	128x128x1 bytes=204800 tiles=25 ovr=None nodata=None n=16384 valid=16384 digest=c10e861c82f14444
-u16_utm10/xyz/12/655/1582/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=96999d83785af3f9
-u16_utm10/xyz/12/655/1582/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=7e5ed473508fd60e
-u16_utm10/xyz/12/656/1582/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=19f6a2ec592316c6
-u16_utm10/xyz/12/656/1582/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=6ee15b444b422d21
-u16_utm10/xyz/12/656/1582/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=441254a0d3090eac
-u16_utm10/xyz/13/1310/3165/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=8db2a5e93a74b413
-u16_utm10/xyz/13/1310/3165/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=04e860adf499d64b
-u16_utm10/xyz/13/1310/3165/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=917da25a7e01da54
-u16_utm10/xyz/13/1311/3165/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=d99a7e8639c09a17
-u16_utm10/xyz/13/1311/3165/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=39a9d8ec5d31e886
-u16_utm10/xyz/13/1311/3165/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=5f319139a9e525ee
-u16_utm10/xyz/10/163/395/96x64	96x64x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=6144 valid=2090 digest=dae508526093c22c
+u16_utm10/xyz/11/328/791/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=90d56bd755b8d891
+u16_utm10/xyz/11/328/791/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=bcea84db699ec5e4
+u16_utm10/xyz/12/655/1582/nearest	128x128x1 bytes=204800 tiles=25 ovr=None nodata=None n=16384 valid=16384 digest=84409f581a3c52e5
+u16_utm10/xyz/12/655/1582/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=d2fb9b307d09c4a7
+u16_utm10/xyz/12/655/1582/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=393c97373fedac0f
+u16_utm10/xyz/12/656/1582/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=4ccf5d5123a139b1
+u16_utm10/xyz/12/656/1582/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=48a376db7760caf6
+u16_utm10/xyz/12/656/1582/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=8bf6838b2c6c3a9f
+u16_utm10/xyz/13/1310/3165/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=d4c3fdf19fc394a6
+u16_utm10/xyz/13/1310/3165/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=72efc756bbb184d5
+u16_utm10/xyz/13/1310/3165/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=017ddcf1edbde34c
+u16_utm10/xyz/13/1311/3165/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=18a42e7f2ea7e39f
+u16_utm10/xyz/13/1311/3165/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=2bd9357b534be175
+u16_utm10/xyz/13/1311/3165/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=3fd744e7d55760c1
+u16_utm10/xyz/10/163/395/96x64	96x64x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=6144 valid=2057 digest=201b6e1650af7829
 u16_utm10/read_tile/0	n=4096 valid=4096 digest=3096daa55164ab96
 u16_utm10/read_tile/50	n=4096 valid=4096 digest=9704ca2293ff8c25
 u16_utm10/read_tile/99	n=4096 valid=4096 digest=fb956b9a6eb3b68d
@@ -140,8 +140,8 @@ u16_utm10/minmax_fast	0 4096
 u16_utm10/sample_lonlat/-122.4/37.8	[(0, 1152573440)]
 u16_utm10/sample_lonlat/-122.3/37.75	[]
 u16_utm10/sample_crs/32610/550000/4190000	[(0, 1160544256)]
-u16_utm10/reproject/4326	64x64x1 crs=4326 bounds=(-122.545733,37.783513,-122.339877,37.946709) nodata=None n=4096 valid=4096 digest=10ca3a9ea8171cb4
-u16_utm10/reproject_streaming/4326	(0, 0):48x48:5fe9ec5238722c0b (1, 0):16x48:b3ab7189f570c727 (0, 1):48x16:062e3bc3cb722e56 (1, 1):16x16:e11982069b20095f
+u16_utm10/reproject/4326	64x64x1 crs=4326 bounds=(-122.545733,37.783513,-122.339877,37.946709) nodata=None n=4096 valid=4096 digest=1e9b8afc93ea4844
+u16_utm10/reproject_streaming/4326	(0, 0):48x48:f0d7e63bbfc93f04 (1, 0):16x48:d8a62147c1a81dff (0, 1):48x16:764ac898f531c38b (1, 1):16x16:b198d034ede41fdd
 u16_odd_size_overviews/meta	1030x770 tile=64x64 across=17 down=13 bands=1 UInt16 Deflate predictor=1 crs=Some(3857) nodata=None tiled=true scale=Some([4863.472898735254, 4863.472898735254, 0.0]) tie=Some([0.0, 0.0, 0.0, -10018754.171394622, 5009377.085697312, 0.0]) offsets=2839337e6e7d02e3 counts=a7add024adab99ff
 u16_odd_size_overviews/overview0	515x385 tile=64x64 across=9 down=7 scale=2 offsets=23d75496ba3b8b0b counts=5b0ed15f4294bdae
 u16_odd_size_overviews/overview1	258x193 tile=64x64 across=5 down=4 scale=4 offsets=e93845aa102dccef counts=c6058ee0dca9d0f7

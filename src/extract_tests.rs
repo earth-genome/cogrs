@@ -376,11 +376,13 @@ async fn reprojected_patches_are_fully_rendered() {
             let (sx, sy) = ((ux - 545_000.0) / 30.0, (4_195_000.0 - uy) / 30.0);
             let v = tile.pixels[y * w + x];
             valid += usize::from(!v.is_nan());
-            // The renderer takes a row's source y from the tile's left edge, which is off by a few
-            // source pixels across a UTM tile; stay clear of the raster edge by more than that.
-            if sx > 12.0 && sx < 388.0 && sy > 12.0 && sy < 388.0 {
+            // The source row comes from each pixel's own transformed position (UTM's meridian
+            // convergence skews rows across the tile), so only rounding at the edge is excused.
+            if sx > 1.0 && sx < 399.0 && sy > 1.0 && sy < 399.0 {
                 inside_checked += 1;
                 assert!(!v.is_nan(), "pixel ({x},{y}) at source ({sx:.1},{sy:.1}) is fill");
+            } else if !(-1.0..=401.0).contains(&sx) || !(-1.0..=401.0).contains(&sy) {
+                assert!(v.is_nan(), "pixel ({x},{y}) at source ({sx:.1},{sy:.1}) outside the raster has data");
             }
         }
     }

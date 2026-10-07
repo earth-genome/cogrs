@@ -154,3 +154,42 @@ async fn bilinear_matches_gdalwarp_on_a_textured_pixel_is_area_raster() {
     let Some(c) = run("natural_earth bilinear", WORLD, &world_window(), ResamplingMethod::Bilinear, "bilinear").await else { return };
     assert!(c.mean_abs_diff < 0.5, "mean |diff| {:.4}", c.mean_abs_diff);
 }
+
+/// A UTM raster reprojected to 3857: UTM grid north is rotated against the web mercator grid by
+/// the meridian convergence (about 4.6 source pixels over a z10 tile here), so a pixel's source
+/// row depends on its column. Synthetic raster written to disk for `gdalwarp`.
+#[tokio::test]
+async fn nearest_matches_gdalwarp_through_a_rotated_grid() {
+    use crate::test_support::{build_cog, CogSpec, Sample};
+    let spec = CogSpec {
+        width: 400,
+        height: 400,
+        tile: 64,
+        bands: 1,
+        sample: Sample::U16,
+        deflate: true,
+        predictor: false,
+        epsg: 32610,
+        origin: (545_000.0, 4_195_000.0),
+        pixel_size: (30.0, 30.0),
+        nodata: None,
+        overviews: 0,
+        sparse: vec![],
+        corrupt: vec![],
+        pixel: |_, x, y| ((x * 31 + y * 17) % 4000) as f64 + 1.0,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("utm10.tif");
+    std::fs::write(&path, build_cog(&spec)).unwrap();
+    // 256 px at 60 m cover the raster (12 km square) and a margin, around its centre; across that
+    // width the grid rotation moves a pixel's source row by about 8 source pixels.
+    let (cx, cy) = crate::geometry::projection::project_point(32610, 3857, 545_000.0 + 6_000.0, 4_195_000.0 - 6_000.0).unwrap();
+    let res = 60.0;
+    let bounds = BoundingBox::new(cx - 128.37 * res, cy - 128.81 * res, cx + 127.63 * res, cy + 127.19 * res);
+    let Some(c) = run("synthetic utm10 near", path.to_str().unwrap(), &bounds, ResamplingMethod::Nearest, "near").await else {
+        return;
+    };
+    assert!(c.compared > 30_000, "only {} pixels compared", c.compared);
+    assert!(c.identical_pct > 99.9, "{:.2}% identical", c.identical_pct);
+    assert_eq!(c.validity_mismatch, 0);
+}
