@@ -1704,7 +1704,7 @@ struct SourceMapping {
 /// Sample positions up to half a pixel outside the level still map onto its edge pixels.
 #[allow(clippy::cast_precision_loss)]
 fn within_level(v: f64, size: usize) -> bool {
-    !v.is_nan() && !(v < -0.5 || v > size as f64 + 0.5)
+    v >= -0.5 && v <= size as f64 + 0.5
 }
 
 /// Nearest source pixel, clamped to the level.
