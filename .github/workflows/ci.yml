@@ -57,7 +57,9 @@ jobs:
       - name: Fetch test fixtures
         run: scripts/fetch-test-data.sh
       - name: Run tests
-        run: cargo test --workspace -- --nocapture 2>&1 | tee out.txt
+        # Single-threaded: some tests assert on wall-clock latency against a local server and
+        # flake on the 2-core runner when run in parallel.
+        run: cargo test --workspace -- --nocapture --test-threads=1 2>&1 | tee out.txt
         shell: bash
       - name: Assert no tests were skipped
         run: "! grep -i skipping out.txt"
