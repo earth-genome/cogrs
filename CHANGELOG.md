@@ -95,6 +95,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Breaking:** `TileData` has a new public field `nodata`; code constructing it with a
   struct literal must set it
+- Opening a COG reads the tile offset/byte-count arrays (and GeoTIFF/GDAL tag values) of all
+  IFDs with one coalesced `read_ranges` call instead of one request per tag per IFD, so a
+  remote open whose arrays outgrow the 16 KiB prefix costs the prefix plus one request when
+  they are contiguous (previously 6-13 requests). A failed read of an overview's arrays now
+  fails the open instead of silently dropping that overview
 - Output pixels with no source data (outside the COG extent, entirely outside tiles,
   sparse source tiles) are now filled with the COG's nodata value, or `NaN` if none is
   declared, instead of `0.0`. Unchanged for COGs with `nodata = 0`

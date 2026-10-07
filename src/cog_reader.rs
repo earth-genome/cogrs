@@ -25,6 +25,7 @@ use crate::tiff_utils::AnyResult;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 // TIFF tag constants
@@ -1485,9 +1486,11 @@ impl TiffHeader {
 
 /// Read the TIFF header, the full-resolution IFD and the overview IFD chain.
 ///
-/// Both classic TIFF and BigTIFF are supported. IFD tables are read first; the (possibly large)
-/// tile offset/byte-count arrays and other tag values are then fetched concurrently, so a COG with
-/// many overviews costs one round trip for them rather than one per array.
+/// Both classic TIFF and BigTIFF are supported. IFD tables are read first (one request each,
+/// normally served from the prefix). The tag values stored outside the IFD tables (the tile
+/// offset/byte-count arrays of every IFD, GeoTIFF tags, GDAL metadata) are then all requested
+/// with a single [`AsyncRangeReader::read_ranges`] call, which merges nearby ranges: the arrays
+/// of a COG are laid out back to back, so they cost one request rather than one per array.
 pub(crate) async fn parse_cog_structure(io: &dyn AsyncRangeReader) -> AnyResult<CogStructure> {
     // Read header to get IFD offset, byte order and TIFF flavour (served from the prefix)
     let file_size = io.size();
@@ -1498,32 +1501,35 @@ pub(crate) async fn parse_cog_structure(io: &dyn AsyncRangeReader) -> AnyResult<
     let first = read_ifd(io, header.first_ifd, file_size, header).await?;
 
     // Overview IFDs (subsequent IFDs in the chain)
-    let walk_chain = async {
-        let mut headers: Vec<(OverviewHeader, HashMap<u16, IfdEntry>)> = Vec::new();
-        let mut next = first.next;
-        while next != 0 {
-            let ifd = read_ifd(io, next, file_size, header).await?;
-            let Ok(overview) = parse_overview_header(&ifd.tags, little_endian) else {
-                break;
-            };
-            headers.push((overview, ifd.tags));
-            next = ifd.next;
+    let mut headers: Vec<(OverviewHeader, HashMap<u16, IfdEntry>)> = Vec::new();
+    let mut next = first.next;
+    while next != 0 {
+        let ifd = read_ifd(io, next, file_size, header).await?;
+        let Ok(overview) = parse_overview_header(&ifd.tags, little_endian) else {
+            break;
+        };
+        headers.push((overview, ifd.tags));
+        next = ifd.next;
 
-            // Safety limit - COGs typically have at most 10 overviews
-            if headers.len() > 10 {
-                break;
-            }
+        // Safety limit - COGs typically have at most 10 overviews
+        if headers.len() > 10 {
+            break;
         }
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(headers)
-    };
-    let (metadata, headers) = futures::try_join!(parse_ifd(&first.tags, io, little_endian), walk_chain)?;
+    }
 
-    let arrays = futures::future::join_all(
-        headers
-            .iter()
-            .map(|(header, tags)| read_overview_arrays(io, tags, header.tiles_across * header.tiles_down, little_endian)),
-    )
-    .await;
+    // Every out-of-line value of every IFD, fetched together
+    let mut wanted = Vec::new();
+    collect_value_ranges(&first.tags, true, file_size, &mut wanted);
+    for (_, tags) in &headers {
+        collect_value_ranges(tags, false, file_size, &mut wanted);
+    }
+    let values = TagValues::fetch(io, &wanted).await?;
+
+    let metadata = parse_ifd(&first.tags, &values, little_endian)?;
+    let arrays: Vec<_> = headers
+        .iter()
+        .map(|(header, tags)| read_overview_arrays(&values, tags, header.tiles_across * header.tiles_down, little_endian))
+        .collect();
 
     // An overview that cannot be parsed ends the chain (it and the ones after it are dropped).
     let (full_width, full_height) = (metadata.width, metadata.height);
@@ -1640,9 +1646,9 @@ async fn read_ifd(io: &dyn AsyncRangeReader, offset: u64, file_size: u64, header
 ///
 /// Returns (`tile_width`, `tile_height`, `tiles_across`, `tiles_down`, `is_tiled`, `tile_offsets`, `tile_byte_counts`)
 #[allow(clippy::type_complexity)] // Return tuple is clear from context and used locally
-async fn parse_tile_layout(
+fn parse_tile_layout(
     tags: &HashMap<u16, IfdEntry>,
-    io: &dyn AsyncRangeReader,
+    fetched: &TagValues,
     little_endian: bool,
     width: usize,
     height: usize,
@@ -1662,10 +1668,10 @@ async fn parse_tile_layout(
         let td = height.div_ceil(th);
         let total_tiles = ta * td;
 
-        let (offsets, byte_counts) = futures::try_join!(
-            read_tag_array_u64(tags, TAG_TILE_OFFSETS, io, little_endian, total_tiles),
-            read_tag_array_u64(tags, TAG_TILE_BYTE_COUNTS, io, little_endian, total_tiles),
-        )?;
+        let (offsets, byte_counts) = (
+            read_tag_array_u64(tags, TAG_TILE_OFFSETS, fetched, little_endian, total_tiles)?,
+            read_tag_array_u64(tags, TAG_TILE_BYTE_COUNTS, fetched, little_endian, total_tiles)?,
+        );
 
         Ok((tw, th, ta, td, is_tiled, offsets, byte_counts))
     } else if has_strip_tags {
@@ -1681,10 +1687,10 @@ async fn parse_tile_layout(
         let td = height.div_ceil(rows_per_strip);
         let total_strips = td;
 
-        let (offsets, byte_counts) = futures::try_join!(
-            read_tag_array_u64(tags, TAG_STRIP_OFFSETS, io, little_endian, total_strips),
-            read_tag_array_u64(tags, TAG_STRIP_BYTE_COUNTS, io, little_endian, total_strips),
-        )?;
+        let (offsets, byte_counts) = (
+            read_tag_array_u64(tags, TAG_STRIP_OFFSETS, fetched, little_endian, total_strips)?,
+            read_tag_array_u64(tags, TAG_STRIP_BYTE_COUNTS, fetched, little_endian, total_strips)?,
+        );
 
         Ok((tw, th, ta, td, false, offsets, byte_counts))
     } else {
@@ -1693,9 +1699,9 @@ async fn parse_tile_layout(
 }
 
 /// Parse the full-resolution IFD and extract all COG metadata
-async fn parse_ifd(
+fn parse_ifd(
     tags: &HashMap<u16, IfdEntry>,
-    io: &dyn AsyncRangeReader,
+    fetched: &TagValues,
     little_endian: bool,
 ) -> AnyResult<CogMetadata> {
     // Extract required tags
@@ -1722,16 +1728,14 @@ async fn parse_ifd(
     let compression = Compression::from_tag(compression_val)
         .ok_or_else(|| format!("Unsupported compression: {compression_val}"))?;
 
-    // Everything below reads tag values that may live outside the IFD table; fetch them
-    // concurrently. Order of the results matches the order of the calls.
-    let (layout, pixel_scale, tiepoint, geokeys, gdal_metadata, nodata) = futures::try_join!(
-        parse_tile_layout(tags, io, little_endian, width, height),
-        read_tag_f64_array(tags, TAG_MODEL_PIXEL_SCALE, io, little_endian, 3),
-        read_tag_f64_array(tags, TAG_MODEL_TIEPOINT, io, little_endian, 6),
-        read_geokey_directory(tags, io),
-        read_gdal_metadata_info(tags, io),
-        read_gdal_nodata(tags, io),
-    )?;
+    // Everything below reads tag values that may live outside the IFD table; they were all
+    // fetched up front (see `parse_cog_structure`).
+    let layout = parse_tile_layout(tags, fetched, little_endian, width, height)?;
+    let pixel_scale = read_tag_f64_array(tags, TAG_MODEL_PIXEL_SCALE, fetched, little_endian, 3)?;
+    let tiepoint = read_tag_f64_array(tags, TAG_MODEL_TIEPOINT, fetched, little_endian, 6)?;
+    let geokeys = read_geokey_directory(tags, fetched)?;
+    let gdal_metadata = read_gdal_metadata_info(tags, fetched)?;
+    let nodata = read_gdal_nodata(tags, fetched)?;
     let (tile_width, tile_height, tiles_across, tiles_down, is_tiled, tile_offsets, tile_byte_counts) = layout;
 
     // Read CRS from GeoKey directory
@@ -1812,16 +1816,16 @@ fn parse_overview_header(tags: &HashMap<u16, IfdEntry>, little_endian: bool) -> 
 }
 
 /// Read an overview's tile offset and byte-count arrays.
-async fn read_overview_arrays(
-    io: &dyn AsyncRangeReader,
+fn read_overview_arrays(
+    fetched: &TagValues,
     tags: &HashMap<u16, IfdEntry>,
     total_tiles: usize,
     little_endian: bool,
 ) -> AnyResult<(Vec<u64>, Vec<u64>)> {
-    futures::try_join!(
-        read_tag_array_u64(tags, TAG_TILE_OFFSETS, io, little_endian, total_tiles),
-        read_tag_array_u64(tags, TAG_TILE_BYTE_COUNTS, io, little_endian, total_tiles),
-    )
+    Ok((
+        read_tag_array_u64(tags, TAG_TILE_OFFSETS, fetched, little_endian, total_tiles)?,
+        read_tag_array_u64(tags, TAG_TILE_BYTE_COUNTS, fetched, little_endian, total_tiles)?,
+    ))
 }
 
 struct IfdEntry {
@@ -1860,26 +1864,100 @@ fn get_tag_value(tags: &HashMap<u16, IfdEntry>, tag: u16, little_endian: bool) -
     }
 }
 
-/// Bytes of a tag value: inline in the IFD entry when it fits there, else fetched.
-async fn tag_value_bytes(entry: &IfdEntry, total_bytes: usize, io: &dyn AsyncRangeReader) -> AnyResult<Bytes> {
-    if total_bytes <= entry.inline_capacity {
-        Ok(Bytes::copy_from_slice(&entry.raw_bytes[..total_bytes]))
-    } else if entry.value_offset.saturating_add(total_bytes as u64) > io.size() {
-        Err(format!(
-            "Tag value of {total_bytes} bytes at offset {} lies outside the file ({} bytes)",
-            entry.value_offset,
-            io.size()
-        )
-        .into())
-    } else {
-        io.read_range(entry.value_offset, total_bytes).await
+/// The out-of-line tag values of all IFDs, fetched together and keyed by file offset.
+struct TagValues {
+    file_size: u64,
+    by_offset: HashMap<u64, Bytes>,
+}
+
+impl TagValues {
+    /// Fetch `ranges` with one [`AsyncRangeReader::read_ranges`] call (nearby ranges become one
+    /// request, see [`IoOptions::coalesce_gap`]).
+    async fn fetch(io: &dyn AsyncRangeReader, ranges: &[Range<u64>]) -> AnyResult<Self> {
+        let mut by_offset: HashMap<u64, Bytes> = HashMap::with_capacity(ranges.len());
+        if !ranges.is_empty() {
+            for (range, bytes) in ranges.iter().zip(io.read_ranges(ranges).await?) {
+                // Two values at one offset: keep the longer
+                let slot = by_offset.entry(range.start).or_default();
+                if bytes.len() > slot.len() {
+                    *slot = bytes;
+                }
+            }
+        }
+        Ok(Self { file_size: io.size(), by_offset })
     }
 }
 
-async fn read_tag_array_u64(
+/// The file range of `entry`'s `total_bytes` of values, if they are stored outside the IFD
+/// entry and inside the file.
+fn value_range(entry: &IfdEntry, total_bytes: usize, file_size: u64) -> Option<Range<u64>> {
+    let end = entry.value_offset.checked_add(total_bytes as u64)?;
+    (total_bytes > entry.inline_capacity && end <= file_size).then_some(entry.value_offset..end)
+}
+
+/// Size of one element of a tile/strip offset or byte-count array, by TIFF field type.
+fn array_type_size(field_type: u16) -> Option<usize> {
+    match field_type {
+        3 => Some(2),  // SHORT
+        4 => Some(4),  // LONG
+        16 => Some(8), // LONG8
+        _ => None,
+    }
+}
+
+/// Push the file ranges of the out-of-line values that [`parse_ifd`] (`full_resolution`) or
+/// [`read_overview_arrays`] will read from `tags`. Values the reader would reject (unsupported
+/// type, outside the file) are left out: reading them reports the error.
+fn collect_value_ranges(tags: &HashMap<u16, IfdEntry>, full_resolution: bool, file_size: u64, out: &mut Vec<Range<u64>>) {
+    let mut push = |tag: u16, field_ok: &dyn Fn(u16) -> Option<usize>, min_count: u64| {
+        if let Some(entry) = tags.get(&tag)
+            && entry.count >= min_count
+            && let Some(size) = field_ok(entry.field_type)
+            && let Some(range) = value_range(entry, entry.byte_len(size), file_size)
+        {
+            out.push(range);
+        }
+    };
+    let (offsets, counts) = if tags.contains_key(&TAG_TILE_OFFSETS) || !full_resolution {
+        (TAG_TILE_OFFSETS, TAG_TILE_BYTE_COUNTS)
+    } else {
+        (TAG_STRIP_OFFSETS, TAG_STRIP_BYTE_COUNTS)
+    };
+    push(offsets, &array_type_size, 0);
+    push(counts, &array_type_size, 0);
+    if full_resolution {
+        let doubles = |t: u16| (t == 12).then_some(8);
+        push(TAG_MODEL_PIXEL_SCALE, &doubles, 3);
+        push(TAG_MODEL_TIEPOINT, &doubles, 6);
+        push(TAG_GEO_KEY_DIRECTORY, &|t| (t == 3).then_some(2), 0);
+        push(TAG_GDAL_METADATA, &|_| Some(1), 0);
+        push(TAG_GDAL_NODATA, &|_| Some(1), 0);
+    }
+}
+
+/// Bytes of a tag value: inline in the IFD entry when it fits there, else from the prefetched
+/// values.
+fn tag_value_bytes(entry: &IfdEntry, total_bytes: usize, fetched: &TagValues) -> AnyResult<Bytes> {
+    if total_bytes <= entry.inline_capacity {
+        Ok(Bytes::copy_from_slice(&entry.raw_bytes[..total_bytes]))
+    } else if entry.value_offset.saturating_add(total_bytes as u64) > fetched.file_size {
+        Err(format!(
+            "Tag value of {total_bytes} bytes at offset {} lies outside the file ({} bytes)",
+            entry.value_offset, fetched.file_size
+        )
+        .into())
+    } else {
+        match fetched.by_offset.get(&entry.value_offset) {
+            Some(bytes) if bytes.len() >= total_bytes => Ok(bytes.slice(..total_bytes)),
+            _ => Err(format!("Tag value at offset {} was not fetched", entry.value_offset).into()),
+        }
+    }
+}
+
+fn read_tag_array_u64(
     tags: &HashMap<u16, IfdEntry>,
     tag: u16,
-    io: &dyn AsyncRangeReader,
+    fetched: &TagValues,
     little_endian: bool,
     expected_count: usize,
 ) -> AnyResult<Vec<u64>> {
@@ -1893,7 +1971,7 @@ async fn read_tag_array_u64(
     };
 
     let total_bytes = entry.byte_len(type_size);
-    let raw_bytes = tag_value_bytes(entry, total_bytes, io).await?;
+    let raw_bytes = tag_value_bytes(entry, total_bytes, fetched)?;
 
     let count = raw_bytes.len() / type_size;
     let mut values = Vec::with_capacity(count);
@@ -1916,10 +1994,10 @@ async fn read_tag_array_u64(
     Ok(values)
 }
 
-async fn read_tag_f64_array(
+fn read_tag_f64_array(
     tags: &HashMap<u16, IfdEntry>,
     tag: u16,
-    io: &dyn AsyncRangeReader,
+    fetched: &TagValues,
     little_endian: bool,
     min_count: usize,
 ) -> AnyResult<Option<Vec<f64>>> {
@@ -1936,7 +2014,7 @@ async fn read_tag_f64_array(
         return Ok(None);
     }
 
-    let raw_bytes = tag_value_bytes(entry, entry.byte_len(8), io).await?;
+    let raw_bytes = tag_value_bytes(entry, entry.byte_len(8), fetched)?;
 
     let count = raw_bytes.len() / 8;
     let mut values = Vec::with_capacity(count);
@@ -2018,9 +2096,9 @@ fn raster_type_is_point(raw_bytes: Option<&[u8]>, little_endian: bool) -> bool {
 }
 
 /// Helper to read raw `GeoKey` directory bytes
-async fn read_geokey_directory(
+fn read_geokey_directory(
     tags: &HashMap<u16, IfdEntry>,
-    io: &dyn AsyncRangeReader,
+    fetched: &TagValues,
 ) -> AnyResult<Option<Bytes>> {
     let Some(entry) = tags.get(&TAG_GEO_KEY_DIRECTORY) else {
         return Ok(None);
@@ -2032,21 +2110,21 @@ async fn read_geokey_directory(
     }
 
     let total_bytes = entry.byte_len(2);
-    Ok(Some(tag_value_bytes(entry, total_bytes, io).await?))
+    Ok(Some(tag_value_bytes(entry, total_bytes, fetched)?))
 }
 
 /// Read GDAL metadata: stats and AREA_OR_POINT
 /// Returns (min, max, is_point_registered)
-async fn read_gdal_metadata_info(
+fn read_gdal_metadata_info(
     tags: &HashMap<u16, IfdEntry>,
-    io: &dyn AsyncRangeReader,
+    fetched: &TagValues,
 ) -> AnyResult<(Option<f32>, Option<f32>, bool)> {
     let Some(entry) = tags.get(&TAG_GDAL_METADATA) else {
         return Ok((None, None, false));
     };
 
     // GDAL metadata is ASCII/UTF-8 XML
-    let raw_bytes = tag_value_bytes(entry, entry.byte_len(1), io).await?;
+    let raw_bytes = tag_value_bytes(entry, entry.byte_len(1), fetched)?;
 
     let metadata_str = String::from_utf8_lossy(&raw_bytes);
 
@@ -2076,15 +2154,15 @@ fn extract_gdal_str(metadata: &str, key: &str) -> Option<String> {
     Some(rest[..end].trim().to_string())
 }
 
-async fn read_gdal_nodata(
+fn read_gdal_nodata(
     tags: &HashMap<u16, IfdEntry>,
-    io: &dyn AsyncRangeReader,
+    fetched: &TagValues,
 ) -> AnyResult<Option<f64>> {
     let Some(entry) = tags.get(&TAG_GDAL_NODATA) else {
         return Ok(None);
     };
 
-    let raw_bytes = tag_value_bytes(entry, entry.byte_len(1), io).await?;
+    let raw_bytes = tag_value_bytes(entry, entry.byte_len(1), fetched)?;
 
     let nodata_str = String::from_utf8_lossy(&raw_bytes);
     let nodata_str = nodata_str.trim_end_matches('\0').trim();
@@ -3888,27 +3966,26 @@ mod async_open_tests {
         assert_same_structure(&remote, &local);
     }
 
-    #[tokio::test]
-    async fn open_async_fetches_large_tag_arrays_concurrently() {
-        // 16384 tiles: the offset and byte-count arrays (64 KiB each) lie beyond the prefix, and
-        // so do the pixel scale, tiepoint and GeoKey values that follow them.
-        use crate::test_support::{ObjectServer, ServedObject};
-        let bytes = build_cog(&http_spec(2048, 16, 0));
-        let server = ObjectServer::start(Some(ServedObject::new(bytes.clone())), Duration::ZERO);
-        // The server holds every request that starts after the IFD (offset 100) until five are
-        // pending at once: the five out-of-line values. They only get answered if the open
-        // issues all five reads together; had it read the arrays one after the other, the first
-        // would wait for the second for ever and the open would fail after 30 s.
-        server.set_gate(Some((100, 5, Duration::from_secs(30))));
-
-        let remote = CogReader::builder(&format!("{}/big.tif", server.base()))
+    async fn open_http(server: &crate::test_support::ObjectServer, path: &str) -> CogReader {
+        CogReader::builder(&format!("{}{path}", server.base()))
             .hint(OverviewQualityHint::NoneUsable)
             .cache(&crate::header_cache::CogCache::disabled())
             .open_async()
             .await
-            .unwrap();
-        assert_eq!(server.requests().len(), 6, "prefix + five values: {:?}", server.requests());
-        assert!(server.max_in_flight() >= 5, "the reads never overlapped");
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn open_async_fetches_large_tag_arrays_in_one_request() {
+        // 16384 tiles: the offset and byte-count arrays (64 KiB each) lie beyond the prefix, and
+        // so do the pixel scale, tiepoint and GeoKey values that follow them. They are one
+        // contiguous run, fetched by a single request after the prefix.
+        use crate::test_support::{ObjectServer, ServedObject};
+        let bytes = build_cog(&http_spec(2048, 16, 0));
+        let server = ObjectServer::start(Some(ServedObject::new(bytes.clone())), Duration::ZERO);
+
+        let remote = open_http(&server, "/big.tif").await;
+        assert_eq!(server.requests().len(), 2, "prefix + one coalesced read: {:?}", server.requests());
         assert!(server.requests().iter().all(|r| r.status == 206), "{:?}", server.requests());
 
         let local = CogReader::from_reader_with_hint(
@@ -3917,6 +3994,116 @@ mod async_open_tests {
         )
         .unwrap();
         assert_same_structure(&remote, &local);
+    }
+
+    /// Classic little-endian TIFF with one IFD per entry of `sides` (a level of `side` x `side`
+    /// tiles of 16 px, uncompressed bytes), the IFDs back to back after the header, and the tile
+    /// arrays at `positions` (per level: offsets, then byte counts). Returns the file and the
+    /// expected (offsets, counts) of each level.
+    #[allow(clippy::type_complexity)]
+    fn tiff_with_arrays(sides: &[u32], positions: &[usize]) -> (Vec<u8>, Vec<(Vec<u64>, Vec<u64>)>) {
+        const IFD_LEN: usize = 2 + 8 * 12 + 4;
+        let mut file = b"II*\0".to_vec();
+        file.extend_from_slice(&8u32.to_le_bytes());
+        for (level, side) in sides.iter().enumerate() {
+            let tiles = side * side;
+            let next = if level + 1 < sides.len() { (8 + IFD_LEN * (level + 1)) as u32 } else { 0 };
+            let entries: [(u16, u16, u32, u32); 8] = [
+                (256, 4, 1, side * 16),
+                (257, 4, 1, side * 16),
+                (258, 3, 1, 8),
+                (259, 3, 1, 1),
+                (322, 4, 1, 16),
+                (323, 4, 1, 16),
+                (324, 4, tiles, positions[2 * level] as u32),
+                (325, 4, tiles, positions[2 * level + 1] as u32),
+            ];
+            file.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            for (tag, field_type, count, value) in entries {
+                file.extend_from_slice(&tag.to_le_bytes());
+                file.extend_from_slice(&field_type.to_le_bytes());
+                file.extend_from_slice(&count.to_le_bytes());
+                file.extend_from_slice(&value.to_le_bytes());
+            }
+            file.extend_from_slice(&next.to_le_bytes());
+        }
+
+        let mut expected = Vec::new();
+        for (level, side) in sides.iter().enumerate() {
+            let tiles = u64::from(side * side);
+            let offsets: Vec<u64> = (0..tiles).map(|i| 1_000_000 + 10_000 * level as u64 + i).collect();
+            let counts: Vec<u64> = (0..tiles).map(|i| 7 + 100 * level as u64 + i).collect();
+            for (values, pos) in [(&offsets, positions[2 * level]), (&counts, positions[2 * level + 1])] {
+                let end = pos + values.len() * 4;
+                if file.len() < end {
+                    file.resize(end, 0);
+                }
+                for (i, v) in values.iter().enumerate() {
+                    file[pos + 4 * i..pos + 4 * i + 4].copy_from_slice(&(*v as u32).to_le_bytes());
+                }
+            }
+            expected.push((offsets, counts));
+        }
+        (file, expected)
+    }
+
+    /// Open `file` over HTTP; the open's requests and the structure read (checked against `want`).
+    async fn open_tiff_checked(file: Vec<u8>, want: &[(Vec<u64>, Vec<u64>)], what: &str) -> usize {
+        use crate::test_support::{ObjectServer, ServedObject};
+        let server = ObjectServer::start(Some(ServedObject::new(file)), Duration::ZERO);
+        let remote = open_http(&server, "/layout.tif").await;
+        assert_eq!(remote.overviews.len(), want.len() - 1, "{what}");
+        assert_eq!(remote.metadata.tile_offsets, want[0].0, "{what}");
+        assert_eq!(remote.metadata.tile_byte_counts, want[0].1, "{what}");
+        for (overview, want) in remote.overviews.iter().zip(&want[1..]) {
+            assert_eq!((&overview.tile_offsets, &overview.tile_byte_counts), (&want.0, &want.1), "{what}");
+        }
+        let requests = server.requests();
+        println!("OPENREQ {what}: {} requests {:?}", requests.len(), requests.iter().map(|r| r.range).collect::<Vec<_>>());
+        requests.len()
+    }
+
+    /// The arrays of every IFD of a COG sit back to back after the IFDs: however many IFDs and
+    /// tiles, the open is the prefix plus one request (none when everything is in the prefix).
+    #[tokio::test]
+    async fn open_async_costs_one_array_request_for_all_ifds() {
+        // Tiles per side of each level (676, 2974 and 6175 tiles in 1, 5 and 5 IFDs): the same
+        // kind of layout as the COGs that took 1, 7-8 and 9 requests to open.
+        for (sides, expected) in [(&[26][..], 1), (&[47, 24, 12, 6, 3][..], 2), (&[68, 34, 17, 9, 5][..], 2)] {
+            let mut positions = Vec::new();
+            let mut at = 8 + 102 * sides.len();
+            for side in sides {
+                positions.extend([at, at + (side * side * 4) as usize]);
+                at += (side * side * 8) as usize;
+            }
+            let tiles: u32 = sides.iter().map(|s| s * s).sum();
+            let (file, want) = tiff_with_arrays(sides, &positions);
+            let requests = open_tiff_checked(file, &want, &format!("{tiles} tiles in {} IFDs", sides.len())).await;
+            assert_eq!(requests, expected, "{tiles} tiles in {} IFDs", sides.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn open_async_reads_scattered_tag_arrays_correctly() {
+        let (a0, a1) = (16 * 1024 + 4000, 16 * 1024 + 4000 + 4096);
+        let far = 100_000; // more than the 32 KiB coalescing gap
+        // Per case: the positions of the four arrays (IFD 0 offsets and counts, IFD 1 offsets
+        // and counts) of a 32 x 32 and a 16 x 16 tile level, and the expected requests.
+        let cases = [
+            // back to back: the prefix and one request for all four arrays
+            ([a0, a1, a1 + 4096, a1 + 4096 + 1024], 2),
+            // the arrays of IFD 0 together, those of IFD 1 far away: two array requests
+            ([a0, a1, a1 + 4096 + far, a1 + 4096 + far + 1024], 3),
+            // every array on its own
+            ([a0, a0 + 4096 + far, a0 + 2 * (4096 + far), a0 + 3 * (4096 + far)], 5),
+            // IFD 1's arrays precede IFD 0's: still one request
+            ([a0 + 2048, a0 + 2048 + 4096, a0, a0 + 1024], 2),
+        ];
+        for (positions, expected) in cases {
+            let (file, want) = tiff_with_arrays(&[32, 16], &positions);
+            let requests = open_tiff_checked(file, &want, &format!("{positions:?}")).await;
+            assert_eq!(requests, expected, "{positions:?}");
+        }
     }
 
     #[tokio::test]
@@ -4194,11 +4381,12 @@ mod tiff_layout_tests {
         assert_eq!(get_tag_value(&ifd.tags, 256, LE), Some(123_456), "LONG8 stored inline");
         assert_eq!(get_tag_value(&ifd.tags, 257, LE), None, "a LONG8 beyond u32 does not fit");
         assert_eq!(ifd.tags[&324].count, 5_000_000_000, "counts are 64-bit");
-        let bits = futures::executor::block_on(tag_value_bytes(&ifd.tags[&258], 6, &reader)).unwrap();
+        let none = futures::executor::block_on(TagValues::fetch(&reader, &[])).unwrap();
+        let bits = tag_value_bytes(&ifd.tags[&258], 6, &none).unwrap();
         assert_eq!(&bits[..], &[8, 0, 8, 0, 8, 0], "6 bytes fit inline in BigTIFF");
 
         // Reading the values of the absurd entry fails cleanly instead of allocating
-        let err = futures::executor::block_on(read_tag_array_u64(&ifd.tags, 324, &reader, LE, 4)).unwrap_err();
+        let err = read_tag_array_u64(&ifd.tags, 324, &none, LE, 4).unwrap_err();
         assert!(err.to_string().contains("outside the file"), "{err}");
     }
 
@@ -4228,7 +4416,9 @@ mod tiff_layout_tests {
         let header = TiffHeader { little_endian: LE, big: false, first_ifd: 8 };
         let reader = io(file);
         let ifd = futures::executor::block_on(read_ifd(&reader, 8, size, header)).unwrap();
-        let bits = futures::executor::block_on(tag_value_bytes(&ifd.tags[&258], 6, &reader)).unwrap();
+        let range = value_range(&ifd.tags[&258], 6, size).expect("out of line in a classic TIFF");
+        let fetched = futures::executor::block_on(TagValues::fetch(&reader, &[range])).unwrap();
+        let bits = tag_value_bytes(&ifd.tags[&258], 6, &fetched).unwrap();
         assert_eq!(&bits[..], &[8, 0, 8, 0, 8, 0]);
         assert_eq!(ifd.tags[&258].inline_capacity, 4);
     }

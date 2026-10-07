@@ -637,8 +637,6 @@ pub(crate) struct ObjectServer {
     base: String,
     state: std::sync::Arc<Mutex<ServerState>>,
     log: std::sync::Arc<Mutex<Vec<String>>>,
-    in_flight: std::sync::Arc<AtomicUsize>,
-    max_in_flight: std::sync::Arc<AtomicUsize>,
 }
 
 impl ObjectServer {
@@ -664,8 +662,6 @@ impl ObjectServer {
                 gate: None,
             })),
             log: Arc::new(Mutex::new(Vec::new())),
-            in_flight: Arc::new(AtomicUsize::new(0)),
-            max_in_flight: Arc::new(AtomicUsize::new(0)),
         };
         let shared = server.clone();
         std::thread::spawn(move || {
@@ -743,12 +739,9 @@ impl ObjectServer {
         };
         let resolved = range.map(|(a, b)| (a, b.unwrap_or(usize::MAX)));
         self.log.lock().push(format!("{} range={:?}", request_line.trim(), resolved));
-        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
         let start = resolved.map_or(0, |(a, _)| a);
         let gate_failed = gate.is_some_and(|(from, gate, timeout)| start >= from && !gate.arrive(timeout));
         std::thread::sleep(delay);
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
         if gate_failed {
             return (b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_vec(), 503, None);
         }
@@ -816,11 +809,6 @@ impl ObjectServer {
     /// measuring any time. `None` removes the gate.
     pub(crate) fn set_gate(&self, gate: Option<(usize, usize, Duration)>) {
         self.state.lock().gate = gate.map(|(from, target, timeout)| (from, Gate::new(target), timeout));
-    }
-
-    /// The most requests that were being served at the same time.
-    pub(crate) fn max_in_flight(&self) -> usize {
-        self.max_in_flight.load(Ordering::SeqCst)
     }
 
     pub(crate) fn requests(&self) -> Vec<RecordedRequest> {
