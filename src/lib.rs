@@ -138,10 +138,12 @@ pub use async_io::{
     AsyncToSync,
     IoOptions,
     RangeFetchError,
+    SourceChanged,
     SyncToAsync,
     fetch_ranges,
+    is_source_changed,
 };
-pub use remote::{ObjectStoreRangeReader, create_async_range_reader};
+pub use remote::{ObjectStoreRangeReader, Validation, create_async_range_reader};
 
 // ============================================================================
 // S3 Support

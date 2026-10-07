@@ -407,67 +407,240 @@ impl AsyncRangeReader for MockReader {
 // Local HTTP range server
 // ============================================================================
 
+/// One object served by [`ObjectServer`].
+#[derive(Clone)]
+pub(crate) struct ServedObject {
+    pub data: std::sync::Arc<Vec<u8>>,
+    /// `ETag` header value as sent (quotes included), if any
+    pub etag: Option<String>,
+    /// `Last-Modified` as Unix seconds, if any
+    pub modified: Option<i64>,
+}
+
+impl ServedObject {
+    /// An object with the ETag `"abc"` and a fixed `Last-Modified`.
+    pub(crate) fn new(data: Vec<u8>) -> Self {
+        use chrono::TimeZone;
+        Self {
+            data: std::sync::Arc::new(data),
+            etag: Some("\"abc\"".to_string()),
+            modified: Some(chrono::Utc.with_ymd_and_hms(2026, 10, 6, 18, 56, 17).unwrap().timestamp()),
+        }
+    }
+
+    pub(crate) fn etag(mut self, etag: Option<&str>) -> Self {
+        self.etag = etag.map(str::to_string);
+        self
+    }
+
+    pub(crate) fn modified(mut self, modified: Option<i64>) -> Self {
+        self.modified = modified;
+        self
+    }
+}
+
+/// A request as the server saw it.
+#[derive(Clone, Debug)]
+pub(crate) struct RecordedRequest {
+    pub path: String,
+    pub range: Option<(usize, usize)>,
+    pub if_match: Option<String>,
+    pub if_unmodified_since: Option<String>,
+    /// Status code the server answered with
+    pub status: u16,
+}
+
+struct ServerState {
+    /// Served for any path without a specific object (`None`: such paths are 404).
+    default: Option<ServedObject>,
+    objects: std::collections::HashMap<String, ServedObject>,
+    requests: Vec<RecordedRequest>,
+    delay: Duration,
+    /// Evaluate `If-Match` / `If-Unmodified-Since` (a server that ignores them sets this false).
+    honor_conditionals: bool,
+    /// Answer 503 to requests whose range starts at or after this offset.
+    fail_from: Option<usize>,
+}
+
+/// Minimal range-capable HTTP/1.1 server on 127.0.0.1 whose objects can be replaced while it
+/// runs. It records every request, answers `412` to failed `If-Match` / `If-Unmodified-Since`
+/// conditions and `404` for unknown paths, and delays every response by `delay`, which stands in
+/// for network latency. Its threads live for the rest of the process.
+#[derive(Clone)]
+pub(crate) struct ObjectServer {
+    base: String,
+    state: std::sync::Arc<Mutex<ServerState>>,
+    log: std::sync::Arc<Mutex<Vec<String>>>,
+}
+
+impl ObjectServer {
+    /// Start a server; `default` is served for any path without its own object.
+    pub(crate) fn start(default: Option<ServedObject>, delay: Duration) -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Self {
+            base: format!("http://{addr}"),
+            state: Arc::new(Mutex::new(ServerState {
+                default,
+                objects: std::collections::HashMap::new(),
+                requests: Vec::new(),
+                delay,
+                honor_conditionals: true,
+                fail_from: None,
+            })),
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let shared = server.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let server = shared.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let mut request_line = String::new();
+                        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let path = request_line.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap().to_string();
+                        let (mut range, mut if_match, mut if_unmodified_since) = (None, None, None);
+                        loop {
+                            let mut line = String::new();
+                            reader.read_line(&mut line).unwrap();
+                            if line.trim().is_empty() {
+                                break;
+                            }
+                            let lower = line.to_ascii_lowercase();
+                            if let Some(v) = lower.strip_prefix("range: bytes=") {
+                                let (a, b) = v.trim().split_once('-').unwrap();
+                                range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().ok()));
+                            } else if lower.starts_with("if-match:") {
+                                if_match = Some(line["if-match:".len()..].trim().to_string());
+                            } else if lower.starts_with("if-unmodified-since:") {
+                                if_unmodified_since = Some(line["if-unmodified-since:".len()..].trim().to_string());
+                            }
+                        }
+                        let requested = range.map(|(a, b)| (a, b.unwrap_or(usize::MAX)));
+                        let (response, status, _) =
+                            server.respond(&request_line, &path, range, if_match.clone(), if_unmodified_since.clone());
+                        server.state.lock().requests.push(RecordedRequest {
+                            path,
+                            range: requested,
+                            if_match,
+                            if_unmodified_since,
+                            status,
+                        });
+                        // One write: separate header and body writes stall ~40 ms on Nagle/delayed ACK.
+                        if stream.write_all(&response).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        server
+    }
+
+    /// Build the response bytes, status and the (resolved) byte range for one request.
+    fn respond(
+        &self,
+        request_line: &str,
+        path: &str,
+        range: Option<(usize, Option<usize>)>,
+        if_match: Option<String>,
+        if_unmodified_since: Option<String>,
+    ) -> (Vec<u8>, u16, Option<(usize, usize)>) {
+        let (object, delay, honor, fail_from) = {
+            let state = self.state.lock();
+            let object = state.objects.get(path).or(state.default.as_ref()).cloned();
+            (object, state.delay, state.honor_conditionals, state.fail_from)
+        };
+        let resolved = range.map(|(a, b)| (a, b.unwrap_or(usize::MAX)));
+        self.log.lock().push(format!("{} range={:?}", request_line.trim(), resolved));
+        std::thread::sleep(delay);
+        let empty = |status: &str| format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").into_bytes();
+        let Some(object) = object else {
+            return (empty("404 Not Found"), 404, None);
+        };
+        if fail_from.is_some_and(|from| resolved.map_or(0, |(a, _)| a) >= from) {
+            return (empty("503 Service Unavailable"), 503, None);
+        }
+        if honor && precondition_failed(&object, if_match.as_deref(), if_unmodified_since.as_deref()) {
+            return (empty("412 Precondition Failed"), 412, None);
+        }
+        let last = object.data.len() - 1;
+        let (start, end) = resolved.map_or((0, last), |(a, b)| (a, b.min(last)));
+        let body = &object.data[start..=end];
+        let mut head = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\n",
+            body.len(),
+            object.data.len()
+        );
+        if let Some(etag) = &object.etag {
+            head.push_str(&format!("ETag: {etag}\r\n"));
+        }
+        if let Some(modified) = object.modified {
+            let date = chrono::DateTime::from_timestamp(modified, 0).unwrap();
+            head.push_str(&format!("Last-Modified: {}\r\n", date.format("%a, %d %b %Y %H:%M:%S GMT")));
+        }
+        head.push_str("\r\n");
+        let mut response = head.into_bytes();
+        response.extend_from_slice(body);
+        (response, 206, Some((start, end)))
+    }
+
+    /// Base URL (`http://127.0.0.1:port`).
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Replace the object served for paths without their own object.
+    pub(crate) fn replace_default(&self, object: Option<ServedObject>) {
+        self.state.lock().default = object;
+    }
+
+    pub(crate) fn set_honor_conditionals(&self, honor: bool) {
+        self.state.lock().honor_conditionals = honor;
+    }
+
+    pub(crate) fn requests(&self) -> Vec<RecordedRequest> {
+        self.state.lock().requests.clone()
+    }
+
+    /// Request lines (`GET /path HTTP/1.1 range=Some((a, b))`), as [`serve_bytes`] returns them.
+    pub(crate) fn log(&self) -> std::sync::Arc<Mutex<Vec<String>>> {
+        std::sync::Arc::clone(&self.log)
+    }
+}
+
+/// Whether an `If-Match` / `If-Unmodified-Since` condition fails for `object`.
+fn precondition_failed(object: &ServedObject, if_match: Option<&str>, if_unmodified_since: Option<&str>) -> bool {
+    if let Some(tags) = if_match {
+        // Strong comparison, as RFC 9110 specifies for If-Match.
+        let matches = tags.trim() == "*"
+            || tags.split(',').map(str::trim).any(|t| !t.starts_with("W/") && object.etag.as_deref() == Some(t));
+        if !matches {
+            return true;
+        }
+    }
+    if let (Some(date), Some(modified)) = (if_unmodified_since, object.modified)
+        && let Ok(since) = chrono::DateTime::parse_from_rfc2822(date)
+        && modified > since.timestamp()
+    {
+        return true;
+    }
+    false
+}
+
 /// Minimal range-capable HTTP/1.1 server over a byte buffer on 127.0.0.1.
 ///
 /// Returns its base URL (`http://127.0.0.1:port`, any path is served) and a log of request
 /// lines. Every response is delayed by `delay`, which stands in for network latency.
 pub(crate) fn serve_bytes(data: Vec<u8>, delay: Duration) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
-    use std::sync::Arc;
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let log2 = Arc::clone(&log);
-    let data = Arc::new(data);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            let data = Arc::clone(&data);
-            let log = Arc::clone(&log2);
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                loop {
-                    let mut request_line = String::new();
-                    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
-                        return;
-                    }
-                    let mut range = None;
-                    loop {
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        if line.trim().is_empty() {
-                            break;
-                        }
-                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
-                            let (a, b) = v.trim().split_once('-').unwrap();
-                            range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
-                        }
-                    }
-                    log.lock().push(format!(
-                        "{} range={:?}",
-                        request_line.trim(),
-                        range
-                    ));
-                    std::thread::sleep(delay);
-                    let (start, end) = range.map_or((0, data.len() - 1), |(a, b)| (a, b.min(data.len() - 1)));
-                    let body = &data[start..=end];
-                    let head = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\n\
-                         ETag: \"abc\"\r\nLast-Modified: Tue, 06 Oct 2026 18:56:17 GMT\r\n\r\n",
-                        body.len(),
-                        data.len()
-                    );
-                    // One write: separate header and body writes stall ~40 ms on Nagle/delayed ACK.
-                    let mut response = head.into_bytes();
-                    response.extend_from_slice(body);
-                    if stream.write_all(&response).is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-    });
-    (format!("http://{addr}"), log)
+    let server = ObjectServer::start(Some(ServedObject::new(data)), delay);
+    (server.base().to_string(), server.log())
 }

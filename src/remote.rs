@@ -24,11 +24,11 @@ use futures::future::BoxFuture;
 use object_store::aws::AmazonS3Builder;
 use object_store::http::HttpBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ClientOptions, GetOptions, GetRange, ObjectStore, RetryConfig};
+use object_store::{ClientOptions, GetOptions, GetRange, ObjectMeta, ObjectStore, RetryConfig};
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
-use crate::async_io::{spawn_io, AsyncRangeReader, IoOptions, SyncToAsync};
+use crate::async_io::{spawn_io, AsyncRangeReader, IoOptions, SourceChanged, SyncToAsync};
 use crate::range_reader::LocalRangeReader;
 use crate::s3::{resolve_region, S3Config};
 use crate::tiff_utils::AnyResult;
@@ -144,6 +144,59 @@ pub(crate) async fn s3_object_store(config: &S3Config, options: &IoOptions) -> A
     Ok(Arc::clone(&s3_store_entry(config, options).await?.store))
 }
 
+/// How reads of a remote object are tied to the version that was opened.
+///
+/// With [`IfMatch`](Self::IfMatch) every range request after the open carries the object's
+/// strong ETag as `If-Match` (or, when the server gives no usable ETag but a `Last-Modified`
+/// time, `If-Unmodified-Since`). An overwritten object then answers `412 Precondition Failed`,
+/// which surfaces as [`SourceChanged`] instead of bytes of the wrong version. The condition
+/// travels with the request, so it costs no extra round trip. Weak ETags (`W/"..."`) are never
+/// sent: `If-Match` compares strongly and would always fail.
+///
+/// The other modes send no conditions; a replaced object is then only noticed when a cached
+/// header expires ([`Ttl`](Self::Ttl)), or never ([`Immutable`](Self::Immutable), for objects
+/// that are never overwritten, such as date-versioned keys).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Validation {
+    /// Conditional requests (default).
+    #[default]
+    IfMatch,
+    /// No conditional requests; cached headers expire after their time to live.
+    Ttl,
+    /// No conditional requests and cached headers never expire.
+    Immutable,
+}
+
+/// The condition attached to every range request after the open.
+#[derive(Clone)]
+enum Precondition {
+    None,
+    IfMatch(String),
+    UnmodifiedSince(chrono::DateTime<chrono::Utc>),
+}
+
+impl Precondition {
+    fn of(meta: &ObjectMeta, validation: Validation) -> Self {
+        if validation != Validation::IfMatch {
+            return Self::None;
+        }
+        match &meta.e_tag {
+            Some(etag) if !etag.starts_with("W/") => Self::IfMatch(etag.clone()),
+            // object_store reports a missing Last-Modified as the epoch.
+            _ if meta.last_modified.timestamp() > 0 => Self::UnmodifiedSince(meta.last_modified),
+            _ => Self::None,
+        }
+    }
+
+    fn apply(&self, options: &mut GetOptions) {
+        match self {
+            Self::None => {}
+            Self::IfMatch(etag) => options.if_match = Some(etag.clone()),
+            Self::UnmodifiedSince(time) => options.if_unmodified_since = Some(*time),
+        }
+    }
+}
+
 /// Async range reader over one S3 or HTTP(S) object.
 pub struct ObjectStoreRangeReader {
     store: Arc<dyn ObjectStore>,
@@ -157,6 +210,8 @@ pub struct ObjectStoreRangeReader {
     version: String,
     last_modified: Option<i64>,
     options: IoOptions,
+    validation: Validation,
+    precondition: Precondition,
 }
 
 impl ObjectStoreRangeReader {
@@ -173,10 +228,18 @@ impl ObjectStoreRangeReader {
     /// # Errors
     /// Returns an error if the URL is invalid or the object cannot be read.
     pub async fn open_with_options(source: &str, options: &IoOptions) -> AnyResult<Self> {
+        Self::open_with_validation(source, options, Validation::default()).await
+    }
+
+    /// Like [`open_with_options`](Self::open_with_options) with an explicit [`Validation`] mode.
+    ///
+    /// # Errors
+    /// Returns an error if the URL is invalid or the object cannot be read.
+    pub async fn open_with_validation(source: &str, options: &IoOptions, validation: Validation) -> AnyResult<Self> {
         if source.starts_with("s3://") {
-            Self::open_s3(S3Config::from_url(source)?, options).await
+            Self::open_s3_with(S3Config::from_url(source)?, options, validation).await
         } else if source.starts_with("http://") || source.starts_with("https://") {
-            Self::open_http(source, options).await
+            Self::open_http(source, options, validation).await
         } else {
             Err(format!("Not a remote URL (expected s3://, http:// or https://): {source}").into())
         }
@@ -187,11 +250,19 @@ impl ObjectStoreRangeReader {
     /// # Errors
     /// Returns an error if the configuration is invalid or the object cannot be read.
     pub async fn open_s3(config: S3Config, options: &IoOptions) -> AnyResult<Self> {
+        Self::open_s3_with(config, options, Validation::default()).await
+    }
+
+    /// Like [`open_s3`](Self::open_s3) with an explicit [`Validation`] mode.
+    ///
+    /// # Errors
+    /// Returns an error if the configuration is invalid or the object cannot be read.
+    pub async fn open_s3_with(config: S3Config, options: &IoOptions, validation: Validation) -> AnyResult<Self> {
         let entry = s3_store_entry(&config, options).await?;
 
         let identifier = format!("s3://{}/{}", config.bucket, config.key);
         let path = ObjectPath::from(config.key.as_str());
-        Self::open_object(entry, path, identifier, options).await.map_err(|e| {
+        Self::open_object(entry, path, identifier, options, validation).await.map_err(|e| {
             let missing_credentials_hint = !config.skip_signature
                 && config.access_key_id.is_none()
                 && !e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. }));
@@ -210,7 +281,7 @@ impl ObjectStoreRangeReader {
     /// A query string is sent unchanged with every request (presigned or SAS URLs work);
     /// such URLs get a private client rather than a shared one, and the query is left out of
     /// [`identifier`](AsyncRangeReader::identifier).
-    async fn open_http(source: &str, options: &IoOptions) -> AnyResult<Self> {
+    async fn open_http(source: &str, options: &IoOptions, validation: Validation) -> AnyResult<Self> {
         let url = url::Url::parse(source)?;
         let host = url.host_str().ok_or("Missing host in URL")?.to_string();
         let path = ObjectPath::from_url_path(url.path())?;
@@ -246,7 +317,7 @@ impl ObjectStoreRangeReader {
             shared_store(&key, options, build)?
         };
 
-        Self::open_object(entry, path, identifier.clone(), options)
+        Self::open_object(entry, path, identifier.clone(), options, validation)
             .await
             .map_err(|e| format!("Failed to open {identifier}: {e}").into())
     }
@@ -257,6 +328,7 @@ impl ObjectStoreRangeReader {
         path: ObjectPath,
         identifier: String,
         options: &IoOptions,
+        validation: Validation,
     ) -> AnyResult<Self> {
         let permit = Arc::clone(&entry.limiter).acquire_owned().await?;
         let store = Arc::clone(&entry.store);
@@ -276,6 +348,7 @@ impl ObjectStoreRangeReader {
         .await??;
 
         let version = meta.e_tag.clone().unwrap_or_else(|| format!("{}:{}", meta.size, meta.last_modified.timestamp()));
+        let precondition = Precondition::of(&meta, validation);
         Ok(Self {
             store: Arc::clone(&entry.store),
             limiter: Arc::clone(&entry.limiter),
@@ -287,6 +360,8 @@ impl ObjectStoreRangeReader {
             version,
             last_modified: Some(meta.last_modified.timestamp()),
             options: options.clone(),
+            validation,
+            precondition,
         })
     }
 
@@ -325,12 +400,21 @@ impl AsyncRangeReader for ObjectStoreRangeReader {
             let permit = Arc::clone(&self.limiter).acquire_owned().await?;
             let store = Arc::clone(&self.store);
             let path = self.path.clone();
+            let mut get = GetOptions { range: Some(GetRange::Bounded(offset..end)), ..GetOptions::default() };
+            self.precondition.apply(&mut get);
             let bytes = spawn_io(async move {
                 let _permit = permit;
-                store.get_range(&path, offset..end).await
+                store.get_opts(&path, get).await?.bytes().await
             })
             .await?
-            .map_err(|e| format!("Reading {offset}+{len} of {}: {e}", self.identifier))?;
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                match e {
+                    object_store::Error::Precondition { .. } => {
+                        Box::new(SourceChanged { identifier: self.identifier.clone() })
+                    }
+                    e => format!("Reading {offset}+{len} of {}: {e}", self.identifier).into(),
+                }
+            })?;
             Ok(bytes)
         })
     }
@@ -345,6 +429,16 @@ impl AsyncRangeReader for ObjectStoreRangeReader {
 
     fn version(&self) -> Option<&str> {
         Some(&self.version)
+    }
+
+    fn reopen(&self) -> BoxFuture<'_, AnyResult<Arc<dyn AsyncRangeReader>>> {
+        Box::pin(async move {
+            let entry = Arc::new(StoreEntry { store: Arc::clone(&self.store), limiter: Arc::clone(&self.limiter) });
+            let fresh = Self::open_object(entry, self.path.clone(), self.identifier.clone(), &self.options, self.validation)
+                .await
+                .map_err(|e| format!("Failed to reopen {}: {e}", self.identifier))?;
+            Ok(Arc::new(fresh) as Arc<dyn AsyncRangeReader>)
+        })
     }
 
     fn is_local(&self) -> bool {
@@ -560,5 +654,145 @@ mod runtime_independence_tests {
             assert!(slow.is_err(), "expected the read to be cancelled");
             assert_eq!(reader.read_range(100_000, 1000).await.unwrap().len(), 1000);
         });
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::async_io::is_source_changed;
+    use crate::test_support::{ObjectServer, ServedObject};
+    use std::time::Duration;
+
+    fn data(n: usize, mul: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * mul % 256) as u8).collect()
+    }
+
+    fn server(object: ServedObject) -> ObjectServer {
+        ObjectServer::start(Some(object), Duration::ZERO)
+    }
+
+    async fn open(server: &ObjectServer, validation: Validation) -> ObjectStoreRangeReader {
+        let url = format!("{}/obj.bin", server.base());
+        ObjectStoreRangeReader::open_with_validation(&url, &IoOptions::default(), validation).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn reads_after_the_open_carry_if_match_and_a_replaced_object_is_reported() {
+        let server = server(ServedObject::new(data(100_000, 7)).etag(Some("\"v1\"")));
+        let reader = open(&server, Validation::IfMatch).await;
+        assert_eq!(reader.version(), Some("\"v1\""));
+        let first = reader.read_range(50_000, 4096).await.unwrap();
+        assert_eq!(&first[..], &data(100_000, 7)[50_000..54_096]);
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "open + one read: {requests:?}");
+        assert_eq!(requests[0].if_match, None, "the open has no version to pin yet");
+        assert_eq!(requests[1].if_match.as_deref(), Some("\"v1\""));
+        assert_eq!((requests[1].path.as_str(), requests[1].range), ("/obj.bin", Some((50_000, 54_095))));
+
+        server.replace_default(Some(ServedObject::new(data(100_000, 11)).etag(Some("\"v2\""))));
+        let err = reader.read_range(60_000, 100).await.unwrap_err();
+        assert!(is_source_changed(&*err), "{err}");
+        let changed = err.downcast_ref::<SourceChanged>().unwrap();
+        assert_eq!(changed.identifier, reader.identifier());
+        assert_eq!(server.requests().last().unwrap().status, 412);
+    }
+
+    #[tokio::test]
+    async fn reopen_returns_the_new_version() {
+        let server = server(ServedObject::new(data(100_000, 7)).etag(Some("\"v1\"")));
+        let reader = open(&server, Validation::IfMatch).await;
+        server.replace_default(Some(ServedObject::new(data(120_000, 11)).etag(Some("\"v2\""))));
+        assert!(reader.read_range(60_000, 100).await.is_err());
+
+        let fresh = reader.reopen().await.unwrap();
+        assert_eq!((fresh.version(), fresh.size()), (Some("\"v2\""), 120_000));
+        assert_eq!(&fresh.read_range(60_000, 100).await.unwrap()[..], &data(120_000, 11)[60_000..60_100]);
+    }
+
+    #[tokio::test]
+    async fn weak_etags_are_never_sent_and_last_modified_is_used_instead() {
+        let server = server(ServedObject::new(data(100_000, 7)).etag(Some("W/\"w1\"")).modified(Some(1_800_000_000)));
+        let reader = open(&server, Validation::IfMatch).await;
+        reader.read_range(50_000, 100).await.unwrap();
+        let read = server.requests().pop().unwrap();
+        assert_eq!(read.if_match, None);
+        assert!(read.if_unmodified_since.is_some(), "{read:?}");
+
+        server.replace_default(Some(ServedObject::new(data(100_000, 11)).etag(Some("W/\"w2\"")).modified(Some(1_800_000_100))));
+        let err = reader.read_range(50_000, 100).await.unwrap_err();
+        assert!(is_source_changed(&*err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sources_without_validators_get_no_conditions() {
+        let server = server(ServedObject::new(data(100_000, 7)).etag(None).modified(None));
+        let reader = open(&server, Validation::IfMatch).await;
+        reader.read_range(50_000, 100).await.unwrap();
+        let read = server.requests().pop().unwrap();
+        assert_eq!((read.if_match, read.if_unmodified_since), (None, None));
+        // Nothing detects the replacement: this is the TTL-only case.
+        server.replace_default(Some(ServedObject::new(data(100_000, 11)).etag(None).modified(None)));
+        assert_eq!(&reader.read_range(50_000, 100).await.unwrap()[..], &data(100_000, 11)[50_000..50_100]);
+    }
+
+    #[tokio::test]
+    async fn ttl_and_immutable_modes_send_no_conditions() {
+        for validation in [Validation::Ttl, Validation::Immutable] {
+            let server = server(ServedObject::new(data(100_000, 7)).etag(Some("\"v1\"")));
+            let reader = open(&server, validation).await;
+            reader.read_range(50_000, 100).await.unwrap();
+            let read = server.requests().pop().unwrap();
+            assert_eq!((read.if_match, read.if_unmodified_since), (None, None), "{validation:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ignores_conditions_is_not_an_error() {
+        let server = server(ServedObject::new(data(100_000, 7)).etag(Some("\"v1\"")));
+        let reader = open(&server, Validation::IfMatch).await;
+        server.set_honor_conditionals(false);
+        server.replace_default(Some(ServedObject::new(data(100_000, 11)).etag(Some("\"v2\""))));
+        assert_eq!(&reader.read_range(50_000, 100).await.unwrap()[..], &data(100_000, 11)[50_000..50_100]);
+    }
+
+    const HTTPS_URL: &str =
+        "https://ei-imagery-sentinel2-prd.s3.us-west-2.amazonaws.com/2026-09-01_2026-10-01/18SUJ_2026-09-01_2026-10-01/TCI.tif";
+    const S3_URL: &str = "s3://ei-imagery-sentinel2-prd/2026-09-01_2026-10-01/18SUJ_2026-09-01_2026-10-01/TCI.tif";
+
+    /// A conditional range read with the right ETag succeeds and with a wrong one fails with
+    /// `412` ([`object_store::Error::Precondition`]), through both the S3 and the HTTPS store, and
+    /// the reader maps it to [`SourceChanged`].
+    async fn check_real_object_honours_if_match(reader: ObjectStoreRangeReader) {
+        let etag = reader.etag().expect("S3 sends an ETag").to_string();
+        assert!(!etag.starts_with("W/"), "{etag}");
+        let range = GetOptions { range: Some(GetRange::Bounded(200_000_000..200_000_064)), ..GetOptions::default() };
+
+        let right = GetOptions { if_match: Some(etag.clone()), ..range.clone() };
+        let bytes = reader.store.get_opts(&reader.path, right).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.len(), 64);
+
+        let wrong = GetOptions { if_match: Some("\"00000000000000000000000000000000-0\"".into()), ..range };
+        let err = reader.store.get_opts(&reader.path, wrong).await.unwrap_err();
+        assert!(matches!(err, object_store::Error::Precondition { .. }), "{err}");
+
+        // The reader itself sends the same condition on every read beyond its prefix.
+        assert_eq!(reader.read_range(200_000_000, 64).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs network access"]
+    async fn real_s3_store_answers_412_to_a_wrong_etag() {
+        let mut config = S3Config::from_url(S3_URL).unwrap();
+        config.skip_signature = true;
+        config.region = Some("us-west-2".to_string());
+        check_real_object_honours_if_match(ObjectStoreRangeReader::open_s3(config, &IoOptions::default()).await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs network access"]
+    async fn real_https_store_answers_412_to_a_wrong_etag() {
+        check_real_object_honours_if_match(ObjectStoreRangeReader::open(HTTPS_URL).await.unwrap()).await;
     }
 }

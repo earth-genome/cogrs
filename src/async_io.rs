@@ -117,6 +117,15 @@ pub trait AsyncRangeReader: Send + Sync {
     fn io_options(&self) -> &IoOptions {
         &DEFAULT_IO_OPTIONS
     }
+
+    /// Open the same object again, fresh from the source (new size, version and prefix).
+    ///
+    /// Used to recover after a read reported [`SourceChanged`]. The default implementation fails:
+    /// sources that cannot be replaced (memory, mocks) have nothing to reopen.
+    fn reopen(&self) -> BoxFuture<'_, AnyResult<Arc<dyn AsyncRangeReader>>> {
+        let identifier = self.identifier().to_string();
+        Box::pin(async move { Err(format!("{identifier} cannot be reopened").into()) })
+    }
 }
 
 /// Merge `ranges` into a sorted list of disjoint requests.
@@ -140,6 +149,32 @@ pub(crate) fn merge_ranges(ranges: &[Range<u64>], gap: u64, max_len: u64) -> Vec
     merged
 }
 
+/// The object was replaced or modified after it was opened: a conditional read (`If-Match` /
+/// `If-Unmodified-Since`) failed with `412 Precondition Failed`.
+///
+/// The reader that returned it still describes the old version; open the source again (the
+/// extraction and point-query entry points do so once, automatically).
+/// [`is_source_changed`] recognises it inside the errors this crate returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceChanged {
+    /// Identifier of the source (URL or path).
+    pub identifier: String,
+}
+
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} was replaced or modified after it was opened", self.identifier)
+    }
+}
+
+impl std::error::Error for SourceChanged {}
+
+/// Whether `err` is, or wraps, a [`SourceChanged`] error.
+#[must_use]
+pub fn is_source_changed(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.is::<SourceChanged>() || err.downcast_ref::<RangeFetchError>().is_some_and(|e| e.source_changed)
+}
+
 /// A failed (possibly merged) range request, naming the byte range it covered. Returned (boxed)
 /// by [`fetch_ranges`] so callers can tell which of their ranges was affected.
 #[derive(Debug)]
@@ -147,6 +182,8 @@ pub struct RangeFetchError {
     /// The range that was requested (after merging).
     pub range: Range<u64>,
     message: String,
+    /// The request failed because the object changed ([`SourceChanged`]).
+    source_changed: bool,
 }
 
 impl std::fmt::Display for RangeFetchError {
@@ -174,9 +211,13 @@ pub async fn fetch_ranges<R: AsyncRangeReader + ?Sized>(
     let mut in_flight = stream::iter(jobs)
         .map(|(i, start, len)| async move {
             let range = start..start + len;
-            let fail = |message: String| RangeFetchError { range: range.clone(), message };
+            let fail = |message: String| RangeFetchError { range: range.clone(), message, source_changed: false };
             let len = usize::try_from(len).map_err(|e| fail(format!("range too large: {e}")))?;
-            let bytes = reader.read_range(start, len).await.map_err(|e| fail(e.to_string()))?;
+            let bytes = reader.read_range(start, len).await.map_err(|e| RangeFetchError {
+                range: range.clone(),
+                source_changed: is_source_changed(&*e),
+                message: e.to_string(),
+            })?;
             if bytes.len() != len {
                 return Err(fail(format!(
                     "short read from {}: requested {len} bytes at offset {start}, got {}",

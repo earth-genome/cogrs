@@ -401,6 +401,7 @@ dependencies = [
  "ahash",
  "anyhow",
  "bytes",
+ "chrono",
  "criterion",
  "crs-definitions",
  "flate2",
