@@ -407,3 +407,160 @@ async fn cubic_downsampling_matches_gdalwarp_on_the_dem() {
     assert_eq!(c.validity_mismatch, 0);
     assert!(c.max_abs_diff < 0.01, "max |diff| {}", c.max_abs_diff);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Multi-band nodata
+// ---------------------------------------------------------------------------------------------
+
+/// Interleaved bands of `src` warped like [`gdalwarp`] (Float32, nodata 0 in every band), with
+/// `extra` gdalwarp arguments.
+fn gdalwarp_bands(src: &str, bounds: &BoundingBox, size: usize, alg: &str, bands: usize, extra: &[&str]) -> Option<Vec<f32>> {
+    let dir = tempfile::tempdir().ok()?;
+    let out = dir.path().join("ref.tif");
+    let status = Command::new("gdalwarp")
+        .args(["-q", "-overwrite", "-t_srs", "EPSG:3857", "-te"])
+        .args([bounds.minx, bounds.miny, bounds.maxx, bounds.maxy].map(|v| format!("{v:.9}")))
+        .args(["-ts", &size.to_string(), &size.to_string(), "-r", alg, "-et", "0"])
+        .args(["-ot", "Float32", "-dstnodata", "0", "-co", "COMPRESS=NONE"])
+        .args(extra)
+        .arg(src)
+        .arg(&out)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    let ds = gdal::Dataset::open(&out).ok()?;
+    let mut interleaved = vec![0f32; size * size * bands];
+    for band in 0..bands {
+        let buf: gdal::raster::Buffer<f32> = ds.rasterband(band + 1).ok()?.read_as((0, 0), (size, size), (size, size), None).ok()?;
+        for (i, v) in buf.data().iter().enumerate() {
+            interleaved[i * bands + band] = *v;
+        }
+    }
+    Some(interleaved)
+}
+
+/// Shares of identical samples (within 1e-3) and of samples more than 1 apart, and the mean |diff|.
+fn compare_bands(ours: &[f32], gdal: &[f32]) -> (f64, f64, f64) {
+    let n = ours.len().min(gdal.len()) as f64;
+    let (mut same, mut big, mut sum) = (0usize, 0usize, 0.0f64);
+    for (&o, &g) in ours.iter().zip(gdal) {
+        let d = f64::from((o - g).abs());
+        same += usize::from(d < 1e-3);
+        big += usize::from(d > 1.0);
+        sum += d;
+    }
+    (100.0 * same as f64 / n, 100.0 * big as f64 / n, sum / n)
+}
+
+/// 3-band 8-bit raster, nodata 0, in 3857: noisy texture in `1..=250`, an all-nodata collar
+/// (about a third of the raster on one side of a slanted line) and band-wise speckle, 3% of the
+/// samples of each band set to 0 on their own, so many pixels are nodata in some bands only.
+fn partial_nodata_raster(dir: &Path) -> String {
+    use crate::test_support::{build_cog, CogSpec, Sample};
+    fn hash(b: usize, x: usize, y: usize) -> u64 {
+        let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ (b as u64 + 1).wrapping_mul(0x1656_67B1_9E37_79F9);
+        h ^= h >> 29;
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^ (h >> 32)
+    }
+    let spec = CogSpec {
+        width: 1024,
+        height: 1024,
+        tile: 256,
+        bands: 3,
+        sample: Sample::U8,
+        deflate: true,
+        predictor: false,
+        epsg: 3857,
+        origin: (1_000_000.0, 5_000_000.0),
+        pixel_size: (10.0, 10.0),
+        nodata: Some(0.0),
+        overviews: 0,
+        sparse: vec![],
+        corrupt: vec![],
+        pixel: |b, x, y| {
+            if x as f64 + 0.3 * y as f64 <= 300.0 || hash(b, x, y) % 100 < 3 {
+                return 0.0;
+            }
+            let wave = (x as f64 * 0.05 + b as f64).sin() * (y as f64 * 0.04).cos();
+            1.0 + (110.0 + 100.0 * wave + (hash(b, y, x) % 40) as f64).clamp(0.0, 249.0)
+        },
+    };
+    let path = dir.join("partial_nodata.tif");
+    std::fs::write(&path, build_cog(&spec)).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// Output window over the raster's interior, `ratio` source pixels per output pixel. It sits in
+/// the raster, across the collar's edge: GDAL scales by the part of the window inside the raster.
+fn partial_nodata_window(ratio: f64) -> BoundingBox {
+    let res = 10.0 * ratio;
+    let (minx, maxy) = (1_000_000.0 + 210.37, 5_000_000.0 - 410.81);
+    BoundingBox::new(minx, maxy - 256.0 * res, minx + 256.0 * res, maxy)
+}
+
+/// Multi-band nodata, downsampling: gdalwarp reading a source's own nodata value leaves
+/// `UNIFIED_SRC_NODATA` unset, which `GDALWarpOperation::WarpRegionToBuffer` runs as `PARTIAL`
+/// (the unified mask is built, the per-band masks are kept). A pixel is then invalid at the
+/// kernel centre only if *every* band is nodata, while a tap is invalid for a band that is
+/// nodata there. Measured with this raster: 100.00% identical to gdalwarp at every ratio, where
+/// judging the centre band by band was 98.99% identical at ratio 1.3 (bilinear; mean |diff| 1.31).
+#[tokio::test]
+async fn downsampling_a_partly_nodata_multiband_raster_matches_gdalwarp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = partial_nodata_raster(dir.path());
+    let reader = CogReader::open(&path).unwrap();
+    for (method, alg) in [(ResamplingMethod::Bilinear, "bilinear"), (ResamplingMethod::Cubic, "cubic")] {
+        for ratio in [1.3, 1.5, 2.5] {
+            let bounds = partial_nodata_window(ratio);
+            let Some(gdal) = gdalwarp_bands(&path, &bounds, 256, alg, 3, &[]) else {
+                println!("Skipping: gdalwarp not available");
+                return;
+            };
+            let tile = TileExtractor::new(&reader).bounds(bounds).size(256).resampling(method).extract().await.unwrap();
+            let (identical, big, mean) = compare_bands(&tile.pixels, &gdal);
+            println!("GDALCMP partial nodata {alg} x{ratio}: {identical:.3}% identical, {big:.3}% off by more than 1, mean|diff| {mean:.5}");
+            assert!(identical > 99.9, "{alg} x{ratio}: {identical:.3}% identical");
+            assert!(mean < 0.001, "{alg} x{ratio}: mean |diff| {mean}");
+        }
+    }
+}
+
+/// gdalwarp with an explicit `-srcnodata` runs `UNIFIED_SRC_NODATA=YES` (taps judged across all
+/// bands too); cogrs follows the default for a source's own nodata value, so it differs from that
+/// mode on a raster with partial nodata pixels. Pins the claim in the docs and CHANGELOG.
+#[tokio::test]
+async fn explicit_srcnodata_in_gdalwarp_is_a_different_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = partial_nodata_raster(dir.path());
+    let reader = CogReader::open(&path).unwrap();
+    let bounds = partial_nodata_window(1.3);
+    let Some(unified) = gdalwarp_bands(&path, &bounds, 256, "bilinear", 3, &["-srcnodata", "0"]) else { return };
+    let Some(default) = gdalwarp_bands(&path, &bounds, 256, "bilinear", 3, &[]) else { return };
+    let tile = TileExtractor::new(&reader).bounds(bounds).size(256).resampling(ResamplingMethod::Bilinear).extract().await.unwrap();
+    let (vs_default, _, _) = compare_bands(&tile.pixels, &default);
+    let (vs_unified, _, _) = compare_bands(&tile.pixels, &unified);
+    println!("GDALCMP partial nodata: {vs_default:.3}% identical to gdalwarp default, {vs_unified:.3}% to -srcnodata 0");
+    assert!(vs_default > 99.9, "{vs_default:.3}%");
+    assert!(vs_unified < 95.0, "{vs_unified:.3}%");
+}
+
+/// `-b` restricts the warped bands, and with them the unified mask: gdalwarp judges the centre
+/// by the selected bands only, like `TileExtractor::bands`.
+#[tokio::test]
+async fn band_selection_limits_the_nodata_centre_rule_like_gdalwarp_b() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = partial_nodata_raster(dir.path());
+    let reader = CogReader::open(&path).unwrap();
+    let bounds = partial_nodata_window(1.3);
+    for (selected, args) in [(&[0usize, 2][..], &["-b", "1", "-b", "3"][..]), (&[1][..], &["-b", "2"][..])] {
+        let Some(gdal) = gdalwarp_bands(&path, &bounds, 256, "bilinear", selected.len(), args) else { return };
+        let tile =
+            TileExtractor::new(&reader).bounds(bounds).size(256).resampling(ResamplingMethod::Bilinear).bands(selected).extract().await.unwrap();
+        let (identical, _, mean) = compare_bands(&tile.pixels, &gdal);
+        println!("GDALCMP partial nodata bands {selected:?}: {identical:.3}% identical, mean|diff| {mean:.5}");
+        assert!(identical > 99.9, "bands {selected:?}: {identical:.3}% identical");
+    }
+}

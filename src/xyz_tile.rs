@@ -90,6 +90,14 @@ pub struct TileData {
     /// covering more than about one source pixel) the window is much wider, so
     /// `NaN`/nodata source pixels are left out and the rest renormalised instead,
     /// unless the nearest source pixel itself is invalid: then that sample is kept.
+    ///
+    /// With several bands, validity of an *interpolation tap* is judged per band (a sample
+    /// equal to the band's nodata value, or `NaN`), but a *nearest source pixel* counts as invalid
+    /// only when it is invalid in every selected band (see [`TileExtractor::bands`]); a pixel
+    /// that is nodata in some bands only is a valid centre, and each band is interpolated
+    /// from its own valid taps. This is what `gdalwarp` does with a source's own nodata value
+    /// (`UNIFIED_SRC_NODATA` left unset), not the all-bands tap rule of an explicit
+    /// `-srcnodata` / `UNIFIED_SRC_NODATA=YES`.
     pub pixels: Vec<f32>,
     /// Number of bands (1 for grayscale, 3 for RGB, 4 for RGBA)
     pub bands: usize,
@@ -2283,6 +2291,7 @@ fn render_extraction(
         sum: Vec::new(),
         weight: Vec::new(),
         centre: Vec::new(),
+        centre_invalid: false,
     });
 
     // Source row/column of every output pixel come from the plan (the same coordinates that
@@ -2558,8 +2567,11 @@ struct ScaledSampler<'a> {
     row_weight: Vec<f64>,
     sum: Vec<f64>,
     weight: Vec<f64>,
-    /// Per output band: `Some(value)` when the nearest source pixel is invalid.
-    centre: Vec<Option<f32>>,
+    /// Per output band: the nearest source pixel's sample (or `fill` when its tile is missing);
+    /// only meaningful when `centre_invalid`.
+    centre: Vec<f32>,
+    /// The nearest source pixel is invalid in every output band.
+    centre_invalid: bool,
 }
 
 /// A weight total below this means no usable data (GDAL: `dfAccumulatorWeight < 0.000001`).
@@ -2580,20 +2592,29 @@ impl ScaledSampler<'_> {
         self.weight.resize(bands, 0.0);
 
         // GDAL never writes a pixel whose own (nearest) source pixel is nodata, however many
-        // valid pixels the kernel reaches: such a band gets that sample, or fill if its tile is
+        // valid pixels the kernel reaches: such a pixel gets that sample, or fill if its tile is
         // missing. Without this the valid area would grow by half a kernel width at nodata edges.
+        // "Nodata" is unified across the bands being warped (`panUnifiedSrcValid`, built from
+        // `-b` bands only): the pixel must be invalid in every one of them. A pixel that is
+        // nodata in some bands only is a valid centre, and each band is interpolated from its
+        // own valid taps.
         let nearest = (nearest_pixel(vx, self.size.0), nearest_pixel(vy, self.size.1));
         let tile = self.tiles.get(&(nearest.1 / tile_h * self.tiles_across + nearest.0 / tile_w));
         let pixel = (nearest.1 % tile_h * tile_w + nearest.0 % tile_w) * self.source_bands;
         self.centre.clear();
+        let mut all_invalid = true;
         for &source_band in self.output_bands {
             let sample = tile.and_then(|t| t.get(pixel + source_band)).copied();
             self.centre.push(match sample {
-                Some(v) if is_invalid_sample(v, self.nodata) => Some(v),
-                Some(_) => None,
-                None => Some(self.fill),
+                Some(v) if is_invalid_sample(v, self.nodata) => v,
+                Some(_) => {
+                    all_invalid = false;
+                    f32::NAN
+                }
+                None => self.fill,
             });
         }
+        self.centre_invalid = all_invalid;
 
         for py in y_lo..=y_hi {
             self.row_sum.clear();
@@ -2630,10 +2651,12 @@ impl ScaledSampler<'_> {
         }
 
         for (b, value) in out.iter_mut().enumerate() {
-            *value = match self.centre[b] {
-                Some(passthrough) => passthrough,
-                None if self.weight[b] > MIN_KERNEL_WEIGHT => (self.sum[b] / self.weight[b]) as f32,
-                None => self.fill,
+            *value = if self.centre_invalid {
+                self.centre[b]
+            } else if self.weight[b] > MIN_KERNEL_WEIGHT {
+                (self.sum[b] / self.weight[b]) as f32
+            } else {
+                self.fill
             };
         }
     }
@@ -3900,6 +3923,17 @@ mod downsample_tests {
     }
 
     fn sample(tiles: &AHashMap<usize, Arc<Vec<f32>>>, nodata: Option<f32>, v: (f64, f64)) -> f32 {
+        sample_bands(tiles, 1, &[0], nodata, v)[0]
+    }
+
+    /// Scaled bilinear sample (ratio 2) of the `output_bands` of an 8x4 level with `source_bands`.
+    fn sample_bands(
+        tiles: &AHashMap<usize, Arc<Vec<f32>>>,
+        source_bands: usize,
+        output_bands: &[usize],
+        nodata: Option<f32>,
+        v: (f64, f64),
+    ) -> Vec<f32> {
         let mut sampler = ScaledSampler {
             tiles,
             resampling: ResamplingMethod::Bilinear,
@@ -3907,8 +3941,8 @@ mod downsample_tests {
             size: (8, 4),
             tile: (8, 4),
             tiles_across: 1,
-            source_bands: 1,
-            output_bands: &[0],
+            source_bands,
+            output_bands,
             nodata,
             fill: -7.0,
             wx: vec![],
@@ -3918,10 +3952,11 @@ mod downsample_tests {
             sum: vec![],
             weight: vec![],
             centre: vec![],
+            centre_invalid: false,
         };
-        let mut out = [0.0f32];
+        let mut out = vec![0.0f32; output_bands.len()];
         sampler.sample(v.0, v.1, &mut out);
-        out[0]
+        out
     }
 
     #[test]
@@ -3975,6 +4010,58 @@ mod downsample_tests {
         assert!(sample(&tiles, None, (4.0, 1.0)).is_nan());
         // unread tile: fill
         assert_eq!(sample(&AHashMap::new(), None, (3.5, 1.5)), -7.0);
+    }
+
+    /// 8x4 level with three interleaved bands, band `b` of pixel `(x, y)` is `x * x + 3 * y + 100 * b`.
+    fn level_rgb() -> AHashMap<usize, Arc<Vec<f32>>> {
+        let data: Vec<f32> =
+            (0..4).flat_map(|y| (0..8).flat_map(move |x| (0..3).map(move |b| (x * x + 3 * y + 100 * b) as f32))).collect();
+        let mut tiles = AHashMap::new();
+        tiles.insert(0, Arc::new(data));
+        tiles
+    }
+
+    /// GDAL (`UNIFIED_SRC_NODATA` unset, as for a source's own nodata value) takes a pixel as
+    /// nodata at the centre only when every band is nodata; a partly nodata pixel is a valid
+    /// centre and each band is interpolated from its own valid taps.
+    #[test]
+    fn scaled_kernel_centre_is_nodata_only_when_every_band_is() {
+        let mut tiles = level_rgb();
+        let all = [0, 1, 2];
+        // Column 4 is nodata (-1) in the middle band only
+        let data = Arc::make_mut(tiles.get_mut(&0).unwrap());
+        for y in 0..4 {
+            data[(y * 8 + 4) * 3 + 1] = -1.0;
+        }
+        // x = 4.1 (nearest pixel 4), y = 1.5: taps 3..=6 weigh .45 .95 .55 .05 (kernel radius 2)
+        let got = sample_bands(&tiles, 3, &all, Some(-1.0), (4.1, 1.5));
+        let row = |b: f32, xs: &[f32], ws: &[f32]| {
+            xs.iter().zip(ws).map(|(x, w)| (x * x + 4.5 + 100.0 * b) * w).sum::<f32>() / ws.iter().sum::<f32>()
+        };
+        assert!((got[0] - row(0.0, &[3.0, 4.0, 5.0, 6.0], &[0.45, 0.95, 0.55, 0.05])).abs() < 1e-3, "{got:?}");
+        // the band that is nodata at the centre leaves column 4 out and renormalises, not -1
+        assert!((got[1] - row(1.0, &[3.0, 5.0, 6.0], &[0.45, 0.55, 0.05])).abs() < 1e-3, "{got:?}");
+        assert!((got[2] - row(2.0, &[3.0, 4.0, 5.0, 6.0], &[0.45, 0.95, 0.55, 0.05])).abs() < 1e-3, "{got:?}");
+
+        // Nodata in every band: the pixel is passed through
+        let data = Arc::make_mut(tiles.get_mut(&0).unwrap());
+        for y in 0..4 {
+            data[(y * 8 + 4) * 3] = -1.0;
+            data[(y * 8 + 4) * 3 + 2] = -1.0;
+        }
+        assert_eq!(sample_bands(&tiles, 3, &all, Some(-1.0), (4.1, 1.5)), [-1.0, -1.0, -1.0]);
+        // Unified validity covers the bands being warped (`-b`): the middle band alone is nodata
+        // at column 4 whichever of the others are selected, and a lone selected band is per band
+        let data = Arc::make_mut(tiles.get_mut(&0).unwrap());
+        for y in 0..4 {
+            data[(y * 8 + 4) * 3] = (16 + 3 * y) as f32;
+            data[(y * 8 + 4) * 3 + 2] = (216 + 3 * y) as f32;
+        }
+        assert_eq!(sample_bands(&tiles, 3, &[1], Some(-1.0), (4.1, 1.5)), [-1.0]);
+        let got = sample_bands(&tiles, 3, &[0, 1], Some(-1.0), (4.1, 1.5));
+        assert!(got[1] > 0.0, "{got:?}");
+        // a missing tile is nodata in every band: fill
+        assert_eq!(sample_bands(&AHashMap::new(), 3, &all, Some(-1.0), (4.1, 1.5)), [-7.0, -7.0, -7.0]);
     }
 
     /// A downsampled extraction must fetch every source tile its widened kernels read, or the
