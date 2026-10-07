@@ -14,6 +14,9 @@ categories = ["science::geo", "encoding"]
 [lib]
 name = "cogrs"
 path = "src/lib.rs"
+# The lib has no benches; without this, `cargo bench -- <criterion flags>` is
+# also passed to libtest, which rejects them.
+bench = false
 
 [dependencies]
 # TIFF/image parsing

@@ -6,42 +6,84 @@
 //! - XYZ tile extraction at various zoom levels
 //! - Point queries (single and batch)
 //! - Coordinate transformation
+//!
+//! Input COG: set `COGRS_BENCH_COG=/path/to/file.tif` to benchmark a real
+//! file (the benches assume world coverage in EPSG:3857; the run fails loudly
+//! if the path does not exist). When unset, a deterministic synthetic
+//! 4096x4096 single-band Deflate GeoTIFF covering the whole Web Mercator
+//! world is generated once into a temp dir. That file is striped with no
+//! overviews (not a true COG layout), so it benchmarks the full-resolution
+//! strip path; set `COGRS_BENCH_COG` to a real tiled COG with overviews for
+//! representative COG numbers.
 
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
 use std::hint::black_box;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::runtime::Runtime;
 
 use cogrs::{
     CogReader, BoundingBox, CoordTransformer, PointQuery,
-    extract_xyz_tile, extract_tile_with_extent,
+    TileExtractor, ReprojectedRaster, GeoTiffCompression,
     range_reader::LocalRangeReader,
 };
 
-/// Get path to test COG file (if it exists)
-fn get_test_cog_path() -> Option<String> {
-    let paths = [
-        "/home/evan/projects/personal/geo/tileyolo/data/viridis/output_cog.tif",
-        "/home/evan/projects/personal/geo/tileyolo/data/grayscale/gray_3857-cog.tif",
-    ];
+/// Name of the env var pointing at a user-supplied COG.
+const BENCH_COG_ENV: &str = "COGRS_BENCH_COG";
 
-    for path in paths {
-        if std::path::Path::new(path).exists() {
-            return Some(path.to_string());
+/// Side length (pixels) of the synthetic world-covering COG.
+const SYNTH_SIZE: usize = 4096;
+
+/// Keeps the temp dir alive for the whole process; second field is the COG path.
+static TEST_COG: LazyLock<(Option<tempfile::TempDir>, String)> = LazyLock::new(|| {
+    if let Some(p) = std::env::var_os(BENCH_COG_ENV) {
+        let p = std::path::PathBuf::from(p);
+        assert!(
+            p.is_file(),
+            "{BENCH_COG_ENV} is set to {p:?}, but that file does not exist"
+        );
+        return (None, p.to_string_lossy().into_owned());
+    }
+    let dir = tempfile::tempdir().expect("create temp dir for synthetic COG");
+    let path = dir.path().join("synthetic_world_3857.tif");
+    let bounds = BoundingBox::from_xyz(0, 0, 0);
+    let res = (bounds.maxx - bounds.minx) / SYNTH_SIZE as f64;
+    let mut pixels = Vec::with_capacity(SYNTH_SIZE * SYNTH_SIZE);
+    for y in 0..SYNTH_SIZE {
+        for x in 0..SYNTH_SIZE {
+            let (fx, fy) = (x as f32 / SYNTH_SIZE as f32, y as f32 / SYNTH_SIZE as f32);
+            pixels.push(
+                100.0 + 50.0 * (fx * 12.0).sin() * (fy * 9.0).cos() + 30.0 * fx + 20.0 * fy,
+            );
         }
     }
-    None
+    let raster = ReprojectedRaster {
+        pixels,
+        bands: 1,
+        width: SYNTH_SIZE,
+        height: SYNTH_SIZE,
+        crs: 3857,
+        bounds,
+        resolution: (res, res),
+        nodata: None,
+    };
+    raster
+        .write_geotiff_compressed(&path, GeoTiffCompression::Deflate)
+        .expect("write synthetic COG");
+    let path = path.to_string_lossy().into_owned();
+    (Some(dir), path)
+});
+
+/// Path to the COG used by the file-backed benchmarks (see module docs).
+fn test_cog_path() -> &'static str {
+    &TEST_COG.1
 }
 
 /// Benchmark XYZ tile extraction at various zoom levels
 fn bench_xyz_tile_extraction(c: &mut Criterion) {
-    let Some(path) = get_test_cog_path() else {
-        eprintln!("Skipping benchmark: no test COG found");
-        return;
-    };
+    let path = test_cog_path();
 
     let rt = Runtime::new().unwrap();
-    let reader = LocalRangeReader::new(&path).unwrap();
+    let reader = LocalRangeReader::new(path).unwrap();
     let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
 
     let mut group = c.benchmark_group("xyz_tile_extraction");
@@ -58,7 +100,7 @@ fn bench_xyz_tile_extraction(c: &mut Criterion) {
             &(zoom, x, y),
             |b, &(z, x, y)| {
                 b.iter(|| {
-                    rt.block_on(extract_xyz_tile(black_box(&cog), z, x, y, (256, 256)))
+                    rt.block_on(TileExtractor::new(black_box(&cog)).xyz(z, x, y).output_size(256, 256).extract())
                 });
             },
         );
@@ -69,13 +111,10 @@ fn bench_xyz_tile_extraction(c: &mut Criterion) {
 
 /// Benchmark tile extraction with different output sizes
 fn bench_tile_sizes(c: &mut Criterion) {
-    let Some(path) = get_test_cog_path() else {
-        eprintln!("Skipping benchmark: no test COG found");
-        return;
-    };
+    let path = test_cog_path();
 
     let rt = Runtime::new().unwrap();
-    let reader = LocalRangeReader::new(&path).unwrap();
+    let reader = LocalRangeReader::new(path).unwrap();
     let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
 
     let mut group = c.benchmark_group("tile_sizes");
@@ -87,7 +126,7 @@ fn bench_tile_sizes(c: &mut Criterion) {
             &size,
             |b, &size| {
                 b.iter(|| {
-                    rt.block_on(extract_tile_with_extent(black_box(&cog), &extent, (size, size)))
+                    rt.block_on(TileExtractor::new(black_box(&cog)).bounds(extent).output_size(size, size).extract())
                 });
             },
         );
@@ -98,12 +137,9 @@ fn bench_tile_sizes(c: &mut Criterion) {
 
 /// Benchmark point queries
 fn bench_point_query(c: &mut Criterion) {
-    let Some(path) = get_test_cog_path() else {
-        eprintln!("Skipping benchmark: no test COG found");
-        return;
-    };
+    let path = test_cog_path();
 
-    let reader = LocalRangeReader::new(&path).unwrap();
+    let reader = LocalRangeReader::new(path).unwrap();
     let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
 
     let mut group = c.benchmark_group("point_query");
@@ -197,10 +233,7 @@ fn bench_bounding_box(c: &mut Criterion) {
 
 /// Benchmark COG file opening (metadata parsing)
 fn bench_cog_open(c: &mut Criterion) {
-    let Some(path) = get_test_cog_path() else {
-        eprintln!("Skipping benchmark: no test COG found");
-        return;
-    };
+    let path = test_cog_path();
 
     c.bench_function("cog_open", |b| {
         b.iter(|| {

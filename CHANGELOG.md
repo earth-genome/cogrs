@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- `cargo bench` now works: benchmarks ported to the `TileExtractor` API, the library
+  target sets `bench = false` so criterion flags are not passed to libtest, and the
+  benchmarks use a synthetic COG generated at startup (or a file given by the
+  `COGRS_BENCH_COG` environment variable) instead of a missing test file
+
 ## [0.0.4] - 2025-12-10
 
 ### Added
