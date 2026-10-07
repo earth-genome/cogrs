@@ -7,12 +7,9 @@
 //!
 //! All bands of a point come from a single tile fetch.
 
-use std::collections::HashMap;
-
 use futures::{StreamExt, TryStreamExt};
 
 use crate::cog_reader::{CogReader, TileRef};
-use crate::geometry::projection::project_point;
 use crate::point_query::PointQueryResult;
 use crate::tiff_utils::AnyResult;
 
@@ -32,32 +29,9 @@ impl CogReader {
         Ok(self.value_in_tile(&tile, tile_index, band, x, y))
     }
 
-    /// The sample for `(band, x, y)` within the decoded tile `tile_index`.
-    fn value_in_tile(&self, tile: &[f32], tile_index: usize, band: usize, x: usize, y: usize) -> Option<f32> {
-        let meta = &self.metadata;
-        let tile_col = tile_index % meta.tiles_across;
-        let tile_row = tile_index / meta.tiles_across;
-        let local_x = x - tile_col * meta.tile_width;
-        let local_y = y - tile_row * meta.tile_height;
-        tile.get((local_y * meta.tile_width + local_x) * meta.bands + band).copied()
-    }
-
-    /// Source pixel `(x, y)` for a coordinate in `crs`, or `None` outside the raster.
-    fn locate_pixel(&self, crs: i32, x: f64, y: f64) -> AnyResult<Option<(usize, usize)>> {
-        let source_crs = self.metadata.crs_code.unwrap_or(4326);
-        let (src_x, src_y) = if crs == source_crs { (x, y) } else { project_point(crs, source_crs, x, y)? };
-        let Some((px, py)) = self.metadata.geo_transform.world_to_pixel(src_x, src_y) else {
-            return Ok(None);
-        };
-        // Allow cast precision loss: bounds checking only needs approximate precision
-        #[allow(clippy::cast_precision_loss)]
-        if px < 0.0 || py < 0.0 || px >= self.metadata.width as f64 || py >= self.metadata.height as f64 {
-            return Ok(None);
-        }
-        // Cast is safe: already bounds-checked against width/height
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        Ok(Some((px as usize, py as usize)))
-    }
+    // The pixel lookup, per-band extraction and result construction are shared with the
+    // synchronous `PointQuery` implementation (`locate_pixel`, `point_result`, ... in
+    // `point_query.rs`); only the tile read is asynchronous here.
 
     /// Async counterpart of [`PointQuery::sample_crs`](crate::PointQuery::sample_crs): sample all
     /// bands at coordinates in `crs`.
@@ -65,35 +39,15 @@ impl CogReader {
     /// # Errors
     /// Returns an error if coordinate projection fails or if reading the tile fails.
     pub async fn sample_crs_async(&self, crs: i32, x: f64, y: f64) -> AnyResult<PointQueryResult> {
-        let source_crs = self.metadata.crs_code.unwrap_or(4326);
-        let invalid = || PointQueryResult {
-            values: HashMap::new(),
-            bands: self.metadata.bands,
-            is_valid: false,
-            pixel_coords: None,
-            input_crs: crs,
-            raster_crs: source_crs,
+        let Some(pixel) = self.locate_pixel(crs, x, y)? else {
+            return Ok(self.empty_point_result(crs));
         };
-        let Some((pixel_x, pixel_y)) = self.locate_pixel(crs, x, y)? else {
-            return Ok(invalid());
-        };
-        let Some(tile_index) = self.metadata.tile_index_for_pixel(pixel_x, pixel_y) else {
-            return Ok(invalid());
+        let Some(tile_index) = self.metadata.tile_index_for_pixel(pixel.0, pixel.1) else {
+            return Ok(self.empty_point_result(crs));
         };
 
         let (tile, _) = self.read_tile_async_ref(TileRef { overview: None, index: tile_index }).await?;
-        let values = (0..self.metadata.bands)
-            .map(|band| (band, self.value_in_tile(&tile, tile_index, band, pixel_x, pixel_y).unwrap_or(f32::NAN)))
-            .collect();
-
-        Ok(PointQueryResult {
-            values,
-            bands: self.metadata.bands,
-            is_valid: true,
-            pixel_coords: Some((pixel_x, pixel_y)),
-            input_crs: crs,
-            raster_crs: source_crs,
-        })
+        Ok(self.point_result(crs, pixel, &tile, tile_index))
     }
 
     /// Async counterpart of [`PointQuery::sample_lonlat`](crate::PointQuery::sample_lonlat).

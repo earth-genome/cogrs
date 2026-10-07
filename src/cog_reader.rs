@@ -948,16 +948,19 @@ impl CogReader {
             return Ok(None);
         };
 
-        let tile_data = self.read_tile(tile_index)?;
+        let (tile, _) = self.read_tile_sync(TileRef { overview: None, index: tile_index })?;
+        Ok(self.value_in_tile(&tile, tile_index, band, x, y))
+    }
 
-        // Calculate position within tile
-        let tile_col = tile_index % self.metadata.tiles_across;
-        let tile_row = tile_index / self.metadata.tiles_across;
-        let local_x = x - tile_col * self.metadata.tile_width;
-        let local_y = y - tile_row * self.metadata.tile_height;
-
-        let idx = (local_y * self.metadata.tile_width + local_x) * self.metadata.bands + band;
-        Ok(tile_data.get(idx).copied())
+    /// The sample for `(band, x, y)` within the decoded full-resolution tile `tile_index`
+    /// (shared by `sample` and the async point queries).
+    pub(crate) fn value_in_tile(&self, tile: &[f32], tile_index: usize, band: usize, x: usize, y: usize) -> Option<f32> {
+        let meta = &self.metadata;
+        let tile_col = tile_index % meta.tiles_across;
+        let tile_row = tile_index / meta.tiles_across;
+        let local_x = x - tile_col * meta.tile_width;
+        let local_y = y - tile_row * meta.tile_height;
+        tile.get((local_y * meta.tile_width + local_x) * meta.bands + band).copied()
     }
 
     /// Estimate min/max from sampling (when GDAL stats not available)

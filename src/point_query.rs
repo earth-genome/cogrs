@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use crate::cog_reader::CogReader;
+use crate::cog_reader::{CogReader, TileRef};
 use crate::geometry::projection::project_point;
 use crate::tiff_utils::AnyResult;
 
@@ -186,65 +186,16 @@ impl PointQuery for CogReader {
     }
 
     fn sample_crs(&self, crs: i32, x: f64, y: f64) -> AnyResult<PointQueryResult> {
-        let source_crs = self.metadata.crs_code.unwrap_or(4326);
-
-        // Transform to source CRS if needed
-        let (src_x, src_y) = if crs == source_crs {
-            (x, y)
-        } else {
-            project_point(crs, source_crs, x, y)?
+        let Some(pixel) = self.locate_pixel(crs, x, y)? else {
+            return Ok(self.empty_point_result(crs));
+        };
+        let Some(tile_index) = self.metadata.tile_index_for_pixel(pixel.0, pixel.1) else {
+            return Ok(self.empty_point_result(crs));
         };
 
-        // Convert world coordinates to pixel coordinates
-        let Some((px, py)) = self.metadata.geo_transform.world_to_pixel(src_x, src_y) else {
-            return Ok(PointQueryResult {
-                values: HashMap::new(),
-                bands: self.metadata.bands,
-                is_valid: false,
-                pixel_coords: None,
-                input_crs: crs,
-                raster_crs: source_crs,
-            });
-        };
-
-        // Bounds check
-        // Allow cast precision loss: bounds checking only needs approximate precision
-        #[allow(clippy::cast_precision_loss)]
-        if px < 0.0 || py < 0.0 ||
-           px >= self.metadata.width as f64 ||
-           py >= self.metadata.height as f64 {
-            return Ok(PointQueryResult {
-                values: HashMap::new(),
-                bands: self.metadata.bands,
-                is_valid: false,
-                pixel_coords: None,
-                input_crs: crs,
-                raster_crs: source_crs,
-            });
-        }
-
-        // Cast is safe: already bounds-checked against width/height
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let pixel_x = px as usize;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let pixel_y = py as usize;
-
-        // Sample all bands
-        let mut values = HashMap::with_capacity(self.metadata.bands);
-
-        for band in 0..self.metadata.bands {
-            let val = self.sample(band, pixel_x, pixel_y)?.unwrap_or(f32::NAN);
-            values.insert(band, val);
-        }
-
-        Ok(PointQueryResult {
-            values,
-            bands: self.metadata.bands,
-            is_valid: true,
-            pixel_coords: Some((pixel_x, pixel_y)),
-            input_crs: crs,
-            raster_crs: source_crs,
-        })
+        // One tile read serves every band
+        let (tile, _) = self.read_tile_sync(TileRef { overview: None, index: tile_index })?;
+        Ok(self.point_result(crs, pixel, &tile, tile_index))
     }
 
     fn sample_band_lonlat(&self, lon: f64, lat: f64, band: usize) -> AnyResult<Option<f32>> {
@@ -256,32 +207,10 @@ impl PointQuery for CogReader {
             return Ok(None);
         }
 
-        let source_crs = self.metadata.crs_code.unwrap_or(4326);
-
-        // Transform to source CRS if needed
-        let (src_x, src_y) = if crs == source_crs {
-            (x, y)
-        } else {
-            project_point(crs, source_crs, x, y)?
-        };
-
-        // Convert world coordinates to pixel coordinates
-        let Some((px, py)) = self.metadata.geo_transform.world_to_pixel(src_x, src_y) else {
-            return Ok(None);
-        };
-
-        // Bounds check
-        // Allow cast precision loss: bounds checking only needs approximate precision
-        #[allow(clippy::cast_precision_loss)]
-        if px < 0.0 || py < 0.0 ||
-           px >= self.metadata.width as f64 ||
-           py >= self.metadata.height as f64 {
-            return Ok(None);
+        match self.locate_pixel(crs, x, y)? {
+            Some((px, py)) => self.sample(band, px, py),
+            None => Ok(None),
         }
-
-        // Cast is safe: already bounds-checked against width/height
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        self.sample(band, px as usize, py as usize)
     }
 
     fn sample_points_lonlat(&self, points: &[(f64, f64)]) -> AnyResult<Vec<PointQueryResult>> {
@@ -296,6 +225,68 @@ impl PointQuery for CogReader {
         }
 
         Ok(results)
+    }
+}
+
+/// Pixel lookup shared by the synchronous [`PointQuery`] implementation and the `*_async`
+/// methods (`sample_*_async` in `point_query_async.rs`): only the tile read differs.
+impl CogReader {
+    /// Source pixel `(x, y)` containing the coordinate `(x, y)` given in `crs`, or `None` if it
+    /// lies outside the raster (or the raster has no usable geotransform).
+    pub(crate) fn locate_pixel(&self, crs: i32, x: f64, y: f64) -> AnyResult<Option<(usize, usize)>> {
+        let source_crs = self.metadata.crs_code.unwrap_or(4326);
+
+        // Transform to source CRS if needed
+        let (src_x, src_y) = if crs == source_crs {
+            (x, y)
+        } else {
+            project_point(crs, source_crs, x, y)?
+        };
+
+        // Convert world coordinates to pixel coordinates
+        let Some((px, py)) = self.metadata.geo_transform.world_to_pixel(src_x, src_y) else {
+            return Ok(None);
+        };
+
+        // Bounds check
+        // Allow cast precision loss: bounds checking only needs approximate precision
+        #[allow(clippy::cast_precision_loss)]
+        if px < 0.0 || py < 0.0 ||
+           px >= self.metadata.width as f64 ||
+           py >= self.metadata.height as f64 {
+            return Ok(None);
+        }
+
+        // Cast is safe: already bounds-checked against width/height
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Ok(Some((px as usize, py as usize)))
+    }
+
+    /// Result for a coordinate outside the raster.
+    pub(crate) fn empty_point_result(&self, crs: i32) -> PointQueryResult {
+        PointQueryResult {
+            values: HashMap::new(),
+            bands: self.metadata.bands,
+            is_valid: false,
+            pixel_coords: None,
+            input_crs: crs,
+            raster_crs: self.metadata.crs_code.unwrap_or(4326),
+        }
+    }
+
+    /// Result for `pixel`, with all bands read from its decoded tile.
+    pub(crate) fn point_result(&self, crs: i32, pixel: (usize, usize), tile: &[f32], tile_index: usize) -> PointQueryResult {
+        let values = (0..self.metadata.bands)
+            .map(|band| (band, self.value_in_tile(tile, tile_index, band, pixel.0, pixel.1).unwrap_or(f32::NAN)))
+            .collect();
+        PointQueryResult {
+            values,
+            bands: self.metadata.bands,
+            is_valid: true,
+            pixel_coords: Some(pixel),
+            input_crs: crs,
+            raster_crs: self.metadata.crs_code.unwrap_or(4326),
+        }
     }
 }
 
