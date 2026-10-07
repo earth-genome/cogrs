@@ -16,29 +16,35 @@ concurrency:
 jobs:
   clippy:
     runs-on: ubuntu-24.04
+    container: ghcr.io/osgeo/gdal:ubuntu-small-3.12.2
     steps:
+      - name: Install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config git curl ca-certificates
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: newer stable clippy adds lints (e.g. chunks_exact_to_as_chunks) that the
+      # codebase hasn't been migrated to yet.
+      - uses: dtolnay/rust-toolchain@1.93.1
         with:
           components: clippy
-      - name: Install GDAL build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgdal-dev libclang-dev pkg-config
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
+    container: ghcr.io/osgeo/gdal:ubuntu-small-3.12.2
     steps:
+      # The apt GDAL on ubuntu-24.04 is 3.8 and its Deflate output differs byte-for-byte from
+      # 3.12, which breaks the golden fixture layout hashes; use the official 3.12 image
+      # (ships headers, gdal_translate and python3 osgeo).
+      - name: Install build deps and fixture tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential libclang-dev pkg-config git curl ca-certificates unzip libtiff-tools python3-numpy
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install GDAL and fixture tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgdal-dev gdal-bin libclang-dev pkg-config \
-            curl unzip libtiff-tools python3 python3-numpy python3-gdal
       - uses: Swatinem/rust-cache@v2
       - name: Cache test fixtures
         uses: actions/cache@v4
@@ -58,14 +64,15 @@ jobs:
 
   doc:
     runs-on: ubuntu-24.04
+    container: ghcr.io/osgeo/gdal:ubuntu-small-3.12.2
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
+      - name: Install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config git curl ca-certificates
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install GDAL build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgdal-dev libclang-dev pkg-config
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
