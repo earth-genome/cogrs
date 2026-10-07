@@ -50,6 +50,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `RangeReader::reads_inline()` (default `false`): marks readers that never block (memory)
 - `S3ScanOptions::skip_signature` (default from `AWS_SKIP_SIGNATURE`), `concurrency` and
   `io`
+- `OverviewMetadata::scale_x` / `scale_y`: exact per-axis ratio of full-resolution size to
+  overview size (see Fixed). **Breaking:** `OverviewMetadata` has two new public fields, and its
+  integer `scale` is now `scale_x` rounded to the nearest integer (informational; it used to be
+  floored). Construct `OverviewMetadata` through the reader, not with a struct literal
 - S3 bucket region auto-detection: when no region is configured and no custom endpoint is
   set, the region is detected with an unauthenticated `HeadBucket` request and cached per
   bucket for the life of the process. Failure to detect falls back to `us-east-1` with a
@@ -125,6 +129,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the same tiles as before. Output changes only for tiles that were previously missing data
   (nodata/`NaN` becomes data) and, with bilinear/bicubic resampling, for pixels that used the
   nearest-sample fallback because a neighbouring tile had not been fetched
+- Overview pixel geometry used an integer scale (`full_width / overview_width`, floored), which
+  is wrong whenever an overview's size is rounded up: a /8 level of a 10980 px raster is 1373
+  px wide (ratio 7.997), so it was mapped with scale 7 and everything sampled from it was
+  placed up to 12.5% off (a low-zoom tile covering a whole scene lost a strip of its data and
+  misplaced the rest). Tile extraction and overview selection now use the exact per-axis ratios
+  `full_width / width` and `full_height / height` (new `OverviewMetadata::scale_x` /
+  `scale_y`), which is how GDAL derives an overview's geotransform. Output changes only for
+  overviews whose size is not an exact division of the full size (power-of-two overviews of
+  power-of-two-sized rasters are unchanged). Point queries read full resolution only and are
+  unaffected
 
 ## [0.0.4] - 2025-12-10
 
