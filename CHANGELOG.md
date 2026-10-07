@@ -102,6 +102,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Bilinear, bicubic and cubic interpolation of an upsampled output pixel (the fixed 2x2 / 4x4
+  footprint) no longer falls back to the nearest source sample when a tap is `NaN`, nodata or
+  unread. As in `gdalwarp` (`GWKBilinearResample4Sample`, `GWKCubicResample4Sample`): bilinear
+  drops the weights of the invalid taps and divides by the sum of the rest (nothing is written
+  where that sum is below 1e-5: the pixel stays nodata/fill); `Cubic` and `Bicubic` use the 4x4
+  window only when all 16 taps are valid and otherwise take that renormalised bilinear value
+  (GDAL does not renormalise cubic weights, which have negative lobes). A pixel whose own source
+  pixel is invalid in every selected band still keeps that sample. `Cubic` also takes the
+  bilinear value within two pixels of the raster edge, where GDAL's 4x4 window is unavailable
+  (`Bicubic` still replicates the edge pixel). Output is unchanged where all taps are valid.
+  Sentinel-2 TCI tile 14/4717/6229 against `gdalwarp` (256x256, 3 bands, nodata 0): bilinear
+  99.897% -> 99.999% identical samples (mean |diff| 0.0035 -> 0.00001, 54 pixels more than 1 off
+  -> 0), cubic 99.632% -> 99.999% (0.0149 -> 0.00001, 214 pixels -> 0). On a 3-band synthetic
+  raster with a nodata collar and per-band speckle, upsampled samples identical to `gdalwarp`
+  went from 93.6-94.8% (bilinear) and 79.1-82.1% (cubic) to 100%, and `Cubic` across the raster
+  edge from a maximum difference of 23.8 to below 0.0005
+- The fixed-footprint interpolation looks each source tap up once per output pixel instead of once
+  per band: a 256x256 RGB tile upsampled from the Natural Earth fixture takes 4.6 ms instead of
+  5.0 ms bilinear and 8.4 ms instead of 13.8 ms cubic/bicubic (release build, tiles cached)
 - **Breaking:** `TileData` has a new public field `nodata`; code constructing it with a
   struct literal must set it
 - Opening a COG reads the tile offset/byte-count arrays (and GeoTIFF/GDAL tag values) of all

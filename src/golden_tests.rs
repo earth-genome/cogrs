@@ -454,9 +454,10 @@ async fn golden_synthetic() {
     let case = "rgb_u8_partial_nodata";
     let r = open_memory(case, &rgb_u8_partial_nodata_spec(), OverviewQualityHint::ComputeAtRuntime);
     record_metadata(&mut g, case, &r);
-    let tiles = [(3, 2, 3), (4, 4, 6), (4, 5, 7), (5, 8, 12), (6, 17, 25)];
+    let tiles = [(3, 2, 3), (4, 4, 6), (4, 5, 7), (5, 8, 12), (6, 17, 25), (7, 35, 51), (7, 36, 51)];
     record_extracts(&mut g, case, &r, &tiles, &[2, 0]).await;
     record_shifted_extracts(&mut g, case, &r, 5, 8, 12).await;
+    record_shifted_extracts(&mut g, case, &r, 7, 35, 51).await;
 
     // --- f32, 4326 source, nodata, sparse tiles ----------------------------------------------
     let case = "f32_4326_nodata";

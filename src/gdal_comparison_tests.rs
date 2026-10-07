@@ -145,13 +145,15 @@ async fn nearest_matches_gdalwarp_on_a_pixel_is_point_raster() {
 #[tokio::test]
 async fn bilinear_matches_gdalwarp_on_a_pixel_is_area_raster() {
     let Some(c) = run("gray_3857 bilinear", GRAY, &gray_window(), ResamplingMethod::Bilinear, "bilinear").await else { return };
-    assert!(c.mean_abs_diff < 0.05, "mean |diff| {:.4}", c.mean_abs_diff);
+    // Measured: max |diff| below 0.0005 (85%, 85% and 57% bit-identical)
+    assert!(c.max_abs_diff < 0.01, "max |diff| {}", c.max_abs_diff);
 }
 
 #[tokio::test]
 async fn bilinear_matches_gdalwarp_on_a_pixel_is_point_raster() {
     let Some(c) = run("copernicus_dem bilinear", DEM, &dem_window(), ResamplingMethod::Bilinear, "bilinear").await else { return };
-    assert!(c.mean_abs_diff < 0.05, "mean |diff| {:.4}", c.mean_abs_diff);
+    // Measured: max |diff| below 0.0005 (85%, 85% and 57% bit-identical)
+    assert!(c.max_abs_diff < 0.01, "max |diff| {}", c.max_abs_diff);
 }
 
 #[tokio::test]
@@ -164,7 +166,8 @@ async fn nearest_matches_gdalwarp_on_a_textured_pixel_is_area_raster() {
 #[tokio::test]
 async fn bilinear_matches_gdalwarp_on_a_textured_pixel_is_area_raster() {
     let Some(c) = run("natural_earth bilinear", WORLD, &world_window(), ResamplingMethod::Bilinear, "bilinear").await else { return };
-    assert!(c.mean_abs_diff < 0.5, "mean |diff| {:.4}", c.mean_abs_diff);
+    // Measured: max |diff| below 0.0005 (85%, 85% and 57% bit-identical)
+    assert!(c.max_abs_diff < 0.01, "max |diff| {}", c.max_abs_diff);
 }
 
 /// Synthetic UTM 10N raster (30 m pixels, `size` pixels square) written to `dir` for `gdalwarp`.
@@ -501,6 +504,14 @@ fn partial_nodata_window(ratio: f64) -> BoundingBox {
     BoundingBox::new(minx, maxy - 256.0 * res, minx + 256.0 * res, maxy)
 }
 
+/// Output window of `ratio` source pixels per output pixel centred on the collar's edge.
+fn partial_nodata_edge_window(ratio: f64) -> BoundingBox {
+    let res = 10.0 * ratio;
+    // the collar edge is x + 0.3 y = 300 source pixels: (270, 100) is on it
+    let (cx, cy) = (1_000_000.0 + 2_700.0 + 0.37, 5_000_000.0 - 1_000.0 - 0.81);
+    BoundingBox::new(cx - 128.0 * res, cy - 128.0 * res, cx + 128.0 * res, cy + 128.0 * res)
+}
+
 /// Multi-band nodata, downsampling: gdalwarp reading a source's own nodata value leaves
 /// `UNIFIED_SRC_NODATA` unset, which `GDALWarpOperation::WarpRegionToBuffer` runs as `PARTIAL`
 /// (the unified mask is built, the per-band masks are kept). A pixel is then invalid at the
@@ -562,5 +573,58 @@ async fn band_selection_limits_the_nodata_centre_rule_like_gdalwarp_b() {
         let (identical, _, mean) = compare_bands(&tile.pixels, &gdal);
         println!("GDALCMP partial nodata bands {selected:?}: {identical:.3}% identical, mean|diff| {mean:.5}");
         assert!(identical > 99.9, "bands {selected:?}: {identical:.3}% identical");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Raster edge and nodata holes in the fixed footprint (upsampling)
+// ---------------------------------------------------------------------------------------------
+
+/// Window `ratio` source pixels per output pixel centred on the right edge of the textured raster.
+fn textured_edge_window(ratio: f64) -> BoundingBox {
+    let res = 10.0 * ratio;
+    let (edge, maxy) = (1_000_000.0 + 20_480.0, 5_000_000.0 - 3_000.81);
+    let minx = edge - 128.0 * res + 0.37;
+    BoundingBox::new(minx, maxy - 256.0 * res, minx + 256.0 * res, maxy)
+}
+
+/// Bilinear and cubic where the window runs over the raster's edge. `gdalwarp -r cubic` does not
+/// use the cubic kernel within two pixels of the raster edge: its 4x4 window is not available
+/// there and it interpolates bilinearly (`GWKCubicResample4Sample`). Measured: max |diff| below
+/// 0.0005 (only ~30% bit-identical for cubic: summation order); before, cubic was up to 23.8 off.
+#[tokio::test]
+async fn bilinear_and_cubic_match_gdalwarp_across_the_raster_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = textured_3857(dir.path());
+    for (method, alg) in [(ResamplingMethod::Bilinear, "bilinear"), (ResamplingMethod::Cubic, "cubic")] {
+        for ratio in [0.4, 0.7] {
+            let Some(c) = run(&format!("edge {alg} x{ratio}"), &path, &textured_edge_window(ratio), method, alg).await else { return };
+            assert_eq!(c.validity_mismatch, 0);
+            assert!(c.max_abs_diff < 0.01, "{alg} x{ratio}: max |diff| {}", c.max_abs_diff);
+        }
+    }
+}
+
+/// Upsampling (the fixed 2x2 / 4x4 footprint) a 3-band raster with a nodata collar and per-band
+/// nodata speckle: taps that are nodata in a band are left out of that band and the weights of
+/// the rest renormalised (bilinear), or the cubic window falls back to that bilinear (cubic).
+/// Measured against gdalwarp's default (per-band taps, unified centre): 100.000% identical and
+/// mean |diff| 0 at ratios 0.4, 0.7 and 1. Before, any invalid tap gave the nearest sample:
+/// 93.6 to 94.8% (bilinear) and 79.1 to 82.1% (cubic) identical, mean |diff| 1.8 to 3.0.
+#[tokio::test]
+async fn upsampling_a_partly_nodata_multiband_raster_matches_gdalwarp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = partial_nodata_raster(dir.path());
+    let reader = CogReader::open(&path).unwrap();
+    for (method, alg) in [(ResamplingMethod::Bilinear, "bilinear"), (ResamplingMethod::Cubic, "cubic")] {
+        for ratio in [0.4, 0.7, 1.0] {
+            let bounds = partial_nodata_edge_window(ratio);
+            let Some(gdal) = gdalwarp_bands(&path, &bounds, 256, alg, 3, &[]) else { return };
+            let tile = TileExtractor::new(&reader).bounds(bounds).size(256).resampling(method).extract().await.unwrap();
+            let (identical, big, mean) = compare_bands(&tile.pixels, &gdal);
+            println!("GDALCMP partial nodata upsampling {alg} x{ratio}: {identical:.3}% identical, {big:.3}% off by more than 1, mean|diff| {mean:.5}");
+            assert!(big < 0.01, "{alg} x{ratio}: {big:.3}% off by more than 1");
+            assert!(mean < 0.001, "{alg} x{ratio}: mean |diff| {mean}");
+        }
     }
 }
