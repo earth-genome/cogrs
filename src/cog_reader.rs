@@ -1417,44 +1417,96 @@ pub(crate) struct CogStructure {
 /// One IFD's entries (value bytes not yet fetched) and the offset of the next IFD.
 struct Ifd {
     tags: HashMap<u16, IfdEntry>,
-    next: u32,
+    next: u64,
+}
+
+/// What the first bytes of a TIFF file say about its layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TiffHeader {
+    little_endian: bool,
+    /// BigTIFF (version 43): 8-byte offsets, 20-byte IFD entries, 8-byte inline values
+    big: bool,
+    first_ifd: u64,
+}
+
+impl TiffHeader {
+    /// Bytes needed to decide: a BigTIFF header is 16 bytes, a classic one 8.
+    const MAX_LEN: usize = 16;
+
+    /// Size of an IFD's entry count: 2 bytes (classic) or 8 (BigTIFF).
+    fn count_len(self) -> usize {
+        if self.big { 8 } else { 2 }
+    }
+
+    /// Size of one IFD entry: 12 bytes (classic) or 20 (BigTIFF).
+    fn entry_len(self) -> usize {
+        if self.big { 20 } else { 12 }
+    }
+
+    /// Size of the next-IFD offset that ends an IFD: 4 bytes (classic) or 8 (BigTIFF).
+    fn offset_len(self) -> usize {
+        if self.big { 8 } else { 4 }
+    }
+
+    /// Tag values up to this many bytes live inside the IFD entry itself.
+    fn inline_capacity(self) -> usize {
+        self.offset_len()
+    }
+
+    fn parse(bytes: &[u8]) -> AnyResult<Self> {
+        if bytes.len() < 8 {
+            return Err("File is too small to be a TIFF".into());
+        }
+        let little_endian = match &bytes[0..2] {
+            b"II" => true,
+            b"MM" => false,
+            _ => return Err("Invalid TIFF signature".into()),
+        };
+        match read_u16(&bytes[2..4], little_endian) {
+            42 => Ok(Self { little_endian, big: false, first_ifd: u64::from(read_u32(&bytes[4..8], little_endian)) }),
+            43 => {
+                if bytes.len() < 16 {
+                    return Err("Truncated BigTIFF header".into());
+                }
+                let offset_size = read_u16(&bytes[4..6], little_endian);
+                let reserved = read_u16(&bytes[6..8], little_endian);
+                if offset_size != 8 || reserved != 0 {
+                    return Err(format!(
+                        "Invalid BigTIFF header (offset size {offset_size}, reserved {reserved}; expected 8 and 0)"
+                    )
+                    .into());
+                }
+                Ok(Self { little_endian, big: true, first_ifd: read_u64(&bytes[8..16], little_endian) })
+            }
+            version => Err(format!("Invalid TIFF version: {version}").into()),
+        }
+    }
 }
 
 /// Read the TIFF header, the full-resolution IFD and the overview IFD chain.
 ///
-/// IFD tables are read first; the (possibly large) tile offset/byte-count arrays and other tag
-/// values are then fetched concurrently, so a COG with many overviews costs one round trip
-/// for them rather than one per array.
+/// Both classic TIFF and BigTIFF are supported. IFD tables are read first; the (possibly large)
+/// tile offset/byte-count arrays and other tag values are then fetched concurrently, so a COG with
+/// many overviews costs one round trip for them rather than one per array.
 pub(crate) async fn parse_cog_structure(io: &dyn AsyncRangeReader) -> AnyResult<CogStructure> {
-    // Read header to get IFD offset and byte order
-    let header_bytes = io.read_range(0, 8).await?;
-
-    let little_endian = match &header_bytes[0..2] {
-        b"II" => true,
-        b"MM" => false,
-        _ => return Err("Invalid TIFF signature".into()),
-    };
-
-    let version = read_u16(&header_bytes[2..4], little_endian);
-    if version != 42 {
-        return Err(format!("Invalid TIFF version: {version}").into());
-    }
-
-    let ifd_offset = read_u32(&header_bytes[4..8], little_endian);
+    // Read header to get IFD offset, byte order and TIFF flavour (served from the prefix)
     let file_size = io.size();
+    let head_len = usize::try_from(file_size.min(TiffHeader::MAX_LEN as u64)).unwrap_or(TiffHeader::MAX_LEN);
+    let header = TiffHeader::parse(&io.read_range(0, head_len).await?)?;
+    let little_endian = header.little_endian;
 
-    let first = read_ifd(io, u64::from(ifd_offset), file_size, little_endian).await?;
+    let first = read_ifd(io, header.first_ifd, file_size, header).await?;
 
     // Overview IFDs (subsequent IFDs in the chain)
     let walk_chain = async {
         let mut headers: Vec<(OverviewHeader, HashMap<u16, IfdEntry>)> = Vec::new();
         let mut next = first.next;
         while next != 0 {
-            let ifd = read_ifd(io, u64::from(next), file_size, little_endian).await?;
-            let Ok(header) = parse_overview_header(&ifd.tags, little_endian) else {
+            let ifd = read_ifd(io, next, file_size, header).await?;
+            let Ok(overview) = parse_overview_header(&ifd.tags, little_endian) else {
                 break;
             };
-            headers.push((header, ifd.tags));
+            headers.push((overview, ifd.tags));
             next = ifd.next;
 
             // Safety limit - COGs typically have at most 10 overviews
@@ -1504,53 +1556,79 @@ pub(crate) async fn parse_cog_structure(io: &dyn AsyncRangeReader) -> AnyResult<
     Ok(CogStructure { metadata, overviews })
 }
 
+/// IFD bytes read in the first request for an IFD; larger IFDs get a second, exact read.
+const IFD_FIRST_READ: u64 = 4096;
+
+/// Upper bound on plausible IFD entry counts (a classic IFD cannot hold more).
+const MAX_IFD_ENTRIES: u64 = 65_535;
+
 /// Read one IFD table (entries and next-IFD offset) at `offset`.
-async fn read_ifd(io: &dyn AsyncRangeReader, offset: u64, file_size: u64, little_endian: bool) -> AnyResult<Ifd> {
-    // Read IFD entries - estimate size based on typical COG (usually < 4KB)
-    // Clamp to available bytes if IFD is near end of file
-    // Safe cast: clamped to 4096, well within usize range on all platforms
-    #[allow(clippy::cast_possible_truncation)]
-    let size = file_size.saturating_sub(offset).min(4096) as usize;
-    if size < 2 {
+async fn read_ifd(io: &dyn AsyncRangeReader, offset: u64, file_size: u64, header: TiffHeader) -> AnyResult<Ifd> {
+    let little_endian = header.little_endian;
+    let (count_len, entry_len, offset_len) = (header.count_len(), header.entry_len(), header.offset_len());
+    let available = file_size.saturating_sub(offset);
+    if available < count_len as u64 {
         return Err(format!("IFD offset {offset} lies outside the file ({file_size} bytes)").into());
     }
-    let ifd_bytes = io.read_range(offset, size).await?;
-    let entry_count = read_u16(&ifd_bytes[0..2], little_endian) as usize;
+    // Most COG IFDs fit in the first read; clamp to the bytes the file has
+    // (the cast is safe: bounded by IFD_FIRST_READ)
+    #[allow(clippy::cast_possible_truncation)]
+    let mut ifd_bytes = io.read_range(offset, available.min(IFD_FIRST_READ) as usize).await?;
+    let entry_count = if header.big {
+        read_u64(&ifd_bytes[0..8], little_endian)
+    } else {
+        u64::from(read_u16(&ifd_bytes[0..2], little_endian))
+    };
+    if entry_count > MAX_IFD_ENTRIES {
+        return Err(format!("Implausible IFD entry count {entry_count} at offset {offset}").into());
+    }
+    // Safe: bounded by MAX_IFD_ENTRIES
+    #[allow(clippy::cast_possible_truncation)]
+    let entry_count = entry_count as usize;
+
+    // A table longer than the first read (BigTIFF entries are 20 bytes) is read again in full.
+    let table_len = count_len + entry_count * entry_len + offset_len;
+    if table_len > ifd_bytes.len() && (ifd_bytes.len() as u64) < available {
+        let want = (table_len as u64).min(available);
+        // Safe: bounded by the table length
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            ifd_bytes = io.read_range(offset, want as usize).await?;
+        }
+    }
 
     // Parse all IFD entries into a map
     let mut tags: HashMap<u16, IfdEntry> = HashMap::new();
-
     for i in 0..entry_count {
-        let entry_offset = 2 + i * 12;
-        if entry_offset + 12 > ifd_bytes.len() {
+        let at = count_len + i * entry_len;
+        if at + entry_len > ifd_bytes.len() {
             break;
         }
-
-        let tag = read_u16(&ifd_bytes[entry_offset..entry_offset + 2], little_endian);
-        let field_type = read_u16(&ifd_bytes[entry_offset + 2..entry_offset + 4], little_endian);
-        let count = read_u32(&ifd_bytes[entry_offset + 4..entry_offset + 8], little_endian);
-        let value_offset = read_u32(&ifd_bytes[entry_offset + 8..entry_offset + 12], little_endian);
-
+        let entry = &ifd_bytes[at..at + entry_len];
+        let tag = read_u16(&entry[0..2], little_endian);
+        let field_type = read_u16(&entry[2..4], little_endian);
+        let mut raw_bytes = [0u8; 8];
+        let (count, value_offset) = if header.big {
+            raw_bytes.copy_from_slice(&entry[12..20]);
+            (read_u64(&entry[4..12], little_endian), read_u64(&raw_bytes, little_endian))
+        } else {
+            raw_bytes[..4].copy_from_slice(&entry[8..12]);
+            (u64::from(read_u32(&entry[4..8], little_endian)), u64::from(read_u32(&raw_bytes, little_endian)))
+        };
         tags.insert(
             tag,
-            IfdEntry {
-                field_type,
-                count,
-                value_offset,
-                raw_bytes: [
-                    ifd_bytes[entry_offset + 8],
-                    ifd_bytes[entry_offset + 9],
-                    ifd_bytes[entry_offset + 10],
-                    ifd_bytes[entry_offset + 11],
-                ],
-            },
+            IfdEntry { field_type, count, value_offset, raw_bytes, inline_capacity: header.inline_capacity() },
         );
     }
 
     // The next IFD offset is right after all entries
-    let next_ifd_pos = 2 + entry_count * 12;
-    let next = if next_ifd_pos + 4 <= ifd_bytes.len() {
-        read_u32(&ifd_bytes[next_ifd_pos..next_ifd_pos + 4], little_endian)
+    let next_pos = count_len + entry_count * entry_len;
+    let next = if next_pos + offset_len <= ifd_bytes.len() {
+        if header.big {
+            read_u64(&ifd_bytes[next_pos..next_pos + 8], little_endian)
+        } else {
+            u64::from(read_u32(&ifd_bytes[next_pos..next_pos + 4], little_endian))
+        }
     } else {
         0
     };
@@ -1748,39 +1826,53 @@ async fn read_overview_arrays(
 
 struct IfdEntry {
     field_type: u16,
-    count: u32,
-    value_offset: u32,
-    raw_bytes: [u8; 4],
+    /// Number of values (u32 in a classic TIFF, u64 in BigTIFF)
+    count: u64,
+    /// Where the values are, when they do not fit in the entry
+    value_offset: u64,
+    /// The entry's value/offset field as stored (4 bytes used in a classic TIFF, 8 in BigTIFF)
+    raw_bytes: [u8; 8],
+    /// Values up to this many bytes are stored in `raw_bytes`: 4 (classic) or 8 (BigTIFF)
+    inline_capacity: usize,
 }
 
-fn get_tag_value(tags: &HashMap<u16, IfdEntry>, tag: u16, little_endian: bool) -> Option<u32> {
-    let entry = tags.get(&tag)?;
-    let type_size = match entry.field_type {
-        1 => 1, // BYTE
-        3 => 2, // SHORT
-        4 => 4, // LONG
-        _ => return None,
-    };
-
-    if entry.count == 1 && type_size <= 4 {
-        // Value is inline
-        match entry.field_type {
-            1 => Some(u32::from(entry.raw_bytes[0])),
-            3 => Some(u32::from(read_u16(&entry.raw_bytes, little_endian))),
-            4 => Some(read_u32(&entry.raw_bytes, little_endian)),
-            _ => None,
-        }
-    } else {
-        None // Would need to read from offset
+impl IfdEntry {
+    /// Total size of the values if each is `type_size` bytes (saturating: `count` comes from
+    /// the file, and an absurd one is rejected when the bytes are read).
+    fn byte_len(&self, type_size: usize) -> usize {
+        usize::try_from(self.count).unwrap_or(usize::MAX).saturating_mul(type_size)
     }
 }
 
-/// Bytes of a tag value: inline in the IFD entry when it fits in 4 bytes, else fetched.
+/// A single-value integer tag (BYTE, SHORT, LONG, or BigTIFF's LONG8), if it fits in `u32`.
+fn get_tag_value(tags: &HashMap<u16, IfdEntry>, tag: u16, little_endian: bool) -> Option<u32> {
+    let entry = tags.get(&tag)?;
+    if entry.count != 1 {
+        return None; // Would need to read from offset
+    }
+    match entry.field_type {
+        1 => Some(u32::from(entry.raw_bytes[0])),
+        3 => Some(u32::from(read_u16(&entry.raw_bytes, little_endian))),
+        4 => Some(read_u32(&entry.raw_bytes, little_endian)),
+        // LONG8 only exists in BigTIFF, where 8 bytes are stored inline
+        16 if entry.inline_capacity >= 8 => u32::try_from(read_u64(&entry.raw_bytes, little_endian)).ok(),
+        _ => None,
+    }
+}
+
+/// Bytes of a tag value: inline in the IFD entry when it fits there, else fetched.
 async fn tag_value_bytes(entry: &IfdEntry, total_bytes: usize, io: &dyn AsyncRangeReader) -> AnyResult<Bytes> {
-    if total_bytes <= 4 {
+    if total_bytes <= entry.inline_capacity {
         Ok(Bytes::copy_from_slice(&entry.raw_bytes[..total_bytes]))
+    } else if entry.value_offset.saturating_add(total_bytes as u64) > io.size() {
+        Err(format!(
+            "Tag value of {total_bytes} bytes at offset {} lies outside the file ({} bytes)",
+            entry.value_offset,
+            io.size()
+        )
+        .into())
     } else {
-        io.read_range(u64::from(entry.value_offset), total_bytes).await
+        io.read_range(entry.value_offset, total_bytes).await
     }
 }
 
@@ -1800,11 +1892,12 @@ async fn read_tag_array_u64(
         _ => return Err(format!("Unsupported type {} for tag {}", entry.field_type, tag).into()),
     };
 
-    let total_bytes = entry.count as usize * type_size;
+    let total_bytes = entry.byte_len(type_size);
     let raw_bytes = tag_value_bytes(entry, total_bytes, io).await?;
 
-    let mut values = Vec::with_capacity(entry.count as usize);
-    for i in 0..entry.count as usize {
+    let count = raw_bytes.len() / type_size;
+    let mut values = Vec::with_capacity(count);
+    for i in 0..count {
         let offset = i * type_size;
         let value = match entry.field_type {
             3 => u64::from(read_u16(&raw_bytes[offset..], little_endian)),
@@ -1839,15 +1932,15 @@ async fn read_tag_f64_array(
         return Ok(None);
     }
 
-    if (entry.count as usize) < min_count {
+    if entry.count < min_count as u64 {
         return Ok(None);
     }
 
-    let total_bytes = entry.count as usize * 8;
-    let raw_bytes = io.read_range(u64::from(entry.value_offset), total_bytes).await?;
+    let raw_bytes = tag_value_bytes(entry, entry.byte_len(8), io).await?;
 
-    let mut values = Vec::with_capacity(entry.count as usize);
-    for i in 0..entry.count as usize {
+    let count = raw_bytes.len() / 8;
+    let mut values = Vec::with_capacity(count);
+    for i in 0..count {
         let offset = i * 8;
         values.push(read_f64(&raw_bytes[offset..], little_endian));
     }
@@ -1938,7 +2031,7 @@ async fn read_geokey_directory(
         return Ok(None);
     }
 
-    let total_bytes = entry.count as usize * 2;
+    let total_bytes = entry.byte_len(2);
     Ok(Some(tag_value_bytes(entry, total_bytes, io).await?))
 }
 
@@ -1953,7 +2046,7 @@ async fn read_gdal_metadata_info(
     };
 
     // GDAL metadata is ASCII/UTF-8 XML
-    let raw_bytes = tag_value_bytes(entry, entry.count as usize, io).await?;
+    let raw_bytes = tag_value_bytes(entry, entry.byte_len(1), io).await?;
 
     let metadata_str = String::from_utf8_lossy(&raw_bytes);
 
@@ -1991,7 +2084,7 @@ async fn read_gdal_nodata(
         return Ok(None);
     };
 
-    let raw_bytes = tag_value_bytes(entry, entry.count as usize, io).await?;
+    let raw_bytes = tag_value_bytes(entry, entry.byte_len(1), io).await?;
 
     let nodata_str = String::from_utf8_lossy(&raw_bytes);
     let nodata_str = nodata_str.trim_end_matches('\0').trim();
@@ -3955,5 +4048,181 @@ mod async_open_tests {
 
         assert_ne!(first.cache_id(), second.cache_id());
         assert!((after[0] - before[0] - 1000.0).abs() < 1e-3, "{} then {}", before[0], after[0]);
+    }
+}
+
+/// Parsing of the TIFF header and IFD tables, classic and BigTIFF, on hand-built bytes.
+#[cfg(test)]
+mod tiff_layout_tests {
+    use super::*;
+    use crate::range_reader::MemoryRangeReader;
+
+    const LE: bool = true;
+
+    fn io(bytes: Vec<u8>) -> SyncToAsync {
+        SyncToAsync::inline(Arc::new(MemoryRangeReader::new(bytes, "mem://layout".to_string())))
+    }
+
+    fn header_bytes(le: bool, version: u16, rest: &[u8]) -> Vec<u8> {
+        let mut b = if le { b"II".to_vec() } else { b"MM".to_vec() };
+        b.extend_from_slice(&if le { version.to_le_bytes() } else { version.to_be_bytes() });
+        b.extend_from_slice(rest);
+        b
+    }
+
+    fn bigtiff_header(le: bool, first_ifd: u64) -> Vec<u8> {
+        let (eight, zero) = if le { (8u16.to_le_bytes(), 0u16.to_le_bytes()) } else { (8u16.to_be_bytes(), 0u16.to_be_bytes()) };
+        let offset = if le { first_ifd.to_le_bytes() } else { first_ifd.to_be_bytes() };
+        header_bytes(le, 43, &[&eight[..], &zero[..], &offset[..]].concat())
+    }
+
+    #[test]
+    fn header_parsing_covers_both_flavours_and_both_byte_orders() {
+        let classic_le = TiffHeader::parse(&header_bytes(true, 42, &1234u32.to_le_bytes())).unwrap();
+        assert_eq!(classic_le, TiffHeader { little_endian: true, big: false, first_ifd: 1234 });
+        let classic_be = TiffHeader::parse(&header_bytes(false, 42, &1234u32.to_be_bytes())).unwrap();
+        assert_eq!(classic_be, TiffHeader { little_endian: false, big: false, first_ifd: 1234 });
+
+        // An offset beyond 4 GiB only fits BigTIFF
+        let big_le = TiffHeader::parse(&bigtiff_header(true, 5_000_000_000)).unwrap();
+        assert_eq!(big_le, TiffHeader { little_endian: true, big: true, first_ifd: 5_000_000_000 });
+        let big_be = TiffHeader::parse(&bigtiff_header(false, 5_000_000_000)).unwrap();
+        assert_eq!(big_be, TiffHeader { little_endian: false, big: true, first_ifd: 5_000_000_000 });
+        assert_eq!((big_le.count_len(), big_le.entry_len(), big_le.offset_len(), big_le.inline_capacity()), (8, 20, 8, 8));
+        assert_eq!((classic_le.count_len(), classic_le.entry_len(), classic_le.offset_len(), classic_le.inline_capacity()), (2, 12, 4, 4));
+    }
+
+    #[test]
+    fn malformed_headers_are_rejected_with_a_reason() {
+        let err = |bytes: &[u8]| TiffHeader::parse(bytes).unwrap_err().to_string();
+        assert!(err(b"XX*\0\x08\0\0\0").contains("signature"));
+        assert!(err(&header_bytes(true, 41, &[0; 4])).contains("version: 41"));
+        assert!(err(b"II+\0").contains("too small"));
+        // BigTIFF: truncated, wrong offset size, non-zero reserved
+        assert!(err(&bigtiff_header(true, 16)[..12]).contains("Truncated BigTIFF"));
+        let mut bad_size = bigtiff_header(true, 16);
+        bad_size[4] = 4;
+        assert!(err(&bad_size).contains("offset size 4"));
+        let mut bad_reserved = bigtiff_header(true, 16);
+        bad_reserved[6] = 1;
+        assert!(err(&bad_reserved).contains("reserved 1"));
+    }
+
+    /// Hand-built BigTIFF IFD: (tag, type, count, 8-byte value field).
+    fn big_ifd(entries: &[(u16, u16, u64, [u8; 8])], next: u64) -> Vec<u8> {
+        let mut b = (entries.len() as u64).to_le_bytes().to_vec();
+        for (tag, ftype, count, value) in entries {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ftype.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(value);
+        }
+        b.extend_from_slice(&next.to_le_bytes());
+        b
+    }
+
+    fn classic_ifd(entries: &[(u16, u16, u32, [u8; 4])], next: u32) -> Vec<u8> {
+        let mut b = (entries.len() as u16).to_le_bytes().to_vec();
+        for (tag, ftype, count, value) in entries {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ftype.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(value);
+        }
+        b.extend_from_slice(&next.to_le_bytes());
+        b
+    }
+
+    fn short_field(v: u16) -> [u8; 8] {
+        let mut f = [0u8; 8];
+        f[..2].copy_from_slice(&v.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn an_ifd_longer_than_the_first_read_is_read_in_full() {
+        // 300 BigTIFF entries are 6008 bytes, 400 classic ones 4806: both exceed the 4096-byte first read.
+        let entries: Vec<_> = (0..300u16).map(|i| (1000 + i, 3u16, 1u64, short_field(i))).collect();
+        let mut file = bigtiff_header(true, 16);
+        file.extend_from_slice(&big_ifd(&entries, 0xABCD));
+        let size = file.len() as u64;
+        let header = TiffHeader { little_endian: LE, big: true, first_ifd: 16 };
+        let ifd = futures::executor::block_on(read_ifd(&io(file), 16, size, header)).unwrap();
+        assert_eq!(ifd.tags.len(), 300);
+        assert_eq!(ifd.next, 0xABCD);
+        assert_eq!(get_tag_value(&ifd.tags, 1299, LE), Some(299));
+
+        let entries: Vec<_> = (0..400u16).map(|i| (1000 + i, 3u16, 1u32, [i as u8, (i >> 8) as u8, 0, 0])).collect();
+        let mut file = header_bytes(true, 42, &8u32.to_le_bytes());
+        file.extend_from_slice(&classic_ifd(&entries, 0x77));
+        let size = file.len() as u64;
+        let header = TiffHeader { little_endian: LE, big: false, first_ifd: 8 };
+        let ifd = futures::executor::block_on(read_ifd(&io(file), 8, size, header)).unwrap();
+        assert_eq!(ifd.tags.len(), 400);
+        assert_eq!(ifd.next, 0x77);
+        assert_eq!(get_tag_value(&ifd.tags, 1399, LE), Some(399));
+    }
+
+    #[test]
+    fn bigtiff_entries_decode_wide_counts_inline_values_and_long8() {
+        let mut long8_inline = [0u8; 8];
+        long8_inline.copy_from_slice(&123_456u64.to_le_bytes());
+        let mut long8_wide = [0u8; 8];
+        long8_wide.copy_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes());
+        let mut inline_shorts = [0u8; 8];
+        inline_shorts[..6].copy_from_slice(&[8, 0, 8, 0, 8, 0]); // BitsPerSample 8,8,8 stored inline
+        let entries = [
+            (256u16, 16u16, 1u64, long8_inline),
+            (257, 16, 1, long8_wide),
+            (258, 3, 3, inline_shorts),
+            (324, 16, 5_000_000_000, [0; 8]), // an absurd count, value offset 0
+        ];
+        let mut file = bigtiff_header(true, 16);
+        file.extend_from_slice(&big_ifd(&entries, 0));
+        let size = file.len() as u64;
+        let header = TiffHeader { little_endian: LE, big: true, first_ifd: 16 };
+        let reader = io(file);
+        let ifd = futures::executor::block_on(read_ifd(&reader, 16, size, header)).unwrap();
+
+        assert_eq!(get_tag_value(&ifd.tags, 256, LE), Some(123_456), "LONG8 stored inline");
+        assert_eq!(get_tag_value(&ifd.tags, 257, LE), None, "a LONG8 beyond u32 does not fit");
+        assert_eq!(ifd.tags[&324].count, 5_000_000_000, "counts are 64-bit");
+        let bits = futures::executor::block_on(tag_value_bytes(&ifd.tags[&258], 6, &reader)).unwrap();
+        assert_eq!(&bits[..], &[8, 0, 8, 0, 8, 0], "6 bytes fit inline in BigTIFF");
+
+        // Reading the values of the absurd entry fails cleanly instead of allocating
+        let err = futures::executor::block_on(read_tag_array_u64(&ifd.tags, 324, &reader, LE, 4)).unwrap_err();
+        assert!(err.to_string().contains("outside the file"), "{err}");
+    }
+
+    #[test]
+    fn implausible_entry_counts_and_offsets_are_errors() {
+        let mut file = bigtiff_header(true, 16);
+        file.extend_from_slice(&u64::MAX.to_le_bytes());
+        file.extend_from_slice(&[0; 32]);
+        let size = file.len() as u64;
+        let header = TiffHeader { little_endian: LE, big: true, first_ifd: 16 };
+        let err = futures::executor::block_on(read_ifd(&io(file.clone()), 16, size, header)).err().unwrap();
+        assert!(err.to_string().contains("Implausible IFD entry count"), "{err}");
+
+        let err = futures::executor::block_on(read_ifd(&io(file), 1 << 40, size, header)).err().unwrap();
+        assert!(err.to_string().contains("outside the file"), "{err}");
+    }
+
+    #[test]
+    fn classic_inline_limit_is_still_four_bytes() {
+        // Three 16-bit values (6 bytes) are out of line in a classic TIFF
+        let entries = [(258u16, 3u16, 3u32, 100u32.to_le_bytes())];
+        let mut file = header_bytes(true, 42, &8u32.to_le_bytes());
+        file.extend_from_slice(&classic_ifd(&entries, 0));
+        file.resize(100, 0);
+        file.extend_from_slice(&[8, 0, 8, 0, 8, 0]);
+        let size = file.len() as u64;
+        let header = TiffHeader { little_endian: LE, big: false, first_ifd: 8 };
+        let reader = io(file);
+        let ifd = futures::executor::block_on(read_ifd(&reader, 8, size, header)).unwrap();
+        let bits = futures::executor::block_on(tag_value_bytes(&ifd.tags[&258], 6, &reader)).unwrap();
+        assert_eq!(&bits[..], &[8, 0, 8, 0, 8, 0]);
+        assert_eq!(ifd.tags[&258].inline_capacity, 4);
     }
 }

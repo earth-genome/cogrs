@@ -57,8 +57,15 @@ pub fn read_tiff_header(file: &mut File) -> AnyResult<TiffHeader> {
         u16::from_be_bytes([header_bytes[2], header_bytes[3]])
     };
 
+    if version == 43 {
+        // This synchronous parser (used by the chunked and LZW local readers) reads 4-byte
+        // offsets and 12-byte entries throughout; `CogReader` handles BigTIFF.
+        return Err("BigTIFF (TIFF version 43) is not supported by the chunked and LZW file \
+                    readers; open the file with CogReader"
+            .into());
+    }
     if version != 42 {
-        return Err("Invalid TIFF version".into());
+        return Err(format!("Invalid TIFF version: {version}").into());
     }
 
     let first_ifd_offset = if little_endian {
