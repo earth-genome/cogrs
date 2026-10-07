@@ -153,6 +153,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the first are now conditional, and an open that fails the check is retried once
 - A failed S3 region probe (`AWS_REGION` unset) was repeated, up to 5 s, on every open; failures
   are now remembered for 60 s
+- Bilinear and bicubic extraction fetch every source tile their interpolation taps read (the
+  2×2 / 4×4 neighbourhood around each sample point), not only the tile of the nearest source
+  pixel. Previously taps in an adjacent, unfetched tile were treated as missing and the pixel
+  fell back to nearest, leaving faint seams along source-tile boundaries. Nearest planning is
+  unchanged
 - Rendered tiles were shifted by half a source pixel for `PixelIsArea` rasters (the common
   case): the renderer read the tiepoint-based coordinate as if integer values were pixel
   centres (that is the `PixelIsPoint` convention), so nearest took the pixel half a pixel to
