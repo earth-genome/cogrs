@@ -22,10 +22,9 @@
 //!
 //! # Async runtimes
 //!
-//! [`S3RangeReaderAsync`] is fully async. [`S3RangeReaderSync`] (used by `CogReader::open`)
-//! blocks the calling thread and so must not be used on an async worker thread. If it is,
-//! tokio's panic is converted to an error on a best-effort basis (unwinding panics only;
-//! `panic = "abort"` aborts). Open COGs from async code with `CogReader::open_async`.
+//! [`S3RangeReaderAsync`] is fully async (it implements [`AsyncRangeReader`]).
+//! [`S3RangeReaderSync`] (used by `CogReader::open`) blocks the calling thread while the request
+//! runs on a private I/O runtime; from async code open COGs with `CogReader::open_async`.
 //!
 //! # Example
 //!
@@ -46,8 +45,8 @@
 //! }
 //! ```
 
-use crate::async_io::{AsyncRangeReader, IoOptions};
-use crate::range_reader::{blocking_call, RangeReader};
+use crate::async_io::{block_on_io, AsyncRangeReader, AsyncToSync, IoOptions};
+use crate::range_reader::RangeReader;
 use crate::remote::ObjectStoreRangeReader;
 use crate::tiff_utils::AnyResult;
 use bytes::Bytes;
@@ -56,9 +55,8 @@ use object_store::aws::resolve_bucket_region;
 use object_store::ClientOptions;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
-use tokio::runtime::Handle;
 
 /// Process-wide cache of detected bucket regions.
 static BUCKET_REGIONS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
@@ -321,57 +319,39 @@ impl AsyncRangeReader for S3RangeReaderAsync {
     }
 }
 
-/// Synchronous wrapper for `S3RangeReaderAsync` that implements `RangeReader` trait
+/// Synchronous wrapper for `S3RangeReaderAsync` that implements the `RangeReader` trait
 ///
-/// Reads block the calling thread on the captured runtime handle, so they must run on a
-/// plain thread or a `spawn_blocking` thread, never on an async worker thread (best-effort
-/// conversion to an error with unwinding panics only; `panic = "abort"` aborts). From async
-/// code prefer `CogReader::open_async`.
+/// Reads block the calling thread while the request runs on a private I/O runtime (see
+/// [`AsyncToSync`]), so no ambient tokio runtime is needed. That is safe from plain threads and
+/// `spawn_blocking` threads; on an async worker thread it blocks that worker, so from async
+/// code use `CogReader::open_async`.
 pub struct S3RangeReaderSync {
-    inner: S3RangeReaderAsync,
-    runtime: Handle,
+    inner: AsyncToSync,
 }
 
 impl S3RangeReaderSync {
     /// Create a new sync S3 range reader
     ///
-    /// Must be called from within a tokio runtime context, on a thread that is allowed to
-    /// block (e.g. inside `tokio::task::spawn_blocking`). From an async worker thread tokio's
-    /// panic is converted to an error only on a best-effort basis (unwinding panics; with
-    /// `panic = "abort"` the process aborts). Use [`S3RangeReaderAsync::new`] or
-    /// `CogReader::open_async` there.
-    ///
     /// # Errors
-    /// Returns an error if not called from within a tokio runtime, if the S3 object cannot
-    /// be accessed, or (best effort) if called on an async worker thread.
+    /// Returns an error if the URL is invalid or the S3 object cannot be accessed.
     pub fn new(url: &str) -> AnyResult<Self> {
-        let runtime = Handle::try_current()
-            .map_err(|_| "S3RangeReaderSync must be created within a tokio runtime")?;
-
-        let inner = blocking_call("S3RangeReaderSync::new", || {
-            runtime.block_on(S3RangeReaderAsync::new(url))
-        })?;
-
-        Ok(Self { inner, runtime })
+        let url = url.to_string();
+        let inner = block_on_io(async move { S3RangeReaderAsync::new(&url).await })??;
+        Self::from_async(inner)
     }
 
     /// Create from an existing async reader
     ///
     /// # Errors
-    /// Returns an error if not called from within a tokio runtime.
+    /// Never fails; the `Result` is kept for API compatibility.
     pub fn from_async(inner: S3RangeReaderAsync) -> AnyResult<Self> {
-        let runtime = Handle::try_current()
-            .map_err(|_| "S3RangeReaderSync must be created within a tokio runtime")?;
-
-        Ok(Self { inner, runtime })
+        Ok(Self { inner: AsyncToSync::new(Arc::new(inner)) })
     }
 }
 
 impl RangeReader for S3RangeReaderSync {
     fn read_range(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
-        blocking_call("S3RangeReaderSync::read_range", || {
-            self.runtime.block_on(self.inner.read_range_async(offset, length))
-        })
+        self.inner.read_range(offset, length)
     }
 
     fn size(&self) -> u64 {
@@ -379,7 +359,7 @@ impl RangeReader for S3RangeReaderSync {
     }
 
     fn identifier(&self) -> &str {
-        self.inner.url()
+        self.inner.identifier()
     }
 
     fn is_local(&self) -> bool {

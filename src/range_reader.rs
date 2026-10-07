@@ -2,14 +2,17 @@
 //!
 //! # Sync readers and async runtimes
 //!
-//! The readers here implement the synchronous [`RangeReader`] trait. Remote readers
-//! (S3, HTTP) block the calling thread, which tokio forbids on its async worker threads.
-//! With unwinding panics (the default) such a call is converted into a descriptive error
-//! (tokio still prints its panic message through the panic hook). With `panic = "abort"`
-//! the process aborts, and in release builds reqwest's blocking HTTP client does not detect
-//! the situation at all and may silently block the worker thread. Always use
-//! [`CogReader::open_async`](crate::CogReader::open_async) and
-//! [`CogReader::spawn_blocking`](crate::CogReader::spawn_blocking) from async code.
+//! [`RangeReader`] is the *synchronous* interface: each read blocks the calling thread. It is
+//! what plain-thread users and custom readers implement, and what [`LocalRangeReader`] and
+//! [`MemoryRangeReader`] provide. Remote sources are natively asynchronous
+//! ([`AsyncRangeReader`](crate::AsyncRangeReader), see [`crate::remote`]); the sync remote
+//! readers here ([`HttpRangeReader`], [`S3RangeReaderSync`](crate::S3RangeReaderSync)) wrap
+//! them with [`AsyncToSync`], which runs the request on a private runtime and blocks the
+//! calling thread. That is safe from plain threads and `spawn_blocking` threads and never
+//! panics or deadlocks inside a runtime, but on an async worker thread it blocks that worker:
+//! from async code use [`CogReader::open_async`](crate::CogReader::open_async) and
+//! [`TileExtractor::extract`](crate::TileExtractor::extract), which never block a thread on
+//! the network.
 //!
 //! This module provides a unified interface for reading byte ranges from various sources
 //! (local files, S3, HTTP). This is essential for efficient COG reading since COGs are
@@ -20,41 +23,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::async_io::{block_on_io, AsyncToSync};
+use crate::remote::ObjectStoreRangeReader;
 use crate::tiff_utils::AnyResult;
-
-/// Run a blocking remote operation, converting tokio's "blocking inside a runtime" panic into
-/// an error where possible.
-///
-/// tokio (`Handle::block_on`) and reqwest's blocking client (debug builds only) panic when
-/// used on a thread that is driving async tasks; there is no public probe for that
-/// condition, so this is best effort: the panic is caught with `catch_unwind` and, if its
-/// message matches tokio's known texts, replaced with an actionable error. Any other panic
-/// is re-raised. This does nothing under `panic = "abort"` (the process aborts as it would
-/// without the guard), and reqwest's blocking client may instead block silently in release
-/// builds. It is a safety net, not a contract: callers in async code must use `open_async`.
-pub(crate) fn blocking_call<T>(op: &str, f: impl FnOnce() -> AnyResult<T>) -> AnyResult<T> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(result) => result,
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("");
-            if msg.contains("within a runtime") || msg.contains("Cannot drop a runtime") {
-                Err(format!(
-                    "{op} performs blocking I/O and was called from an async runtime thread. \
-                     From async code use `CogReader::open_async` / `open_async_with_hint` to open, \
-                     and `TileExtractor::extract` or `CogReader::spawn_blocking` to read; \
-                     sync APIs are only for plain threads or `tokio::task::spawn_blocking`"
-                )
-                .into())
-            } else {
-                std::panic::resume_unwind(payload)
-            }
-        }
-    }
-}
 
 /// Trait for reading byte ranges from any source
 ///
@@ -198,152 +169,45 @@ impl RangeReader for LocalRangeReader {
     }
 }
 
-/// HTTP range reader for remote COG files
-/// Uses reqwest with blocking client for simplicity in sync contexts
+/// Blocking HTTP(S) range reader for remote COG files.
 ///
-/// Like every synchronous reader it must not be driven from a tokio worker thread;
-/// from async code open the COG with [`CogReader::open_async`](crate::CogReader::open_async)
-/// and read through `TileExtractor::extract` or `CogReader::spawn_blocking`.
+/// A synchronous front for [`ObjectStoreRangeReader`] (see the module docs for what that means
+/// on async threads). Opening costs one ranged `GET`; the first 16 KiB are kept in memory.
 pub struct HttpRangeReader {
-    url: String,
-    size: u64,
-    client: reqwest::blocking::Client,
+    inner: AsyncToSync,
 }
 
 impl HttpRangeReader {
+    /// Open `url` (`http://` or `https://`).
+    ///
     /// # Errors
-    /// Returns an error if the HTTP HEAD request fails, the URL is invalid, or the server
-    /// does not return a valid Content-Length header. Called from an async runtime thread
-    /// it is converted to an error only on a best-effort basis (see the module docs); use
-    /// `CogReader::open_async` from async code.
+    /// Returns an error if the URL is invalid, the server does not support range requests, or
+    /// the object cannot be read.
     pub fn new(url: &str) -> AnyResult<Self> {
-        blocking_call("HttpRangeReader::new", || {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?;
-
-            // Get file size via HEAD request
-            let response = client.head(url).send()?;
-            let size = response
-                .headers()
-                .get("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok())
-                .ok_or_else(|| format!("HTTP server did not return Content-Length header for {url}"))?;
-
-            Ok(Self {
-                url: url.to_string(),
-                size,
-                client,
-            })
-        })
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(format!("Expected an http:// or https:// URL, got: {url}").into());
+        }
+        let url = url.to_string();
+        let reader = block_on_io(async move { ObjectStoreRangeReader::open(&url).await })??;
+        Ok(Self { inner: AsyncToSync::new(Arc::new(reader)) })
     }
 }
 
 impl RangeReader for HttpRangeReader {
     fn read_range(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
-        blocking_call("HttpRangeReader::read_range", || {
-            let range = format!("bytes={}-{}", offset, offset + length as u64 - 1);
-            let response = self.client
-                .get(&self.url)
-                .header("Range", range)
-                .send()?;
-
-            if !response.status().is_success() {
-                return Err(format!("HTTP request failed: {}", response.status()).into());
-            }
-
-            Ok(response.bytes()?.to_vec())
-        })
+        self.inner.read_range(offset, length)
     }
 
     fn size(&self) -> u64 {
-        self.size
+        self.inner.size()
     }
 
     fn identifier(&self) -> &str {
-        &self.url
-    }
-}
-
-/// S3 range reader for public buckets via HTTPS
-///
-/// Note: For full S3 support with credentials, use `S3RangeReaderSync` from the `s3` module.
-pub struct S3RangeReader {
-    size: u64,
-    url: String,
-}
-
-impl S3RangeReader {
-    /// Create from an S3 URL like `s3://bucket/key`
-    ///
-    /// Validates the URL format but does not fetch size (use `from_https` for that).
-    ///
-    /// # Errors
-    /// Returns an error if the URL is invalid, missing bucket/key, or not using the s3:// scheme.
-    pub fn new(url: &str) -> AnyResult<Self> {
-        let url_parsed = url::Url::parse(url)?;
-
-        if url_parsed.scheme() != "s3" {
-            return Err("URL must use s3:// scheme".into());
-        }
-
-        if url_parsed.host_str().is_none() {
-            return Err("Missing bucket in S3 URL".into());
-        }
-
-        let key = url_parsed.path().trim_start_matches('/');
-        if key.is_empty() {
-            return Err("Missing key in S3 URL".into());
-        }
-
-        Ok(Self {
-            size: 0,
-            url: url.to_string(),
-        })
+        self.inner.identifier()
     }
 
-    /// Create from an HTTPS URL pointing to S3-hosted content
-    ///
-    /// # Errors
-    /// Returns an error if the HTTP HEAD request fails or the URL is invalid.
-    pub fn from_https(url: &str) -> AnyResult<Self> {
-        let http_reader = HttpRangeReader::new(url)?;
-
-        Ok(Self {
-            size: http_reader.size,
-            url: url.to_string(),
-        })
-    }
-}
-
-impl RangeReader for S3RangeReader {
-    fn read_range(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
-        blocking_call("S3RangeReader::read_range", || {
-            // For public S3 buckets, use HTTP range requests
-            // For private buckets, this would use aws-sdk-s3 with credentials
-            let client = reqwest::blocking::Client::new();
-            let range = format!("bytes={}-{}", offset, offset + length as u64 - 1);
-
-            let response = client
-                .get(&self.url)
-                .header("Range", range)
-                .send()?;
-
-            if !response.status().is_success() {
-                return Err(format!("S3 request failed: {}", response.status()).into());
-            }
-
-            Ok(response.bytes()?.to_vec())
-        })
-    }
-
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn identifier(&self) -> &str {
-        &self.url
+    fn is_local(&self) -> bool {
+        false
     }
 }
 
@@ -416,5 +280,53 @@ mod tests {
         assert_eq!(reader.size(), 9);
         let result = reader.read_range(0, 4).unwrap();
         assert_eq!(&result, b"Test");
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use crate::test_support::serve_bytes;
+    use std::time::Duration;
+
+    fn data() -> Vec<u8> {
+        (0..50_000usize).map(|i| (i % 253) as u8).collect()
+    }
+
+    #[test]
+    fn http_range_reader_from_a_plain_thread() {
+        let d = data();
+        let (base, log) = serve_bytes(d.clone(), Duration::ZERO);
+        let reader = HttpRangeReader::new(&format!("{base}/sync.bin")).unwrap();
+        assert_eq!((reader.size(), reader.is_local()), (50_000, false));
+        assert_eq!(reader.identifier(), format!("{base}/sync.bin"));
+        assert_eq!(reader.read_range(10, 100).unwrap(), d[10..110]);
+        assert_eq!(reader.read_range(30_000, 500).unwrap(), d[30_000..30_500]);
+        // open (prefix) + one request outside the prefix
+        assert_eq!(log.lock().len(), 2);
+    }
+
+    #[test]
+    fn http_range_reader_rejects_other_schemes() {
+        assert!(HttpRangeReader::new("s3://bucket/key").is_err());
+        assert!(HttpRangeReader::new("/tmp/file").is_err());
+    }
+
+    #[test]
+    fn create_range_reader_routes_http_sources() {
+        let (base, _log) = serve_bytes(data(), Duration::ZERO);
+        let reader = create_range_reader(&format!("{base}/x.bin")).unwrap();
+        assert!(!reader.is_local());
+        assert_eq!(reader.size(), 50_000);
+    }
+
+    /// The sync reader inside a single-threaded runtime blocks it but neither panics nor
+    /// deadlocks (the request runs on the private I/O runtime).
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_range_reader_inside_a_current_thread_runtime() {
+        let d = data();
+        let (base, _log) = serve_bytes(d.clone(), Duration::from_millis(10));
+        let reader = HttpRangeReader::new(&format!("{base}/rt.bin")).unwrap();
+        assert_eq!(reader.read_range(40_000, 64).unwrap(), d[40_000..40_064]);
     }
 }
