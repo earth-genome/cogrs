@@ -236,3 +236,24 @@ async fn extraction_and_open_futures_are_send() {
     assert_send(&open);
     drop(open);
 }
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_opens_share_the_overview_quality_sampling() {
+    // Several requests opening the same COG at once (default hint: sample overview tiles)
+    // fetch each sample tile once between them.
+    let mut spec = spec();
+    spec.overviews = 2;
+    let mock = Arc::new(MockReader::new(build_cog(&spec), "mock://x/open-share", Duration::from_millis(20)));
+    let opens = (0..8).map(|_| CogReader::from_async_reader(mock.clone()));
+    let readers = futures::future::join_all(opens).await;
+    let first = readers[0].as_ref().unwrap();
+    assert!(readers.iter().all(|r| r.as_ref().unwrap().min_usable_overview == first.min_usable_overview));
+
+    let sampled_tile_requests = mock.calls().into_iter().filter(|c| c.start > 16 * 1024).count();
+    let overview_tiles = first.overviews.last().unwrap().tile_offsets.len().min(3);
+    assert!(
+        sampled_tile_requests <= overview_tiles,
+        "{sampled_tile_requests} tile requests for 8 opens, expected at most {overview_tiles}: {:?}",
+        mock.calls()
+    );
+}

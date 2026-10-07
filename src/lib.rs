@@ -5,13 +5,17 @@
 //! The library is organized into several modules:
 //!
 //! - [`cog_reader`]: Core COG metadata parsing and tile reading
-//! - [`point_query`]: Geographic coordinate sampling via [`PointQuery`] trait
+//! - [`point_query`]: Geographic coordinate sampling via [`PointQuery`] trait (sync) and
+//!   `CogReader::sample_*_async`
 //! - [`xyz_tile`]: XYZ tile extraction with [`TileExtractor`] builder
 //! - [`geometry`]: Coordinate types ([`Point`], [`BoundingBox`]) and projections
-//! - [`range_reader`]: I/O abstraction for local/HTTP/S3 sources
+//! - [`async_io`]: [`AsyncRangeReader`], the core I/O abstraction, range coalescing
+//!   ([`fetch_ranges`]), [`IoOptions`], and sync/async adapters
+//! - [`remote`]: S3 and HTTP(S) reader built on `object_store` ([`ObjectStoreRangeReader`])
+//! - [`range_reader`]: synchronous [`RangeReader`] for local files, memory and plain threads
 //! - [`source`]: COG discovery from directories and S3 buckets
 //! - [`tile_cache`]: Global LRU cache for decompressed tiles
-//! - [`s3`]: S3-compatible storage backend
+//! - [`s3`]: S3 configuration, region resolution and S3 reader front-ends
 //! - [`raster`]: Raster data abstraction trait
 //! - [`geotiff_writer`]: Write reprojected rasters to GeoTIFF files
 //! - [`webp`]: Lossless RGBA WebP encoding of extracted tiles ([`TileData::to_webp`])

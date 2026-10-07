@@ -45,13 +45,15 @@ pub(crate) struct FetchedTiles {
 /// `(source identifier, overview level, tile index)`
 type InflightKey = (String, Option<usize>, usize);
 
-static INFLIGHT: LazyLock<Mutex<HashMap<InflightKey, Arc<watch::Sender<Option<TileResult>>>>>> =
-    LazyLock::new(Mutex::default);
+/// Publishing end of a tile being fetched; followers subscribe to it.
+type InflightSender = Arc<watch::Sender<Option<TileResult>>>;
+
+static INFLIGHT: LazyLock<Mutex<HashMap<InflightKey, InflightSender>>> = LazyLock::new(Mutex::default);
 
 /// The caller responsible for fetching a tile. Dropping it unregisters the tile.
 struct Leader {
     key: InflightKey,
-    tx: Arc<watch::Sender<Option<TileResult>>>,
+    tx: InflightSender,
 }
 
 impl Leader {

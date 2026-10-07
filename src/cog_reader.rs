@@ -5,6 +5,9 @@
 //! - Uses range requests for tile data (no full file downloads)
 //! - Caches decompressed tiles with LRU eviction
 //! - Supports multiple sources: local files, HTTP, S3
+//! - Native async I/O: open with [`CogReader::open_async`], read tiles through
+//!   `TileExtractor`; the blocking `open`/`read_tile`/`sample` API stays for plain threads
+//! - Cheap to clone: parsed metadata is shared behind `Arc`, so it can be cached per source
 //!
 //! Key optimizations:
 //! - Min/max from GDAL statistics tags (no full scan needed)
@@ -858,24 +861,13 @@ impl CogReader {
         Ok((data, span.len))
     }
 
-    /// Read, decode and cache one tile without blocking: the fetch is awaited and the decode
-    /// runs on tokio's blocking pool.
+    /// Read, decode and cache one tile without blocking: the fetch is awaited (sharing the
+    /// request with concurrent callers that need the same tile) and the decode runs on tokio's
+    /// blocking pool.
     pub(crate) async fn read_tile_async_ref(&self, tile: TileRef) -> AnyResult<(Arc<Vec<f32>>, usize)> {
-        if let Some(cached) = self.cached_tile(tile) {
-            return Ok((cached, 0));
-        }
-        let span = self.tile_span(tile)?;
-        if span.len == 0 {
-            return Ok((self.sparse_tile(&span), 0));
-        }
-        let compressed = self.async_io.read_range(span.offset, span.len).await?;
-        let this = self.clone();
-        let data = tokio::task::spawn_blocking(move || this.decode_tile(&span, &compressed))
-            .await
-            .map_err(|e| format!("Task join error: {e}"))??;
-        let data = Arc::new(data);
-        self.cache_tile(tile, Arc::clone(&data));
-        Ok((data, span.len))
+        let mut fetched = crate::tile_fetch::fetch_tiles(self, tile.overview, &[tile.index]).await?;
+        let data = fetched.tiles.remove(&tile.index).ok_or("tile missing from fetch result")?;
+        Ok((data, fetched.bytes_fetched))
     }
 
     /// Read a tile from a specific overview level
@@ -3669,6 +3661,20 @@ mod async_open_tests {
         let (base, _log) = serve_bytes(bytes, Duration::from_millis(20));
         let reader = CogReader::open_with_hint(&format!("{base}/m.tif"), OverviewQualityHint::AllUsable).unwrap();
         assert_eq!(reader.min_usable_overview, Some(0));
+    }
+
+    /// A reader opened with `open_async` on one runtime can be used through the sync API from a
+    /// `spawn_blocking` thread (the sync read runs on the private I/O runtime).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_reads_on_an_async_opened_reader_from_a_blocking_thread() {
+        let bytes = build_cog(&http_spec(256, 64, 1));
+        let (base, _log) = serve_bytes(bytes, Duration::from_millis(10));
+        let reader = CogReader::open_async_with_hint(&format!("{base}/mix.tif"), OverviewQualityHint::AllUsable)
+            .await
+            .unwrap();
+        let via_blocking = reader.spawn_blocking(|r| r.read_tile(3)).await.unwrap();
+        let via_async = reader.read_tile_async(3).await.unwrap();
+        assert_eq!(via_blocking, via_async);
     }
 
     #[test]
