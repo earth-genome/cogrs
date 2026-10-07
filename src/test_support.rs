@@ -299,7 +299,7 @@ use crate::tiff_utils::AnyResult;
 pub(crate) struct MockReader {
     data: Bytes,
     identifier: String,
-    latency: Duration,
+    latency: Mutex<Duration>,
     options: IoOptions,
     calls: Mutex<Vec<Range<u64>>>,
     in_flight: AtomicUsize,
@@ -313,7 +313,7 @@ impl MockReader {
         Self {
             data: Bytes::from(data),
             identifier: identifier.to_string(),
-            latency,
+            latency: Mutex::new(latency),
             options: IoOptions::default(),
             calls: Mutex::default(),
             in_flight: AtomicUsize::new(0),
@@ -344,6 +344,10 @@ impl MockReader {
         self.max_in_flight.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn set_latency(&self, latency: Duration) {
+        *self.latency.lock() = latency;
+    }
+
     pub(crate) fn reset(&self) {
         self.calls.lock().clear();
         self.max_in_flight.store(0, Ordering::SeqCst);
@@ -357,7 +361,8 @@ impl AsyncRangeReader for MockReader {
             self.calls.lock().push(range.clone());
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(self.latency).await;
+            let latency = *self.latency.lock();
+            tokio::time::sleep(latency).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             if self.fail_ranges.lock().iter().any(|f| f.start < range.end && range.start < f.end) {
                 return Err(format!("injected failure for {range:?}").into());

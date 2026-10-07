@@ -35,6 +35,7 @@ pub mod tiff_chunked;
 pub mod remote;
 pub mod tiff_utils;
 pub mod tile_cache;
+mod tile_fetch;
 pub mod xyz_tile;
 pub mod webp;
 
@@ -42,6 +43,8 @@ pub mod webp;
 mod test_support;
 #[cfg(test)]
 mod golden_tests;
+#[cfg(test)]
+mod extract_tests;
 
 // ============================================================================
 // Core COG Types
@@ -127,6 +130,7 @@ pub use async_io::{
     AsyncRangeReader,
     AsyncToSync,
     IoOptions,
+    RangeFetchError,
     SyncToAsync,
     fetch_ranges,
 };

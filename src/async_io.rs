@@ -130,6 +130,23 @@ pub(crate) fn merge_ranges(ranges: &[Range<u64>], gap: u64, max_len: u64) -> Vec
     merged
 }
 
+/// A failed (possibly merged) range request, naming the byte range it covered. Returned (boxed)
+/// by [`fetch_ranges`] so callers can tell which of their ranges was affected.
+#[derive(Debug)]
+pub struct RangeFetchError {
+    /// The range that was requested (after merging).
+    pub range: Range<u64>,
+    message: String,
+}
+
+impl std::fmt::Display for RangeFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RangeFetchError {}
+
 /// Fetch `ranges` from `reader`: merge nearby ranges (see [`IoOptions::coalesce_gap`]), issue
 /// up to [`IoOptions::max_concurrent_requests`] requests at a time, and slice the responses
 /// back into the requested ranges (zero-copy). The first error cancels the rest.
@@ -146,17 +163,18 @@ pub async fn fetch_ranges<R: AsyncRangeReader + ?Sized>(
     let jobs: Vec<(usize, u64, u64)> = merged.iter().enumerate().map(|(i, m)| (i, m.start, m.end - m.start)).collect();
     let mut in_flight = stream::iter(jobs)
         .map(|(i, start, len)| async move {
-            let len = usize::try_from(len).map_err(|e| format!("range too large: {e}"))?;
-            let bytes = reader.read_range(start, len).await?;
+            let range = start..start + len;
+            let fail = |message: String| RangeFetchError { range: range.clone(), message };
+            let len = usize::try_from(len).map_err(|e| fail(format!("range too large: {e}")))?;
+            let bytes = reader.read_range(start, len).await.map_err(|e| fail(e.to_string()))?;
             if bytes.len() != len {
-                return Err(format!(
+                return Err(fail(format!(
                     "short read from {}: requested {len} bytes at offset {start}, got {}",
                     reader.identifier(),
                     bytes.len()
-                )
-                .into());
+                )));
             }
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((i, bytes))
+            Ok::<_, RangeFetchError>((i, bytes))
         })
         .buffer_unordered(opts.max_concurrent_requests.max(1));
     while let Some((i, bytes)) = in_flight.try_next().await? {

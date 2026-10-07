@@ -32,7 +32,6 @@
 
 use std::collections::HashSet;
 use std::f64::consts::PI;
-use ahash::AHashMap;
 use proj4rs::proj::Proj;
 use proj4rs::transform::transform;
 
@@ -651,31 +650,23 @@ impl<'a> TileExtractor<'a> {
 
     /// Extract the tile asynchronously with the configured parameters.
     ///
-    /// This runs tile extraction on a blocking thread pool to avoid blocking
-    /// the async runtime during I/O and decompression operations.
+    /// Network reads are awaited without holding a thread (concurrent, coalesced requests for
+    /// the source tiles the output tile needs); decoding and resampling run on tokio's blocking
+    /// thread pool.
     ///
     /// # Errors
     /// Returns an error if bounds were not set, or if tile extraction fails.
     pub async fn extract(self) -> AnyResult<TileData> {
         let bounds = self.bounds.ok_or("Bounds not set: use .xyz() or .bounds()")?;
-        let reader_clone = self.reader.clone();
-        let resampling = self.resampling;
-        let output_size = self.output_size;
-        let output_crs = self.output_crs;
-
-        if let Some(selected) = self.selected_bands {
-            tokio::task::spawn_blocking(move || {
-                extract_tile_with_bands_sync(&reader_clone, &bounds, output_crs, output_size, resampling, &selected)
-            })
-            .await
-            .map_err(|e| format!("Task join error: {e}"))?
-        } else {
-            tokio::task::spawn_blocking(move || {
-                extract_tile_with_extent_resampled_sync(&reader_clone, &bounds, output_crs, output_size, resampling)
-            })
-            .await
-            .map_err(|e| format!("Task join error: {e}"))?
-        }
+        extract_tile_async(
+            self.reader,
+            bounds,
+            self.output_crs,
+            self.output_size,
+            self.resampling,
+            self.selected_bands,
+        )
+        .await
     }
 
     /// Get the configured output size.
@@ -936,26 +927,16 @@ impl<'a> Reprojector<'a> {
     /// - The extraction fails
     pub async fn extract(self) -> AnyResult<ReprojectedRaster> {
         let target_crs = self.target_crs.ok_or("Target CRS not set: use .to_crs()")?;
-        let reader_clone = self.reader.clone();
-        let output_bounds = self.output_bounds;
-        let output_resolution = self.output_resolution;
-        let output_size = self.output_size;
-        let resampling = self.resampling;
-        let selected_bands = self.selected_bands;
-
-        tokio::task::spawn_blocking(move || {
-            reproject_sync(
-                &reader_clone,
-                target_crs,
-                output_bounds,
-                output_resolution,
-                output_size,
-                resampling,
-                selected_bands.as_deref(),
-            )
-        })
+        reproject(
+            self.reader,
+            target_crs,
+            self.output_bounds,
+            self.output_resolution,
+            self.output_size,
+            self.resampling,
+            self.selected_bands.as_deref(),
+        )
         .await
-        .map_err(|e| format!("Task join error: {e}"))?
     }
 
     /// Get the source CRS of the input raster.
@@ -1106,26 +1087,16 @@ pub struct RasterChunk<'a> {
 impl<'a> RasterChunk<'a> {
     /// Extract this chunk's pixel data
     pub async fn extract(&self) -> AnyResult<ReprojectedRaster> {
-        let reader_clone = self.reader.clone();
-        let bounds = self.bounds;
-        let dimensions = self.dimensions;
-        let target_crs = self.target_crs;
-        let resampling = self.resampling;
-        let selected_bands = self.selected_bands.clone();
-
-        tokio::task::spawn_blocking(move || {
-            reproject_sync(
-                &reader_clone,
-                target_crs,
-                Some(bounds),
-                None, // resolution computed from size
-                Some(dimensions),
-                resampling,
-                selected_bands.as_deref(),
-            )
-        })
+        reproject(
+            self.reader,
+            self.target_crs,
+            Some(self.bounds),
+            None, // resolution computed from size
+            Some(self.dimensions),
+            self.resampling,
+            self.selected_bands.as_deref(),
+        )
         .await
-        .map_err(|e| format!("Task join error: {e}"))?
     }
 }
 
@@ -1427,8 +1398,8 @@ impl<'a> StreamingReprojector<'a> {
     }
 }
 
-/// Synchronous reprojection implementation
-fn reproject_sync(
+/// Reproject the raster into `target_crs` (bounds/size/resolution as given or derived)
+async fn reproject(
     reader: &CogReader,
     target_crs: u32,
     output_bounds: Option<BoundingBox>,
@@ -1503,15 +1474,16 @@ fn reproject_sync(
         return Err("At least one band must be selected".into());
     }
 
-    // Use TileExtractor to extract the reprojected data
-    let tile_data = extract_tile_with_bands_sync(
+    // Extract the reprojected data as one output raster
+    let tile_data = extract_tile_async(
         reader,
-        &output_bounds,
+        output_bounds,
         target_crs,
         (width, height),
         resampling,
-        &bands,
-    )?;
+        Some(bands),
+    )
+    .await?;
 
     Ok(ReprojectedRaster {
         pixels: tile_data.pixels,
@@ -1618,23 +1590,145 @@ fn compute_output_resolution(
 }
 
 // ============================================================================
-// Internal sync tile extraction functions
+// Tile extraction: plan (CPU) -> fetch (async I/O) -> render (CPU)
 // ============================================================================
-// These run on tokio's blocking thread pool via spawn_blocking.
-// The public API is through TileExtractor builder.
+// An output tile is produced in three phases so that network waits never hold a thread:
+//
+// 1. `plan_extraction` works out which source tiles are needed (cheap CPU, run inline).
+// 2. `tile_fetch::fetch_tiles` gets them: cache lookups, one coalesced concurrent fetch for the
+//    misses, and decoding on tokio's blocking pool (async).
+// 3. `render_extraction` resamples them into the output tile (CPU, run on the blocking pool).
+//
+// The public API is through the `TileExtractor` and `Reprojector` builders.
 
-/// Synchronous tile extraction with resampling (used by `TileExtractor`)
+/// Which source tiles an output tile needs, and how to render it from them.
 ///
-/// Extracts a tile in the specified output CRS from a COG in any source CRS.
-pub(crate) fn extract_tile_with_extent_resampled_sync(
+/// Plain data (no coordinate transformer), so it can be held across `.await` points and moved
+/// into a blocking task; the transformer is rebuilt for rendering.
+struct ExtractionPlan {
+    extent: BoundingBox,
+    output_crs: u32,
+    source_epsg: u32,
+    tile_size: (usize, usize),
+    resampling: ResamplingMethod,
+    selected_bands: Option<Vec<usize>>,
+    overview_idx: Option<usize>,
+    /// Source tile indexes within the level selected by `overview_idx`, ascending.
+    needed_tiles: Vec<usize>,
+}
+
+/// Geometry of the COG level (full resolution or one overview) used for an extraction.
+struct LevelParams {
+    eff_width: usize,
+    eff_height: usize,
+    eff_tile_width: usize,
+    eff_tile_height: usize,
+    eff_tiles_across: usize,
+    /// Source pixel size at this level
+    scale: [f64; 3],
+    tiepoint: [f64; 6],
+    /// Output pixel size in the output CRS
+    out_res_x: f64,
+    out_res_y: f64,
+}
+
+fn level_params(
     reader: &CogReader,
     extent: &BoundingBox,
+    tile_size: (usize, usize),
+    overview_idx: Option<usize>,
+) -> Result<LevelParams, Box<dyn std::error::Error + Send + Sync>> {
+    let (tile_size_x, tile_size_y) = tile_size;
+    let metadata = &reader.metadata;
+    let geo_transform = &metadata.geo_transform;
+
+    // Pre-compute the affine transform from output pixel to source pixel
+    let (Some(base_scale), Some(tiepoint)) = (geo_transform.pixel_scale, geo_transform.tiepoint) else {
+        return Err("Missing geotransform".into());
+    };
+
+    // Get effective metadata for the level we're using
+    let (eff_width, eff_height, eff_tile_width, eff_tile_height, eff_tiles_across, scale_factor) = if let Some(ovr_idx) = overview_idx {
+        let ovr = &reader.overviews[ovr_idx];
+        // Scale factor is small (typically 2, 4, 8, etc.), so precision loss is acceptable
+        #[allow(clippy::cast_precision_loss)]
+        let ovr_scale = ovr.scale as f64;
+        (ovr.width, ovr.height, ovr.tile_width, ovr.tile_height, ovr.tiles_across, ovr_scale)
+    } else {
+        (metadata.width, metadata.height, metadata.tile_width, metadata.tile_height, metadata.tiles_across, 1.0)
+    };
+
+    // Adjust scale for overview level
+    let scale = [base_scale[0] * scale_factor, base_scale[1] * scale_factor, base_scale[2]];
+
+    // Output tile pixel resolution in the output CRS
+    #[allow(clippy::cast_precision_loss)]
+    let out_res_x = (extent.maxx - extent.minx) / (tile_size_x as f64);
+    #[allow(clippy::cast_precision_loss)]
+    let out_res_y = (extent.maxy - extent.miny) / (tile_size_y as f64);
+
+    Ok(LevelParams {
+        eff_width,
+        eff_height,
+        eff_tile_width,
+        eff_tile_height,
+        eff_tiles_across,
+        scale,
+        tiepoint,
+        out_res_x,
+        out_res_y,
+    })
+}
+
+/// Extract a tile in `output_crs` (optionally only `bands`) from a COG in any source CRS.
+///
+/// Network I/O is awaited (concurrently, coalesced, de-duplicated across callers); decoding and
+/// resampling run on tokio's blocking pool, so no thread is held while waiting on the network.
+pub(crate) async fn extract_tile_async(
+    reader: &CogReader,
+    extent: BoundingBox,
     output_crs: u32,
     tile_size: (usize, usize),
     resampling: ResamplingMethod,
+    bands: Option<Vec<usize>>,
 ) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
+    let plan = plan_extraction(reader, extent, output_crs, tile_size, resampling, bands)?;
+    let fetched = if plan.needed_tiles.is_empty() {
+        crate::tile_fetch::FetchedTiles::default()
+    } else {
+        crate::tile_fetch::fetch_tiles(reader, plan.overview_idx, &plan.needed_tiles).await?
+    };
+    let reader = reader.clone();
+    tokio::task::spawn_blocking(move || render_extraction(&reader, &plan, fetched))
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Phase 1: choose the overview level and the source tiles an output tile needs.
+fn plan_extraction(
+    reader: &CogReader,
+    extent: BoundingBox,
+    output_crs: u32,
+    tile_size: (usize, usize),
+    resampling: ResamplingMethod,
+    bands: Option<Vec<usize>>,
+) -> Result<ExtractionPlan, Box<dyn std::error::Error + Send + Sync>> {
+    let (tile_size_x, tile_size_y) = tile_size;
     let metadata = &reader.metadata;
     let geo_transform = &metadata.geo_transform;
+
+    if let Some(bands) = &bands {
+        // Validate band indices
+        for &band in bands {
+            if band >= metadata.bands {
+                return Err(format!("Band index {} out of range (COG has {} bands)", band, metadata.bands).into());
+            }
+        }
+
+        if bands.is_empty() {
+            return Err("At least one band must be selected".into());
+        }
+    }
 
     // Pre-compute the affine transform from output pixel to source pixel
     let (Some(base_scale), Some(_tiepoint)) = (geo_transform.pixel_scale, geo_transform.tiepoint) else {
@@ -1662,116 +1756,8 @@ pub(crate) fn extract_tile_with_extent_resampled_sync(
     // Find the best overview level
     let overview_idx = reader.best_overview_for_resolution(extent_src_width, extent_src_height);
 
-    // Call the internal function with automatic fallback for empty overviews
-    extract_tile_with_overview(reader, extent, tile_size, overview_idx, strategy, resampling, None)
-}
-
-/// Synchronous band selection extraction (used by `TileExtractor`)
-///
-/// Extracts a tile in the specified output CRS from a COG in any source CRS.
-pub(crate) fn extract_tile_with_bands_sync(
-    reader: &CogReader,
-    extent: &BoundingBox,
-    output_crs: u32,
-    tile_size: (usize, usize),
-    resampling: ResamplingMethod,
-    bands: &[usize],
-) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
-    let metadata = &reader.metadata;
-    let geo_transform = &metadata.geo_transform;
-
-    // Validate band indices
-    for &band in bands {
-        if band >= metadata.bands {
-            return Err(format!("Band index {} out of range (COG has {} bands)", band, metadata.bands).into());
-        }
-    }
-
-    if bands.is_empty() {
-        return Err("At least one band must be selected".into());
-    }
-
-    // Pre-compute the affine transform from output pixel to source pixel
-    let (Some(base_scale), Some(_tiepoint)) = (geo_transform.pixel_scale, geo_transform.tiepoint) else {
-        return Err("Missing geotransform".into());
-    };
-
-    // Create coordinate transformer: output CRS → source CRS
-    let source_epsg = u32::try_from(metadata.crs_code.unwrap_or(3857))
-        .map_err(|e| format!("Invalid CRS code: {e}"))?;
-    let strategy = TransformStrategy::new(output_crs, source_epsg)?;
-
-    // Convert extent to source CRS
-    let (src_min_x, src_min_y) = strategy.transform(extent.minx, extent.miny)?;
-    let (src_max_x, src_max_y) = strategy.transform(extent.maxx, extent.maxy)?;
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let extent_src_width = ((src_max_x - src_min_x) / base_scale[0]).abs().max(1.0) as usize;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let extent_src_height = ((src_max_y - src_min_y) / base_scale[1]).abs().max(1.0) as usize;
-
-    let overview_idx = reader.best_overview_for_resolution(extent_src_width, extent_src_height);
-
-    extract_tile_with_overview(reader, extent, tile_size, overview_idx, strategy, resampling, Some(bands))
-}
-
-/// Internal function that extracts a tile using a specific overview level (or full resolution if None)
-#[allow(clippy::too_many_lines)]
-fn extract_tile_with_overview(
-    reader: &CogReader,
-    extent_3857: &BoundingBox,
-    tile_size: (usize, usize),
-    overview_idx: Option<usize>,
-    strategy: TransformStrategy,
-    resampling: ResamplingMethod,
-    selected_bands: Option<&[usize]>,
-) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
-    let (tile_size_x, tile_size_y) = tile_size;
-    let metadata = &reader.metadata;
-    // Value for output pixels with no source data: the COG's nodata if declared, else NaN.
-    let fill = fill_value(metadata.nodata);
-    let nodata_f32 = nodata_as_f32(metadata.nodata);
-    let geo_transform = &metadata.geo_transform;
-
-    // Pre-compute the affine transform from output pixel to source pixel
-    let (Some(base_scale), Some(tiepoint)) = (geo_transform.pixel_scale, geo_transform.tiepoint) else {
-        return Err("Missing geotransform".into());
-    };
-
-    // Get effective metadata for the level we're using
-    let (eff_width, eff_height, eff_tile_width, eff_tile_height, eff_tiles_across, scale_factor) = if let Some(ovr_idx) = overview_idx {
-        let ovr = &reader.overviews[ovr_idx];
-        // Scale factor is small (typically 2, 4, 8, etc.), so precision loss is acceptable
-        #[allow(clippy::cast_precision_loss)]
-        let ovr_scale = ovr.scale as f64;
-        (ovr.width, ovr.height, ovr.tile_width, ovr.tile_height, ovr.tiles_across, ovr_scale)
-    } else {
-        (metadata.width, metadata.height, metadata.tile_width, metadata.tile_height, metadata.tiles_across, 1.0)
-    };
-
-    // Adjust scale for overview level
-    let scale = [base_scale[0] * scale_factor, base_scale[1] * scale_factor, base_scale[2]];
-
-    // Output tile pixel resolution in Web Mercator
-    #[allow(clippy::cast_precision_loss)]
-    let out_res_x = (extent_3857.maxx - extent_3857.minx) / (tile_size_x as f64);
-    #[allow(clippy::cast_precision_loss)]
-    let out_res_y = (extent_3857.maxy - extent_3857.miny) / (tile_size_y as f64);
-
-    // Pre-compute bit shifts for fast division if tile sizes are powers of 2
-    // This avoids expensive div/mod in the inner loop
-    let tile_width_shift = if eff_tile_width.is_power_of_two() {
-        Some(eff_tile_width.trailing_zeros() as usize)
-    } else {
-        None
-    };
-    let tile_height_shift = if eff_tile_height.is_power_of_two() {
-        Some(eff_tile_height.trailing_zeros() as usize)
-    } else {
-        None
-    };
-    let tile_width_mask = eff_tile_width - 1;
-    let tile_height_mask = eff_tile_height - 1;
+    let LevelParams { eff_width, eff_height, eff_tile_width, eff_tile_height, eff_tiles_across, scale, tiepoint, out_res_x, out_res_y } =
+        level_params(reader, &extent, tile_size, overview_idx)?;
 
     // Pre-compute which source tiles we need by checking corners and edges
     let mut needed_tiles: HashSet<usize> = HashSet::new();
@@ -1802,9 +1788,9 @@ fn extract_tile_with_overview(
 
     for &(out_x, out_y) in &sample_points {
         #[allow(clippy::cast_precision_loss)]
-        let merc_x = extent_3857.minx + (out_x as f64 + 0.5) * out_res_x;
+        let merc_x = extent.minx + (out_x as f64 + 0.5) * out_res_x;
         #[allow(clippy::cast_precision_loss)]
-        let merc_y = extent_3857.maxy - (out_y as f64 + 0.5) * out_res_y;
+        let merc_y = extent.maxy - (out_y as f64 + 0.5) * out_res_y;
 
         // Transform from Web Mercator to source CRS
         let (world_x, world_y) = strategy.transform(merc_x, merc_y)?;
@@ -1864,8 +1850,57 @@ fn extract_tile_with_overview(
         }
     }
 
+    let mut needed_tiles: Vec<usize> = needed_tiles.into_iter().collect();
+    needed_tiles.sort_unstable();
+
+    Ok(ExtractionPlan {
+        extent,
+        output_crs,
+        source_epsg,
+        tile_size,
+        resampling,
+        selected_bands: bands,
+        overview_idx,
+        needed_tiles,
+    })
+}
+
+/// Phase 3: resample the fetched source tiles into the output tile.
+#[allow(clippy::too_many_lines)]
+fn render_extraction(
+    reader: &CogReader,
+    plan: &ExtractionPlan,
+    fetched: crate::tile_fetch::FetchedTiles,
+) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
+    let extent_3857 = &plan.extent;
+    let (resampling, overview_idx) = (plan.resampling, plan.overview_idx);
+    let selected_bands = plan.selected_bands.as_deref();
+    let (tile_size_x, tile_size_y) = plan.tile_size;
+    let metadata = &reader.metadata;
+    // Value for output pixels with no source data: the COG's nodata if declared, else NaN.
+    let fill = fill_value(metadata.nodata);
+    let nodata_f32 = nodata_as_f32(metadata.nodata);
+    let strategy = TransformStrategy::new(plan.output_crs, plan.source_epsg)?;
+    let LevelParams { eff_width, eff_height, eff_tile_width, eff_tile_height, eff_tiles_across, scale, tiepoint, out_res_x, out_res_y } =
+        level_params(reader, extent_3857, plan.tile_size, overview_idx)?;
+
+    // Pre-compute bit shifts for fast division if tile sizes are powers of 2
+    // This avoids expensive div/mod in the inner loop
+    let tile_width_shift = if eff_tile_width.is_power_of_two() {
+        Some(eff_tile_width.trailing_zeros() as usize)
+    } else {
+        None
+    };
+    let tile_height_shift = if eff_tile_height.is_power_of_two() {
+        Some(eff_tile_height.trailing_zeros() as usize)
+    } else {
+        None
+    };
+    let tile_width_mask = eff_tile_width - 1;
+    let tile_height_mask = eff_tile_height - 1;
+
     // Output entirely outside the COG: a tile of fill (nodata, or NaN if none declared)
-    if needed_tiles.is_empty() {
+    if plan.needed_tiles.is_empty() {
         let output_bands: Vec<usize> = selected_bands.map_or_else(|| (0..metadata.bands).collect(), <[usize]>::to_vec);
         let num_output_bands = output_bands.len();
         return Ok(TileData {
@@ -1880,29 +1915,10 @@ fn extract_tile_with_overview(
         });
     }
 
-    // Pre-load all needed tiles and track bytes fetched
-    let mut tile_data_cache: AHashMap<usize, Vec<f32>> = AHashMap::new();
-    let mut total_bytes_fetched: usize = 0;
-    let mut tiles_actually_read: usize = 0;
-
-    // Source tiles with a zero byte count are sparse (never written); the reader
-    // returns them as all-NaN with 0 bytes. Any real I/O or decode error aborts.
-    for &tile_idx in &needed_tiles {
-        let tile_result = if let Some(ovr_idx) = overview_idx {
-            reader.read_overview_tile_with_bytes(ovr_idx, tile_idx)
-        } else {
-            reader.read_tile_with_bytes(tile_idx)
-        };
-
-        let (data, bytes) = tile_result.map_err(|e| {
-            format!("Failed to read source tile {tile_idx} (overview {overview_idx:?}): {e}")
-        })?;
-        tile_data_cache.insert(tile_idx, data);
-        total_bytes_fetched += bytes;
-        if bytes > 0 {
-            tiles_actually_read += 1;
-        }
-    }
+    // Source tiles with a zero byte count are sparse (never written) and arrive as all-NaN
+    // with 0 bytes; any real I/O or decode error has already aborted the fetch.
+    let crate::tile_fetch::FetchedTiles { tiles: tile_data_cache, bytes_fetched: total_bytes_fetched, tiles_read: tiles_actually_read } =
+        fetched;
 
     // Determine output bands: selected or all
     let source_bands = metadata.bands;

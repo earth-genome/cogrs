@@ -568,6 +568,11 @@ impl CogReader {
         self.async_io.identifier()
     }
 
+    /// The asynchronous reader tile data is fetched through.
+    pub(crate) fn io(&self) -> &Arc<dyn AsyncRangeReader> {
+        &self.async_io
+    }
+
     fn assemble(
         async_io: Arc<dyn AsyncRangeReader>,
         sync_io: Arc<dyn RangeReader>,
