@@ -18,6 +18,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   memory. `CogReader::open` now wraps non-local readers with it, so opening a remote
   COG costs a single header request instead of many small sequential ones
 - `RangeReader::has_prefix_cache()` (default method, returns `false`)
+- `CogReader::open_async()` / `CogReader::open_async_with_hint()`: async entry points that
+  run the blocking open (S3 region detection, header/IFD reads, overview analysis) on
+  tokio's blocking pool. Safe on `multi_thread` and `current_thread` runtimes; use these
+  for S3/HTTP sources from async code
+- `CogReader::spawn_blocking(|reader| ..)`: run any sync operation (point queries, tile
+  reads) on an opened reader on the blocking pool
+- S3 bucket region auto-detection: when no region is configured and no custom endpoint is
+  set, the region is detected with an unauthenticated `HeadBucket` request and cached per
+  bucket for the life of the process. Failure to detect falls back to `us-east-1` with a
+  warning
+- S3 open failures without credentials now mention `AWS_SKIP_SIGNATURE=true` for public buckets
 
 ### Changed
 
@@ -33,6 +44,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   instead of silently leaving a hole in the output (and, for overviews, instead of
   retrying at full resolution). Sparse tiles (zero byte count) are still valid and
   produce nodata/`NaN` pixels
+- S3 region precedence is now: explicit `S3Config::region` / `S3ScanOptions::region` >
+  `AWS_REGION` > `AWS_DEFAULT_REGION` > auto-detect. Previously `AWS_DEFAULT_REGION` was
+  ignored and the region defaulted to `us-east-1`, which failed with "Received redirect
+  without LOCATION" for buckets in other regions. `S3Config::region` /
+  `S3ScanOptions::region` are still `Option<String>`, but `None` (what `from_url` /
+  `Default` yield when no env var is set) now means "auto-detect" instead of being
+  pre-filled with `us-east-1`. Custom endpoints (`AWS_ENDPOINT_URL`, MinIO) still default
+  to `us-east-1` and never trigger detection
+- Blocking remote readers (`S3RangeReaderSync`, `HttpRangeReader`, legacy `S3RangeReader`,
+  and therefore `CogReader::open` for `s3://` / `http(s)://`) called on a tokio worker
+  thread now try to convert tokio's "Cannot start a runtime from within a runtime" panic
+  into an error naming `CogReader::open_async` (best effort, string-matched). This works
+  with unwinding panics only, and tokio's panic message is still printed by the panic hook;
+  with `panic = "abort"` the process aborts as before; and reqwest's blocking client only
+  detects the condition in debug builds, so in release builds `HttpRangeReader` may instead
+  silently block the worker thread. Always use `open_async` from async code
 
 ### Fixed
 
@@ -40,6 +67,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   target sets `bench = false` so criterion flags are not passed to libtest, and the
   benchmarks use a synthetic COG generated at startup (or a file given by the
   `COGRS_BENCH_COG` environment variable) instead of a missing test file
+- `S3CogSource::scan` panicked when called from async code (it opened each COG with the
+  blocking S3 reader on the runtime thread); metadata reads now run on the blocking pool
+- `S3CogSource::scan` honors `AWS_DEFAULT_REGION` and bucket region detection like `S3Config`
 
 ## [0.0.4] - 2025-12-10
 

@@ -9,11 +9,23 @@
 //! # Configuration
 //!
 //! The reader can be configured via environment variables:
-//! - `AWS_ACCESS_KEY_ID` - AWS access key
-//! - `AWS_SECRET_ACCESS_KEY` - AWS secret key
-//! - `AWS_REGION` - AWS region (default: us-east-1)
-//! - `AWS_ENDPOINT_URL` - Custom endpoint for MinIO/S3-compatible services
+//! - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - AWS credentials
+//! - `AWS_SKIP_SIGNATURE` - Set to "true" for anonymous access to public buckets
+//! - `AWS_REGION`, then `AWS_DEFAULT_REGION` - AWS region. If neither is set (and no custom
+//!   endpoint is configured) the bucket's region is detected with an unauthenticated
+//!   `HEAD https://{bucket}.s3.amazonaws.com` and cached per bucket for the process lifetime
+//! - `AWS_ENDPOINT_URL` - Custom endpoint for MinIO/S3-compatible services (disables region
+//!   detection; the region then defaults to `us-east-1`)
 //! - `AWS_ALLOW_HTTP` - Set to "true" to allow HTTP endpoints (for local `MinIO`)
+//!
+//! An explicit [`S3Config::region`] always wins over the environment.
+//!
+//! # Async runtimes
+//!
+//! [`S3RangeReaderAsync`] is fully async. [`S3RangeReaderSync`] (used by `CogReader::open`)
+//! blocks the calling thread and so must not be used on an async worker thread. If it is,
+//! tokio's panic is converted to an error on a best-effort basis (unwinding panics only;
+//! `panic = "abort"` aborts). Open COGs from async code with `CogReader::open_async`.
 //!
 //! # Example
 //!
@@ -34,14 +46,104 @@
 //! }
 //! ```
 
-use crate::range_reader::RangeReader;
+use crate::range_reader::{blocking_call, RangeReader};
 use crate::tiff_utils::AnyResult;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{resolve_bucket_region, AmazonS3Builder};
 use object_store::path::Path as ObjectPath;
-use object_store::{GetOptions, GetRange, ObjectStore};
+use object_store::{ClientOptions, GetOptions, GetRange, ObjectStore};
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use tokio::runtime::Handle;
+
+/// Process-wide cache of detected bucket regions.
+static BUCKET_REGIONS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
+
+/// Treat unset and empty/whitespace values alike.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// Pick the region from explicit config, then `AWS_REGION`, then `AWS_DEFAULT_REGION`.
+///
+/// Pure (inputs are passed in) so precedence can be tested without touching the process
+/// environment. `None` means "not configured": detect it from the bucket, or use the
+/// `object_store` default when a custom endpoint is in use.
+fn select_region(
+    explicit: Option<&str>,
+    aws_region: Option<&str>,
+    aws_default_region: Option<&str>,
+) -> Option<String> {
+    non_empty(explicit)
+        .or_else(|| non_empty(aws_region))
+        .or_else(|| non_empty(aws_default_region))
+        .map(str::to_string)
+}
+
+/// Region detection is only appropriate for AWS itself: with a custom endpoint
+/// (`MinIO`, `LocalStack`, ...) `{bucket}.s3.amazonaws.com` says nothing about the bucket.
+fn should_detect_region(region: Option<&str>, endpoint: Option<&str>) -> bool {
+    region.is_none() && non_empty(endpoint).is_none()
+}
+
+/// Resolve the region to use for `bucket`: explicit > `AWS_REGION` > `AWS_DEFAULT_REGION` >
+/// auto-detect (AWS only, cached). `None` means "let `object_store` use its default".
+pub(crate) async fn resolve_region(
+    bucket: &str,
+    explicit: Option<&str>,
+    endpoint: Option<&str>,
+) -> Option<String> {
+    let region = select_region(
+        explicit,
+        std::env::var("AWS_REGION").ok().as_deref(),
+        std::env::var("AWS_DEFAULT_REGION").ok().as_deref(),
+    );
+    if !should_detect_region(region.as_deref(), endpoint) {
+        return region;
+    }
+    match detect_bucket_region(bucket).await {
+        Ok(region) => Some(region),
+        Err(e) => {
+            tracing::warn!(
+                bucket,
+                error = %e,
+                "Could not detect S3 bucket region; falling back to us-east-1. \
+                 Set AWS_REGION to avoid detection"
+            );
+            None
+        }
+    }
+}
+
+/// Region from the environment only (`AWS_REGION`, then `AWS_DEFAULT_REGION`).
+pub(crate) fn region_from_env() -> Option<String> {
+    select_region(
+        None,
+        std::env::var("AWS_REGION").ok().as_deref(),
+        std::env::var("AWS_DEFAULT_REGION").ok().as_deref(),
+    )
+}
+
+/// Resolve a bucket's region, using the process-wide cache.
+async fn detect_bucket_region(bucket: &str) -> AnyResult<String> {
+    let cache = &*BUCKET_REGIONS;
+    if let Some(region) = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(bucket) {
+        return Ok(region.clone());
+    }
+
+    let options = ClientOptions::new()
+        .with_connect_timeout(Duration::from_secs(5))
+        .with_timeout(Duration::from_secs(10));
+    let region = resolve_bucket_region(bucket, &options).await?;
+    tracing::debug!(bucket, %region, "Detected S3 bucket region");
+
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(bucket.to_string(), region.clone());
+    Ok(region)
+}
 
 /// S3 configuration for connecting to S3-compatible storage
 #[derive(Debug, Clone)]
@@ -50,7 +152,8 @@ pub struct S3Config {
     pub bucket: String,
     /// Object key (path within the bucket)
     pub key: String,
-    /// AWS region (default: us-east-1)
+    /// AWS region. `None` means "unset": use `AWS_REGION` / `AWS_DEFAULT_REGION`, else
+    /// auto-detect from the bucket (AWS only; custom endpoints default to `us-east-1`)
     pub region: Option<String>,
     /// Custom endpoint URL (for `MinIO`, `LocalStack`, etc.)
     pub endpoint_url: Option<String>,
@@ -92,7 +195,8 @@ impl S3Config {
         Ok(Self {
             bucket,
             key,
-            region: std::env::var("AWS_REGION").ok().or(Some("us-east-1".to_string())),
+            // Unset (None) = auto-detect when the reader is opened
+            region: region_from_env(),
             endpoint_url: std::env::var("AWS_ENDPOINT_URL").ok(),
             access_key_id: std::env::var("AWS_ACCESS_KEY_ID").ok(),
             secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
@@ -159,7 +263,10 @@ impl S3RangeReaderAsync {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket);
 
-        if let Some(region) = &config.region {
+        // explicit config > AWS_REGION > AWS_DEFAULT_REGION > detect from the bucket
+        let region =
+            resolve_region(&config.bucket, config.region.as_deref(), config.endpoint_url.as_deref()).await;
+        if let Some(region) = &region {
             builder = builder.with_region(region);
         }
 
@@ -187,7 +294,18 @@ impl S3RangeReaderAsync {
         let path = ObjectPath::from(config.key.as_str());
 
         // Get file size via HEAD request
-        let meta = store.head(&path).await?;
+        let meta = store.head(&path).await.map_err(|e| {
+            let hint = if !config.skip_signature
+                && config.access_key_id.is_none()
+                && !matches!(e, object_store::Error::NotFound { .. })
+            {
+                ". No AWS credentials are configured; if this is a public bucket set \
+                 AWS_SKIP_SIGNATURE=true (or S3Config::skip_signature) for anonymous access"
+            } else {
+                ""
+            };
+            format!("Failed to open s3://{}/{}: {e}{hint}", config.bucket, config.key)
+        })?;
         let size = meta.size as u64;
 
         let url = format!("s3://{}/{}", config.bucket, config.key);
@@ -234,6 +352,11 @@ impl S3RangeReaderAsync {
 }
 
 /// Synchronous wrapper for `S3RangeReaderAsync` that implements `RangeReader` trait
+///
+/// Reads block the calling thread on the captured runtime handle, so they must run on a
+/// plain thread or a `spawn_blocking` thread, never on an async worker thread (best-effort
+/// conversion to an error with unwinding panics only; `panic = "abort"` aborts). From async
+/// code prefer `CogReader::open_async`.
 pub struct S3RangeReaderSync {
     inner: S3RangeReaderAsync,
     runtime: Handle,
@@ -242,15 +365,22 @@ pub struct S3RangeReaderSync {
 impl S3RangeReaderSync {
     /// Create a new sync S3 range reader
     ///
-    /// Must be called from within a tokio runtime context
+    /// Must be called from within a tokio runtime context, on a thread that is allowed to
+    /// block (e.g. inside `tokio::task::spawn_blocking`). From an async worker thread tokio's
+    /// panic is converted to an error only on a best-effort basis (unwinding panics; with
+    /// `panic = "abort"` the process aborts). Use [`S3RangeReaderAsync::new`] or
+    /// `CogReader::open_async` there.
     ///
     /// # Errors
-    /// Returns an error if not called from within a tokio runtime or if the S3 object cannot be accessed.
+    /// Returns an error if not called from within a tokio runtime, if the S3 object cannot
+    /// be accessed, or (best effort) if called on an async worker thread.
     pub fn new(url: &str) -> AnyResult<Self> {
         let runtime = Handle::try_current()
             .map_err(|_| "S3RangeReaderSync must be created within a tokio runtime")?;
 
-        let inner = runtime.block_on(S3RangeReaderAsync::new(url))?;
+        let inner = blocking_call("S3RangeReaderSync::new", || {
+            runtime.block_on(S3RangeReaderAsync::new(url))
+        })?;
 
         Ok(Self { inner, runtime })
     }
@@ -269,7 +399,9 @@ impl S3RangeReaderSync {
 
 impl RangeReader for S3RangeReaderSync {
     fn read_range(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
-        self.runtime.block_on(self.inner.read_range_async(offset, length))
+        blocking_call("S3RangeReaderSync::read_range", || {
+            self.runtime.block_on(self.inner.read_range_async(offset, length))
+        })
     }
 
     fn size(&self) -> u64 {
@@ -322,5 +454,45 @@ mod tests {
         assert_eq!(config.key, "data/test.tif");
         assert_eq!(config.endpoint_url, Some("http://localhost:9000".to_string()));
         assert!(config.allow_http);
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    #[test]
+    fn select_region_precedence() {
+        assert_eq!(select_region(Some("eu-west-1"), Some("us-east-2"), Some("us-west-1")).as_deref(), Some("eu-west-1"));
+        assert_eq!(select_region(None, Some("us-east-2"), Some("us-west-1")).as_deref(), Some("us-east-2"));
+        assert_eq!(select_region(None, None, Some("us-west-1")).as_deref(), Some("us-west-1"));
+        assert_eq!(select_region(None, None, None), None);
+    }
+
+    #[test]
+    fn select_region_ignores_empty_values() {
+        assert_eq!(select_region(Some(""), Some("  "), Some("us-west-2")).as_deref(), Some("us-west-2"));
+        assert_eq!(select_region(Some(" "), Some(""), Some("")), None);
+        assert_eq!(select_region(None, Some(" us-west-2 "), None).as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn detection_only_without_region_or_custom_endpoint() {
+        assert!(should_detect_region(None, None));
+        assert!(should_detect_region(None, Some("")));
+        assert!(!should_detect_region(Some("us-west-2"), None));
+        assert!(!should_detect_region(None, Some("http://localhost:9000")));
+        assert!(!should_detect_region(Some("us-east-1"), Some("http://localhost:9000")));
+    }
+
+    #[tokio::test]
+    async fn detected_region_is_cached_per_bucket() {
+        // A cache hit must return without any network access.
+        BUCKET_REGIONS
+            .lock()
+            .unwrap()
+            .insert("cogrs-test-cached-bucket".to_string(), "ap-south-1".to_string());
+        let region = detect_bucket_region("cogrs-test-cached-bucket").await.unwrap();
+        assert_eq!(region, "ap-south-1");
     }
 }

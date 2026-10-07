@@ -27,7 +27,8 @@ pub struct S3ScanOptions {
     pub max_objects: Option<usize>,
     /// Custom endpoint URL (for `MinIO`, `LocalStack`, etc.)
     pub endpoint_url: Option<String>,
-    /// AWS region
+    /// AWS region. `None` = `AWS_REGION` / `AWS_DEFAULT_REGION`, else auto-detected from the
+    /// bucket (not when a custom endpoint is set)
     pub region: Option<String>,
     /// Allow HTTP connections
     pub allow_http: bool,
@@ -45,7 +46,8 @@ impl Default for S3ScanOptions {
             ],
             max_objects: None,
             endpoint_url: std::env::var("AWS_ENDPOINT_URL").ok(),
-            region: std::env::var("AWS_REGION").ok().or(Some("us-east-1".to_string())),
+            // None = auto-detect (AWS only) when scanning
+            region: crate::s3::region_from_env(),
             allow_http: std::env::var("AWS_ALLOW_HTTP")
                 .map(|v| v.to_lowercase() == "true")
                 .unwrap_or(false),
@@ -141,7 +143,9 @@ impl S3CogSource {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(bucket);
 
-        if let Some(region) = &options.region {
+        let region =
+            crate::s3::resolve_region(bucket, options.region.as_deref(), options.endpoint_url.as_deref()).await;
+        if let Some(region) = &region {
             builder = builder.with_region(region);
         }
 
@@ -197,7 +201,14 @@ impl S3CogSource {
 
             // Try to read COG metadata
             let s3_url = format!("s3://{bucket}/{key}");
-            match Self::read_cog_entry(&s3_url, &meta) {
+            // CogReader and the sync S3 reader block, so keep them off the async worker threads
+            let read = {
+                let (url, meta) = (s3_url.clone(), meta.clone());
+                tokio::task::spawn_blocking(move || Self::read_cog_entry(&url, &meta))
+                    .await
+                    .map_err(|e| format!("Task join error: {e}"))?
+            };
+            match read {
                 Ok(cog_entry) => {
                     let idx = entries.len();
                     entries_by_name.insert(cog_entry.name.clone(), idx);

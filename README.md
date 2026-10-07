@@ -17,9 +17,9 @@ use cogrs::{CogReader, PointQuery, TileExtractor};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let reader = CogReader::open("path/to/file.tif")?;
+    let reader = CogReader::open_async("path/to/file.tif").await?;
 
-    // Point query (sync)
+    // Point query (sync I/O; use `reader.spawn_blocking(..)` for remote sources)
     let result = reader.sample_lonlat(-122.4, 37.8)?;
 
     // XYZ tile extraction (async)
@@ -34,20 +34,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 ## Sources
 
+From async code (axum/tokio handlers, etc.) always open with `CogReader::open_async`. It runs
+the blocking header/IFD reads on tokio's blocking pool and works on both `multi_thread` and
+`current_thread` runtimes. S3 and HTTP sources need it: the synchronous `CogReader::open`
+blocks the calling thread. Called on an async worker thread it is converted to an error
+only on a best-effort basis: with unwinding panics tokio's panic message is still printed
+and an error naming `open_async` is returned; with `panic = "abort"` the process aborts;
+and in release builds the blocking HTTP reader may silently block the worker thread
+instead. Always use `open_async` from async code.
+
 ```rust,no_run
 use cogrs::CogReader;
-# fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 // Local file
-let reader = CogReader::open("path/to/file.tif")?;
+let reader = CogReader::open_async("path/to/file.tif").await?;
 
 // HTTP
-let reader = CogReader::open("https://example.com/file.tif")?;
+let reader = CogReader::open_async("https://example.com/file.tif").await?;
 
 // S3 (uses AWS_* environment variables for credentials)
-let reader = CogReader::open("s3://bucket/path/to/file.tif")?;
+let reader = CogReader::open_async("s3://bucket/path/to/file.tif").await?;
 # Ok(())
 # }
 ```
+
+S3 configuration: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for credentials,
+`AWS_SKIP_SIGNATURE=true` for anonymous access to public buckets, `AWS_ENDPOINT_URL` /
+`AWS_ALLOW_HTTP` for MinIO and other S3-compatible stores. The region is taken from
+`AWS_REGION`, then `AWS_DEFAULT_REGION`; if neither is set it is detected from the bucket
+(once per bucket per process) unless a custom endpoint is configured.
+
+Blocking APIs (`CogReader::open`, `sample_lonlat`, ...) are fine in plain threads and inside
+`spawn_blocking`. To call them from async code on an opened reader, use
+`reader.spawn_blocking(|r| r.sample_lonlat(lon, lat)).await`; tile extraction
+(`TileExtractor::extract`) is already async.
 
 ## Point Queries
 
@@ -74,7 +95,7 @@ let result = reader.sample_crs(32610, 551000.0, 4185000.0)?;
 use cogrs::{CogReader, TileExtractor, ResamplingMethod};
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let reader = CogReader::open("imagery.tif")?;
+let reader = CogReader::open_async("imagery.tif").await?;
 
 // Simple extraction (256x256)
 let tile = TileExtractor::new(&reader)
@@ -107,7 +128,7 @@ Areas of a tile outside the COG extent are filled with the COG's nodata value
 use cogrs::{CogReader, TileExtractor, WebpOptions};
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let reader = CogReader::open("imagery.tif")?;
+let reader = CogReader::open_async("imagery.tif").await?;
 let tile = TileExtractor::new(&reader).xyz(10, 163, 395).extract().await?;
 
 let webp: Vec<u8> = tile.to_webp()?;

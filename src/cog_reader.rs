@@ -377,6 +377,13 @@ pub struct CogReader {
 impl CogReader {
     /// Open a COG from any source (local file, HTTP URL, or S3)
     ///
+    /// This is a **blocking** call. For HTTP and S3 sources it must not run on an async
+    /// worker thread; always use [`CogReader::open_async`] from async code. If it is called
+    /// there anyway, unwinding panics are converted to an error on a best-effort basis
+    /// (tokio still prints its panic message), `panic = "abort"` builds abort, and in release
+    /// builds the HTTP reader may silently block the worker. S3 sources additionally need
+    /// to run inside a tokio runtime context (e.g. a `spawn_blocking` thread).
+    ///
     /// # Errors
     /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
     /// or required metadata tags are missing or invalid.
@@ -385,10 +392,73 @@ impl CogReader {
         Self::from_reader(reader)
     }
 
+    /// Open a COG without blocking the async runtime (local file, HTTP URL, or S3)
+    ///
+    /// The blocking work (region detection, header and IFD reads, overview analysis) runs on
+    /// tokio's blocking thread pool, so this is safe on `multi_thread` and `current_thread`
+    /// runtimes alike. Prefer this over [`CogReader::open`] anywhere inside an `async fn`.
+    ///
+    /// ```rust,no_run
+    /// use cogrs::CogReader;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// let reader = CogReader::open_async("s3://bucket/path/to/file.tif").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
+    /// required metadata tags are missing or invalid, or the blocking task fails.
+    pub async fn open_async(source: &str) -> AnyResult<Self> {
+        Self::open_async_with_hint(source, OverviewQualityHint::ComputeAtRuntime).await
+    }
+
+    /// Async counterpart of [`CogReader::open_with_hint`]; see [`CogReader::open_async`].
+    ///
+    /// # Errors
+    /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
+    /// required metadata tags are missing or invalid, or the blocking task fails.
+    pub async fn open_async_with_hint(source: &str, hint: OverviewQualityHint) -> AnyResult<Self> {
+        let source = source.to_string();
+        tokio::task::spawn_blocking(move || Self::open_with_hint(&source, hint))
+            .await
+            .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    /// Run a synchronous operation on this reader (point queries, tile reads, ...) on tokio's
+    /// blocking thread pool, without blocking the async runtime.
+    ///
+    /// ```rust,no_run
+    /// use cogrs::{CogReader, PointQuery};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// let reader = CogReader::open_async("s3://bucket/file.tif").await?;
+    /// let result = reader.spawn_blocking(|r| r.sample_lonlat(-122.4, 37.8)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns the operation's error, or an error if the blocking task fails.
+    pub async fn spawn_blocking<F, T>(&self, f: F) -> AnyResult<T>
+    where
+        F: FnOnce(&CogReader) -> AnyResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let reader = self.clone_for_async();
+        tokio::task::spawn_blocking(move || f(&reader))
+            .await
+            .map_err(|e| format!("Task join error: {e}"))?
+    }
+
     /// Open a COG with a pre-computed overview quality hint
     ///
     /// Use this when you have pre-computed the overview quality (e.g., stored in a database)
     /// to skip the expensive runtime analysis that samples tiles.
+    ///
+    /// Blocking, like [`CogReader::open`]; from async code use
+    /// [`CogReader::open_async_with_hint`].
     ///
     /// # Errors
     /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
@@ -3477,5 +3547,69 @@ mod gdal_verification_tests {
             prev_width = overview.width;
             prev_height = overview.height;
         }
+    }
+}
+
+#[cfg(test)]
+mod async_open_tests {
+    use super::*;
+
+    // Async open / spawn_blocking (local synthetic file, no network)
+
+    /// Write a small single-band 3857 GeoTIFF and return its temp dir + path.
+    fn write_small_tiff() -> (tempfile::TempDir, String) {
+        use crate::geotiff_writer::GeoTiffCompression;
+        use crate::xyz_tile::{BoundingBox, ReprojectedRaster};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.tif");
+        let (w, h) = (64usize, 64usize);
+        let raster = ReprojectedRaster {
+            pixels: (0..w * h).map(|i| 1.0 + (i % 200) as f32).collect(),
+            bands: 1,
+            width: w,
+            height: h,
+            crs: 3857,
+            bounds: BoundingBox::new(0.0, 0.0, 6400.0, 6400.0),
+            resolution: (100.0, 100.0),
+            nodata: None,
+        };
+        raster.write_geotiff_compressed(&path, GeoTiffCompression::Deflate).unwrap();
+        let path = path.to_str().unwrap().to_string();
+        (dir, path)
+    }
+
+    async fn check_open_async() {
+        let (_dir, path) = write_small_tiff();
+        let reader = CogReader::open_async(&path).await.unwrap();
+        assert_eq!((reader.metadata.width, reader.metadata.height), (64, 64));
+
+        let hinted = CogReader::open_async_with_hint(&path, OverviewQualityHint::NoneUsable)
+            .await
+            .unwrap();
+        assert_eq!(hinted.metadata.width, 64);
+
+        let width = reader.spawn_blocking(|r| Ok(r.metadata.width)).await.unwrap();
+        assert_eq!(width, 64);
+
+        let err = CogReader::open_async("/nonexistent/definitely/missing.tif").await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_open_async_multi_thread() {
+        check_open_async().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_open_async_current_thread() {
+        check_open_async().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_sync_s3_open_inside_async_is_an_error_not_a_panic() {
+        // No network is needed: the guard fires before any request is made.
+        let err = CogReader::open("s3://cogrs-test-bucket/file.tif").err().expect("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("open_async"), "unexpected error: {msg}");
     }
 }
