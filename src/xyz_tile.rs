@@ -68,6 +68,12 @@ pub enum ResamplingMethod {
 #[derive(Debug, Clone)]
 pub struct TileData {
     /// Pixel values (interleaved if multi-band: R,G,B,R,G,B,...)
+    ///
+    /// Output pixels with no source data (outside the COG extent, or in sparse
+    /// source tiles) hold [`TileData::nodata`] if the COG declares one, else
+    /// `NaN`. With bilinear/bicubic resampling, any output pixel whose
+    /// interpolation window touches `NaN`/nodata falls back to the nearest
+    /// source sample rather than blending it in.
     pub pixels: Vec<f32>,
     /// Number of bands (1 for grayscale, 3 for RGB, 4 for RGBA)
     pub bands: usize,
@@ -81,6 +87,8 @@ pub struct TileData {
     pub tiles_read: usize,
     /// Overview level used (None = full resolution, Some(n) = overview index)
     pub overview_used: Option<usize>,
+    /// `NoData` value of the source COG (`None` if the COG declares none).
+    pub nodata: Option<f64>,
 }
 
 /// Bounding box in a coordinate reference system
@@ -1718,6 +1726,9 @@ fn extract_tile_with_overview(
 ) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
     let (tile_size_x, tile_size_y) = tile_size;
     let metadata = &reader.metadata;
+    // Value for output pixels with no source data: the COG's nodata if declared, else NaN.
+    let fill = fill_value(metadata.nodata);
+    let nodata_f32 = nodata_as_f32(metadata.nodata);
     let geo_transform = &metadata.geo_transform;
 
     // Pre-compute the affine transform from output pixel to source pixel
@@ -1851,18 +1862,19 @@ fn extract_tile_with_overview(
         }
     }
 
-    // If no tiles needed, return transparent tile
+    // Output entirely outside the COG: a tile of fill (nodata, or NaN if none declared)
     if needed_tiles.is_empty() {
         let output_bands: Vec<usize> = selected_bands.map_or_else(|| (0..metadata.bands).collect(), <[usize]>::to_vec);
         let num_output_bands = output_bands.len();
         return Ok(TileData {
-            pixels: vec![0.0; tile_size_x * tile_size_y * num_output_bands],
+            pixels: vec![fill; tile_size_x * tile_size_y * num_output_bands],
             bands: num_output_bands,
             width: tile_size_x,
             height: tile_size_y,
             bytes_fetched: 0,
             tiles_read: 0,
             overview_used: overview_idx,
+            nodata: metadata.nodata,
         });
     }
 
@@ -1871,6 +1883,8 @@ fn extract_tile_with_overview(
     let mut total_bytes_fetched: usize = 0;
     let mut tiles_actually_read: usize = 0;
 
+    // Source tiles with a zero byte count are sparse (never written); the reader
+    // returns them as all-NaN with 0 bytes. Any real I/O or decode error aborts.
     for &tile_idx in &needed_tiles {
         let tile_result = if let Some(ovr_idx) = overview_idx {
             reader.read_overview_tile_with_bytes(ovr_idx, tile_idx)
@@ -1878,25 +1892,21 @@ fn extract_tile_with_overview(
             reader.read_tile_with_bytes(tile_idx)
         };
 
-        if let Ok((data, bytes)) = tile_result {
-            tile_data_cache.insert(tile_idx, data);
-            total_bytes_fetched += bytes;
-            if bytes > 0 {
-                tiles_actually_read += 1;
-            }
+        let (data, bytes) = tile_result.map_err(|e| {
+            format!("Failed to read source tile {tile_idx} (overview {overview_idx:?}): {e}")
+        })?;
+        tile_data_cache.insert(tile_idx, data);
+        total_bytes_fetched += bytes;
+        if bytes > 0 {
+            tiles_actually_read += 1;
         }
-    }
-
-    // If all tile reads failed, try falling back to full resolution
-    if tile_data_cache.is_empty() && overview_idx.is_some() {
-        return extract_tile_with_overview(reader, extent_3857, tile_size, None, strategy, resampling, selected_bands);
     }
 
     // Determine output bands: selected or all
     let source_bands = metadata.bands;
     let output_bands: Vec<usize> = selected_bands.map_or_else(|| (0..source_bands).collect(), <[usize]>::to_vec);
     let num_output_bands = output_bands.len();
-    let mut pixel_data = vec![0.0_f32; tile_size_x * tile_size_y * num_output_bands];
+    let mut pixel_data = vec![fill; tile_size_x * tile_size_y * num_output_bands];
 
     // Pre-compute inverse scale for speed
     let inv_scale_x = 1.0 / scale[0];
@@ -2004,14 +2014,15 @@ fn extract_tile_with_overview(
 
             let out_idx = (out_y * tile_size_x + out_x) * num_output_bands;
 
+            // Nearest source pixel column (also the fallback for interpolation near invalid data)
+            #[allow(clippy::cast_possible_truncation)]
+            let src_px_int = src_pixel_x.round() as isize;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+            let src_px_clamped = src_px_int.max(0).min(eff_width as isize - 1) as usize;
+
             // Sample each band using the configured resampling method
             match resampling {
                 ResamplingMethod::Nearest => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let src_px_int = src_pixel_x.round() as isize;
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-                    let src_px_clamped = src_px_int.max(0).min(eff_width as isize - 1) as usize;
-
                     for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
                         if let Some(value) = sample_pixel(src_px_clamped, src_pixel_y_nearest, source_band) {
                             pixel_data[out_idx + out_band_idx] = value;
@@ -2041,24 +2052,26 @@ fn extract_tile_with_overview(
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
                     let y1c = y1.max(0).min(eff_height as isize - 1) as usize;
 
+                    #[allow(clippy::cast_possible_truncation)]
+                    let weight_x = fx as f32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let weight_y = fy as f32;
+
                     for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
-                        let v00 = sample_pixel(x0c, y0c, source_band).unwrap_or(0.0);
-                        let v10 = sample_pixel(x1c, y0c, source_band).unwrap_or(0.0);
-                        let v01 = sample_pixel(x0c, y1c, source_band).unwrap_or(0.0);
-                        let v11 = sample_pixel(x1c, y1c, source_band).unwrap_or(0.0);
-
-                        // Bilinear interpolation formula
-                        #[allow(clippy::cast_possible_truncation)]
-                        let weight_x = fx as f32;
-                        #[allow(clippy::cast_possible_truncation)]
-                        let weight_y = fy as f32;
-
-                        let value = v00 * (1.0 - weight_x) * (1.0 - weight_y)
-                                  + v10 * weight_x * (1.0 - weight_y)
-                                  + v01 * (1.0 - weight_x) * weight_y
-                                  + v11 * weight_x * weight_y;
-
-                        pixel_data[out_idx + out_band_idx] = value;
+                        let taps = [
+                            sample_pixel(x0c, y0c, source_band),
+                            sample_pixel(x1c, y0c, source_band),
+                            sample_pixel(x0c, y1c, source_band),
+                            sample_pixel(x1c, y1c, source_band),
+                        ];
+                        pixel_data[out_idx + out_band_idx] = bilinear_masked(
+                            taps,
+                            weight_x,
+                            weight_y,
+                            || sample_pixel(src_px_clamped, src_pixel_y_nearest, source_band),
+                            nodata_f32,
+                            fill,
+                        );
                     }
                 }
                 ResamplingMethod::Bicubic => {
@@ -2083,10 +2096,9 @@ fn extract_tile_with_overview(
                     ];
 
                     for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
-                        let mut sum = 0.0f32;
-                        let mut weight_sum = 0.0f32;
-
                         // Sample 4x4 grid centered around (x0, y0_floor)
+                        let mut taps = [(None, 0.0f32); 16];
+                        let mut n = 0;
                         for i in -1..=2isize {
                             #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
                             let px = (x0 + i).max(0).min(eff_width as isize - 1) as usize;
@@ -2094,16 +2106,19 @@ fn extract_tile_with_overview(
                             let wx = bicubic_weight(i as f64 - fx);
 
                             for &(py, wy) in &y_weights {
-                                if let Some(v) = sample_pixel(px, py, source_band) {
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    let w = (wx * wy) as f32;
-                                    sum += v * w;
-                                    weight_sum += w;
-                                }
+                                #[allow(clippy::cast_possible_truncation)]
+                                let w = (wx * wy) as f32;
+                                taps[n] = (sample_pixel(px, py, source_band), w);
+                                n += 1;
                             }
                         }
 
-                        pixel_data[out_idx + out_band_idx] = if weight_sum > 0.0 { sum / weight_sum } else { 0.0 };
+                        pixel_data[out_idx + out_band_idx] = bicubic_masked(
+                            &taps,
+                            || sample_pixel(src_px_clamped, src_pixel_y_nearest, source_band),
+                            nodata_f32,
+                            fill,
+                        );
                     }
                 }
             }
@@ -2121,12 +2136,312 @@ fn extract_tile_with_overview(
         bytes_fetched: total_bytes_fetched,
         tiles_read: tiles_actually_read,
         overview_used: overview_idx,
+        nodata: metadata.nodata,
     })
+}
+
+/// Value used for output pixels that have no source data: the COG's declared
+/// nodata (as `f32`), or `NaN` when none is declared.
+#[inline]
+fn fill_value(nodata: Option<f64>) -> f32 {
+    nodata_as_f32(nodata).unwrap_or(f32::NAN)
+}
+
+/// The nodata value in the `f32` domain pixels are stored in.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn nodata_as_f32(nodata: Option<f64>) -> Option<f32> {
+    nodata.map(|v| v as f32)
+}
+
+/// A sample is invalid if it is `NaN` or equals the nodata value.
+#[inline]
+fn is_invalid_sample(v: f32, nodata: Option<f32>) -> bool {
+    v.is_nan() || nodata.is_some_and(|nd| v == nd)
+}
+
+/// Bilinear interpolation over taps `[v00, v10, v01, v11]` (x then y order).
+///
+/// If any tap is missing, `NaN` or nodata, interpolating would bleed invalid
+/// data into the result, so the nearest sample is returned instead (itself
+/// passed through unchanged, or `fill` when it is missing).
+#[inline]
+fn bilinear_masked(
+    taps: [Option<f32>; 4],
+    weight_x: f32,
+    weight_y: f32,
+    nearest: impl FnOnce() -> Option<f32>,
+    nodata: Option<f32>,
+    fill: f32,
+) -> f32 {
+    if let [Some(v00), Some(v10), Some(v01), Some(v11)] = taps
+        && !taps.iter().flatten().any(|&v| is_invalid_sample(v, nodata))
+    {
+        return v00 * (1.0 - weight_x) * (1.0 - weight_y)
+            + v10 * weight_x * (1.0 - weight_y)
+            + v01 * (1.0 - weight_x) * weight_y
+            + v11 * weight_x * weight_y;
+    }
+    nearest().unwrap_or(fill)
+}
+
+/// Weighted bicubic interpolation over 16 `(value, weight)` taps.
+///
+/// Same masking rule as [`bilinear_masked`]: any invalid tap yields the nearest
+/// sample. Renormalising the remaining weights is not used because the
+/// Mitchell kernel has negative lobes, so partial weight sums are unstable.
+#[inline]
+fn bicubic_masked(
+    taps: &[(Option<f32>, f32); 16],
+    nearest: impl FnOnce() -> Option<f32>,
+    nodata: Option<f32>,
+    fill: f32,
+) -> f32 {
+    let mut sum = 0.0f32;
+    let mut weight_sum = 0.0f32;
+    for &(v, w) in taps {
+        match v {
+            Some(v) if !is_invalid_sample(v, nodata) => {
+                sum += v * w;
+                weight_sum += w;
+            }
+            _ => return nearest().unwrap_or(fill),
+        }
+    }
+    if weight_sum > 0.0 { sum / weight_sum } else { fill }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Fill / masked interpolation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_fill_value_selection() {
+        assert_eq!(fill_value(Some(-9999.0)), -9999.0);
+        assert_eq!(fill_value(Some(0.0)), 0.0);
+        assert_eq!(fill_value(Some(255.0)), 255.0);
+        assert!(fill_value(None).is_nan());
+    }
+
+    #[test]
+    fn test_is_invalid_sample() {
+        assert!(is_invalid_sample(f32::NAN, None));
+        assert!(is_invalid_sample(f32::NAN, Some(0.0)));
+        assert!(is_invalid_sample(0.0, Some(0.0)));
+        assert!(is_invalid_sample(-9999.0, Some(-9999.0)));
+        assert!(!is_invalid_sample(0.0, None));
+        assert!(!is_invalid_sample(1.0, Some(0.0)));
+        // NaN nodata: only NaN samples are invalid
+        let nan_nodata = nodata_as_f32(Some(f64::NAN));
+        assert!(is_invalid_sample(f32::NAN, nan_nodata));
+        assert!(!is_invalid_sample(5.0, nan_nodata));
+    }
+
+    /// Reference: the pre-existing bilinear formula.
+    fn bilinear_reference(t: [f32; 4], wx: f32, wy: f32) -> f32 {
+        t[0] * (1.0 - wx) * (1.0 - wy) + t[1] * wx * (1.0 - wy) + t[2] * (1.0 - wx) * wy + t[3] * wx * wy
+    }
+
+    #[test]
+    fn test_bilinear_masked_matches_formula_when_all_valid() {
+        let t = [10.0, 20.0, 30.0, 40.0];
+        for &(wx, wy) in &[(0.0, 0.0), (0.25, 0.75), (0.5, 0.5), (1.0, 1.0)] {
+            let got = bilinear_masked(t.map(Some), wx, wy, || panic!("nearest must not be needed"), Some(0.0), f32::NAN);
+            assert_eq!(got, bilinear_reference(t, wx, wy));
+        }
+        // 0.0 is a valid sample when no nodata is declared
+        let got = bilinear_masked([Some(0.0), Some(4.0), Some(0.0), Some(4.0)], 0.5, 0.5, || panic!(), None, f32::NAN);
+        assert_eq!(got, 2.0);
+    }
+
+    #[test]
+    fn test_bilinear_masked_invalid_tap_falls_back_to_nearest() {
+        let taps = [Some(10.0), Some(f32::NAN), Some(30.0), Some(40.0)];
+        assert_eq!(bilinear_masked(taps, 0.3, 0.3, || Some(10.0), None, -1.0), 10.0);
+        // nodata tap, even with zero weight, must not be blended in
+        let taps = [Some(10.0), Some(0.0), Some(30.0), Some(40.0)];
+        assert_eq!(bilinear_masked(taps, 0.0, 0.0, || Some(10.0), Some(0.0), -1.0), 10.0);
+        // missing tap (unread source tile)
+        let taps = [Some(10.0), None, Some(30.0), Some(40.0)];
+        assert_eq!(bilinear_masked(taps, 0.9, 0.9, || Some(40.0), None, -1.0), 40.0);
+        // nearest is itself invalid: passed through, not replaced by fill
+        let taps = [Some(0.0), Some(1.0), Some(2.0), Some(3.0)];
+        assert_eq!(bilinear_masked(taps, 0.1, 0.1, || Some(0.0), Some(0.0), -1.0), 0.0);
+        assert!(bilinear_masked(taps, 0.1, 0.1, || Some(f32::NAN), Some(0.0), -1.0).is_nan());
+        // nearest missing -> fill
+        assert_eq!(bilinear_masked([None; 4], 0.5, 0.5, || None, None, -1.0), -1.0);
+        assert!(bilinear_masked([None; 4], 0.5, 0.5, || None, None, f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn test_bicubic_masked_matches_formula_when_all_valid() {
+        let mut taps = [(Some(0.0f32), 0.0f32); 16];
+        let (mut sum, mut wsum) = (0.0f32, 0.0f32);
+        for (i, tap) in taps.iter_mut().enumerate() {
+            let v = 10.0 + i as f32;
+            let w = bicubic_weight(i as f64 * 0.1 - 0.7) as f32;
+            *tap = (Some(v), w);
+            sum += v * w;
+            wsum += w;
+        }
+        let got = bicubic_masked(&taps, || panic!("nearest must not be needed"), Some(0.0), f32::NAN);
+        assert_eq!(got, sum / wsum);
+    }
+
+    #[test]
+    fn test_bicubic_masked_invalid_tap_falls_back_to_nearest() {
+        let mut taps = [(Some(50.0f32), 1.0 / 16.0); 16];
+        taps[7].0 = Some(f32::NAN);
+        assert_eq!(bicubic_masked(&taps, || Some(50.0), None, -1.0), 50.0);
+        taps[7].0 = Some(0.0); // nodata
+        assert_eq!(bicubic_masked(&taps, || Some(50.0), Some(0.0), -1.0), 50.0);
+        taps[7].0 = None; // missing
+        assert_eq!(bicubic_masked(&taps, || Some(50.0), None, -1.0), 50.0);
+        // nearest missing -> fill
+        assert_eq!(bicubic_masked(&taps, || None, None, -1.0), -1.0);
+        // degenerate weights with all-valid taps -> fill
+        let zero_w = [(Some(5.0f32), 0.0f32); 16];
+        assert_eq!(bicubic_masked(&zero_w, || panic!(), None, -1.0), -1.0);
+    }
+
+    // ------------------------------------------------------------------
+    // End-to-end edge tile (synthetic GeoTIFF written with GeoTiffWriter)
+    // ------------------------------------------------------------------
+
+    /// Width in pixels (of 256) of the synthetic raster inside tile 2/1/1.
+    const EDGE_RASTER_W: usize = 100;
+
+    /// Write a 1-band f32 GeoTIFF in EPSG:3857 covering the left `EDGE_RASTER_W`
+    /// columns of XYZ tile 2/1/1 at that tile's resolution. Values are in 1..=250
+    /// (never 0) so zero fill / zero blending is detectable.
+    fn write_edge_raster(path: &std::path::Path, nodata: Option<f64>) {
+        use crate::geotiff_writer::GeoTiffCompression;
+        let tile = BoundingBox::from_xyz(2, 1, 1);
+        let res = (tile.maxx - tile.minx) / 256.0;
+        let mut pixels = Vec::with_capacity(EDGE_RASTER_W * 256);
+        for y in 0..256usize {
+            for x in 0..EDGE_RASTER_W {
+                pixels.push(1.0 + ((x * 7 + y * 3) % 250) as f32);
+            }
+        }
+        let raster = ReprojectedRaster {
+            pixels,
+            bands: 1,
+            width: EDGE_RASTER_W,
+            height: 256,
+            crs: 3857,
+            // Shifted a quarter pixel so output pixel centers never sit exactly on a
+            // rounding boundary of the source grid (nearest then maps pixel i -> i).
+            bounds: BoundingBox::new(
+                tile.minx + 0.25 * res,
+                tile.miny,
+                tile.minx + 0.25 * res + res * EDGE_RASTER_W as f64,
+                tile.maxy - 0.25 * res,
+            ),
+            resolution: (res, res),
+            nodata,
+        };
+        raster.write_geotiff_compressed(path, GeoTiffCompression::Deflate).unwrap();
+    }
+
+    async fn extract_edge_tile(reader: &CogReader, resampling: ResamplingMethod) -> TileData {
+        TileExtractor::new(reader).xyz(2, 1, 1).size(256).resampling(resampling).extract().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_edge_tile_outside_extent_is_nan_and_transparent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge_no_nodata.tif");
+        write_edge_raster(&path, None);
+        let reader = CogReader::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(reader.metadata.nodata, None);
+
+        for method in [ResamplingMethod::Nearest, ResamplingMethod::Bilinear, ResamplingMethod::Bicubic] {
+            let tile = extract_edge_tile(&reader, method).await;
+            assert_eq!((tile.width, tile.height, tile.bands), (256, 256, 1));
+            let at = |x: usize, y: usize| tile.pixels[y * 256 + x];
+
+            // Clearly outside: NaN, in every row
+            for y in 0..256 {
+                for x in (EDGE_RASTER_W + 4)..256 {
+                    assert!(at(x, y).is_nan(), "{method:?}: ({x},{y}) should be NaN, got {}", at(x, y));
+                }
+            }
+            // Inside (and up to the edge pixels): valid data in 1..=250, never 0 or NaN.
+            // Skip the first/last rows and columns where interpolation windows leave the raster.
+            for y in 4..252 {
+                for x in 0..(EDGE_RASTER_W - 4) {
+                    let v = at(x, y);
+                    // Bicubic (Mitchell) can overshoot slightly
+                    let slack = if method == ResamplingMethod::Bicubic { 25.0 } else { 0.0 };
+                    assert!((1.0 - slack..=250.0 + slack).contains(&v), "{method:?}: ({x},{y}) = {v}");
+                }
+            }
+            // The transition band never produces zeros (old zero-fill/zero-blend bug)
+            for y in 0..256 {
+                for x in 0..256 {
+                    assert_ne!(at(x, y), 0.0, "{method:?}: ({x},{y}) is 0.0");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_edge_tile_nearest_values_match_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge_values.tif");
+        write_edge_raster(&path, None);
+        let reader = CogReader::open(path.to_str().unwrap()).unwrap();
+        let tile = extract_edge_tile(&reader, ResamplingMethod::Nearest).await;
+        let mut checked = 0;
+        for y in 0..256usize {
+            for x in 0..(EDGE_RASTER_W - 2) {
+                let expected = 1.0 + ((x * 7 + y * 3) % 250) as f32;
+                assert_eq!(tile.pixels[y * 256 + x], expected, "({x},{y})");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 256 * (EDGE_RASTER_W - 2));
+    }
+
+    #[tokio::test]
+    async fn test_tile_fully_outside_extent_is_all_nan() {
+        // The GeoTIFF writer emits no GDAL_NODATA tag, so the declared-nodata
+        // fill is covered by test_fill_value_selection instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outside.tif");
+        write_edge_raster(&path, None);
+        let reader = CogReader::open(path.to_str().unwrap()).unwrap();
+        // Tile 2/2/2 (southeast) does not intersect the raster at all
+        let tile = TileExtractor::new(&reader).xyz(2, 2, 2).size(64).extract().await.unwrap();
+        assert_eq!(tile.pixels.len(), 64 * 64);
+        assert!(tile.pixels.iter().all(|v| v.is_nan()));
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_source_tile_propagates_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.tif");
+        write_edge_raster(&path, None);
+        // Overwrite the compressed data of every strip with garbage
+        let (offsets, counts) = {
+            let r = CogReader::open(path.to_str().unwrap()).unwrap();
+            (r.metadata.tile_offsets.clone(), r.metadata.tile_byte_counts.clone())
+        };
+        let mut bytes = std::fs::read(&path).unwrap();
+        for (&o, &c) in offsets.iter().zip(&counts) {
+            bytes[o as usize..(o + c) as usize].fill(0xFF);
+        }
+        let path2 = dir.path().join("corrupt2.tif");
+        std::fs::write(&path2, bytes).unwrap();
+        let reader = CogReader::open(path2.to_str().unwrap()).unwrap();
+        let err = TileExtractor::new(&reader).xyz(2, 1, 1).size(64).extract().await.unwrap_err();
+        assert!(err.to_string().contains("Failed to read source tile"), "{err}");
+    }
 
     #[test]
     fn test_bbox_from_xyz() {
@@ -2596,13 +2911,18 @@ mod global_cog_tests {
 
         println!("Valid pixels - 4326: {}, 3857: {}, UTM: {}", valid_4326, valid_3857, valid_utm);
 
-        // Calculate mean values for comparison (rough check that we're getting similar data)
-        let mean_4326: f64 = tile_4326.pixels.iter().map(|&v| f64::from(v)).sum::<f64>()
-            / tile_4326.pixels.len() as f64;
-        let mean_3857: f64 = tile_3857.pixels.iter().map(|&v| f64::from(v)).sum::<f64>()
-            / tile_3857.pixels.len() as f64;
-        let mean_utm: f64 = tile_utm.pixels.iter().map(|&v| f64::from(v)).sum::<f64>()
-            / tile_utm.pixels.len() as f64;
+        // Mean over valid pixels only: out-of-extent pixels hold nodata or NaN
+        let valid_mean = |t: &TileData| -> f64 {
+            let (sum, n) = t
+                .pixels
+                .iter()
+                .filter(|&&v| !is_invalid_sample(v, nodata_as_f32(t.nodata)))
+                .fold((0.0f64, 0usize), |(s, n), &v| (s + f64::from(v), n + 1));
+            sum / n.max(1) as f64
+        };
+        let mean_4326 = valid_mean(&tile_4326);
+        let mean_3857 = valid_mean(&tile_3857);
+        let mean_utm = valid_mean(&tile_utm);
 
         println!("Mean values - 4326: {:.2}, 3857: {:.2}, UTM: {:.2}", mean_4326, mean_3857, mean_utm);
 

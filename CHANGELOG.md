@@ -8,10 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `TileData::nodata`: the source COG's nodata value, set at extraction time
 - `PrefixCachedRangeReader`: serves reads inside the first 16 KiB of a source from
   memory. `CogReader::open` now wraps non-local readers with it, so opening a remote
   COG costs a single header request instead of many small sequential ones
 - `RangeReader::has_prefix_cache()` (default method, returns `false`)
+
+### Changed
+
+- **Breaking:** `TileData` has a new public field `nodata`; code constructing it with a
+  struct literal must set it
+- Output pixels with no source data (outside the COG extent, entirely outside tiles,
+  sparse source tiles) are now filled with the COG's nodata value, or `NaN` if none is
+  declared, instead of `0.0`. Unchanged for COGs with `nodata = 0`
+- Bilinear and bicubic resampling no longer blend `NaN`, nodata or unavailable samples
+  into neighbouring pixels; if any sample in the interpolation window is invalid the
+  nearest source sample is used. This removes dark fringes along nodata boundaries
+- Failures reading or decoding a source tile during extraction now return an error
+  instead of silently leaving a hole in the output (and, for overviews, instead of
+  retrying at full resolution). Sparse tiles (zero byte count) are still valid and
+  produce nodata/`NaN` pixels
 
 ### Fixed
 
