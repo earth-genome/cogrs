@@ -18,7 +18,8 @@
 
 use crate::async_io::{block_on_io, AsyncRangeReader, AsyncToSync, IoOptions, SyncToAsync};
 use crate::range_reader::{create_range_reader, RangeReader};
-use crate::remote::create_async_range_reader;
+use crate::header_cache::{CacheMode, CogCache, ReaderOrigin};
+use crate::remote::{create_async_range_reader_with, Validation};
 use crate::tile_cache;
 use crate::tiff_utils::AnyResult;
 use bytes::Bytes;
@@ -416,6 +417,76 @@ pub struct CogReader {
     pub min_usable_overview: Option<usize>,
     /// Identity decoded tiles are cached and de-duplicated under: identifier plus version.
     cache_id: Arc<str>,
+    /// The overview quality hint this reader was opened with (kept to reopen it the same way).
+    hint: OverviewQualityHint,
+    /// Where the reader came from, for remote sources opened through the header cache.
+    origin: Option<Arc<ReaderOrigin>>,
+}
+
+/// Opens a [`CogReader`] with explicit settings; start with [`CogReader::builder`].
+///
+/// Remote sources (`s3://`, `http(s)://`) are opened through a [`CogCache`]: the process-wide
+/// [`CogCache::global`] unless [`cache`](Self::cache) says otherwise. Local files are not cached.
+#[derive(Clone)]
+pub struct CogReaderBuilder {
+    source: String,
+    hint: OverviewQualityHint,
+    options: IoOptions,
+    cache: CogCache,
+    mode: CacheMode,
+}
+
+impl CogReaderBuilder {
+    /// Overview quality hint (default [`OverviewQualityHint::ComputeAtRuntime`]; the computed
+    /// result is cached per source).
+    #[must_use]
+    pub fn hint(mut self, hint: OverviewQualityHint) -> Self {
+        self.hint = hint;
+        self
+    }
+
+    /// I/O tuning (default [`IoOptions::default`]).
+    #[must_use]
+    pub fn io_options(mut self, options: IoOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Header cache to use instead of the global one; [`CogCache::disabled`] turns caching off.
+    #[must_use]
+    pub fn cache(mut self, cache: &CogCache) -> Self {
+        self.cache = cache.clone();
+        self
+    }
+
+    /// Whether to use, bypass or refresh the cached header (default [`CacheMode::Use`]).
+    #[must_use]
+    pub fn cache_mode(mut self, mode: CacheMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Open the source without blocking the async runtime.
+    ///
+    /// # Errors
+    /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
+    /// or required metadata tags are missing or invalid.
+    pub async fn open_async(self) -> AnyResult<CogReader> {
+        self.cache.open(&self.source, self.hint, &self.options, self.mode).await
+    }
+
+    /// Open the source, blocking the calling thread (see [`CogReader::open`]).
+    ///
+    /// # Errors
+    /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
+    /// or required metadata tags are missing or invalid.
+    pub fn open(self) -> AnyResult<CogReader> {
+        if is_remote_source(&self.source) {
+            block_on_io(async move { self.open_async().await })?
+        } else {
+            CogReader::open_with_hint(&self.source, self.hint)
+        }
+    }
 }
 
 impl CogReader {
@@ -474,8 +545,86 @@ impl CogReader {
         hint: OverviewQualityHint,
         options: &IoOptions,
     ) -> AnyResult<Self> {
-        let reader = create_async_range_reader(source, options).await?;
-        Self::from_async_reader_with_hint(reader, hint).await
+        Self::builder(source).hint(hint).io_options(options.clone()).open_async().await
+    }
+
+    /// Start opening `source` with explicit cache and I/O settings; see [`CogReaderBuilder`].
+    ///
+    /// ```rust,no_run
+    /// use cogrs::{CacheConfig, CogCache, CogReader};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// let cache = CogCache::new(CacheConfig::default());
+    /// let reader = CogReader::builder("s3://bucket/file.tif").cache(&cache).open_async().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn builder(source: &str) -> CogReaderBuilder {
+        CogReaderBuilder {
+            source: source.to_string(),
+            hint: OverviewQualityHint::ComputeAtRuntime,
+            options: IoOptions::default(),
+            cache: CogCache::global(),
+            mode: CacheMode::Use,
+        }
+    }
+
+    /// Open without the header cache; reads of a remote source are conditioned per `validation`.
+    pub(crate) async fn open_uncached(
+        source: &str,
+        hint: OverviewQualityHint,
+        options: &IoOptions,
+        validation: Validation,
+        origin: Option<Arc<ReaderOrigin>>,
+    ) -> AnyResult<Self> {
+        let reader = create_async_range_reader_with(source, options, validation).await?;
+        let mut cog = Self::from_async_reader_with_hint(reader, hint).await?;
+        cog.origin = origin;
+        Ok(cog)
+    }
+
+    /// A reader over already-parsed metadata (a header cache hit); the quality hint is applied
+    /// except `ComputeAtRuntime`, which the caller computes.
+    pub(crate) fn from_cached(
+        reader: Arc<dyn AsyncRangeReader>,
+        metadata: Arc<CogMetadata>,
+        overviews: Arc<[OverviewMetadata]>,
+        hint: OverviewQualityHint,
+        origin: Option<Arc<ReaderOrigin>>,
+    ) -> Self {
+        let min_usable_overview = match hint {
+            OverviewQualityHint::AllUsable => overviews.len().checked_sub(1),
+            OverviewQualityHint::NoneUsable | OverviewQualityHint::ComputeAtRuntime => None,
+            OverviewQualityHint::MinUsable(n) => Some(n),
+        };
+        let mut cog = Self::from_parts(reader, metadata, overviews, min_usable_overview);
+        cog.hint = hint;
+        cog.origin = origin;
+        cog
+    }
+
+    /// Open this source again after a read reported it changed ([`SourceChanged`](crate::SourceChanged)).
+    ///
+    /// The decoded tiles of the version this reader describes are dropped first, so they can
+    /// never be served again. For a source opened through the header cache, the cached header
+    /// for that version is dropped too (unless a concurrent caller already replaced it) and the
+    /// source is opened through the cache, so concurrent callers share one request. The result
+    /// has the same overview quality hint as this reader and describes the object as it is now.
+    ///
+    /// The extraction and point-query entry points call this themselves, once per operation.
+    ///
+    /// # Errors
+    /// Returns an error if the source cannot be opened again (for readers of in-memory data
+    /// there is nothing to reopen).
+    pub async fn reopen_after_change(&self) -> AnyResult<Self> {
+        tile_cache::invalidate_identity(&self.cache_id);
+        if let Some(origin) = &self.origin {
+            origin.cache.reopen_stale(&origin.source, self.hint, &origin.options, self.async_io.version()).await
+        } else {
+            let reader = self.async_io.reopen().await?;
+            Self::from_async_reader_with_hint(reader, self.hint).await
+        }
     }
 
     /// Run a synchronous operation on this reader (point queries, tile reads, ...) on tokio's
@@ -556,7 +705,7 @@ impl CogReader {
         let sync_io: Arc<dyn RangeReader> = Arc::new(AsyncToSync::new(Arc::clone(&reader)));
         let mut cog = Self::assemble(reader, sync_io, structure, hint);
         if matches!(hint, OverviewQualityHint::ComputeAtRuntime) {
-            cog.min_usable_overview = cog.analyze_overview_quality_async().await;
+            cog.min_usable_overview = cog.analyze_overview_quality_async().await.0;
         }
         Ok(cog)
     }
@@ -574,7 +723,11 @@ impl CogReader {
     ) -> Self {
         let sync_io: Arc<dyn RangeReader> = Arc::new(AsyncToSync::new(Arc::clone(&reader)));
         let cache_id = tile_cache::source_id(reader.identifier(), reader.version());
-        Self { async_io: reader, sync_io, metadata, overviews, min_usable_overview, cache_id }
+        let hint = match min_usable_overview {
+            Some(n) => OverviewQualityHint::MinUsable(n),
+            None => OverviewQualityHint::NoneUsable,
+        };
+        Self { async_io: reader, sync_io, metadata, overviews, min_usable_overview, cache_id, hint, origin: None }
     }
 
     /// Source identifier (path or URL).
@@ -619,6 +772,8 @@ impl CogReader {
             overviews: overviews.into(),
             min_usable_overview,
             cache_id,
+            hint,
+            origin: None,
         }
     }
 
@@ -687,7 +842,7 @@ impl CogReader {
         if self.overviews.is_empty() {
             return OverviewQualityHint::AllUsable;
         }
-        match self.analyze_overview_quality_async().await {
+        match self.analyze_overview_quality_async().await.0 {
             None => OverviewQualityHint::NoneUsable,
             Some(idx) => OverviewQualityHint::MinUsable(idx),
         }
@@ -718,8 +873,10 @@ impl CogReader {
     }
 
     /// Same analysis as [`Self::analyze_overview_quality_impl`], fetching each level's sample
-    /// tiles concurrently.
-    async fn analyze_overview_quality_async(&self) -> Option<usize> {
+    /// tiles concurrently. The flag is false if a sample tile failed to read (it then counts as
+    /// having no valid data, as before): such a result is not worth remembering.
+    pub(crate) async fn analyze_overview_quality_async(&self) -> (Option<usize>, bool) {
+        let mut complete = true;
         for (idx, ovr) in self.overviews.iter().enumerate().rev() {
             let samples = overview_sample_indices(ovr.tile_offsets.len());
             let reads = futures::future::join_all(
@@ -728,15 +885,20 @@ impl CogReader {
             .await;
             let mut total_pixels = 0usize;
             let mut valid_pixels = 0usize;
-            for (data, _) in reads.into_iter().flatten() {
-                total_pixels += data.len();
-                valid_pixels += valid_sample_count(&data);
+            for read in reads {
+                match read {
+                    Ok((data, _)) => {
+                        total_pixels += data.len();
+                        valid_pixels += valid_sample_count(&data);
+                    }
+                    Err(_) => complete = false,
+                }
             }
             if overview_density(valid_pixels, total_pixels) >= MIN_OVERVIEW_DENSITY {
-                return Some(idx);
+                return (Some(idx), complete);
             }
         }
-        None
+        (None, complete)
     }
 
     /// Find the best overview level for a given source extent size
@@ -1171,7 +1333,7 @@ fn read_f64(bytes: &[u8], little_endian: bool) -> f64 {
 }
 
 /// True for sources that are fetched over the network (`s3://`, `http://`, `https://`).
-fn is_remote_source(source: &str) -> bool {
+pub(crate) fn is_remote_source(source: &str) -> bool {
     source.starts_with("s3://") || source.starts_with("http://") || source.starts_with("https://")
 }
 
@@ -1210,9 +1372,9 @@ fn overview_density(valid_pixels: usize, total_pixels: usize) -> f64 {
 
 /// What `open` learns from the file structure (header and IFD chain), before any overview
 /// quality hint is applied.
-struct CogStructure {
-    metadata: CogMetadata,
-    overviews: Vec<OverviewMetadata>,
+pub(crate) struct CogStructure {
+    pub(crate) metadata: CogMetadata,
+    pub(crate) overviews: Vec<OverviewMetadata>,
 }
 
 /// One IFD's entries (value bytes not yet fetched) and the offset of the next IFD.
@@ -1226,7 +1388,7 @@ struct Ifd {
 /// IFD tables are read first; the (possibly large) tile offset/byte-count arrays and other tag
 /// values are then fetched concurrently, so a COG with many overviews costs one round trip
 /// for them rather than one per array.
-async fn parse_cog_structure(io: &dyn AsyncRangeReader) -> AnyResult<CogStructure> {
+pub(crate) async fn parse_cog_structure(io: &dyn AsyncRangeReader) -> AnyResult<CogStructure> {
     // Read header to get IFD offset and byte order
     let header_bytes = io.read_range(0, 8).await?;
 

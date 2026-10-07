@@ -167,6 +167,49 @@ pub enum Validation {
     Immutable,
 }
 
+/// What a server reported about an object when it was opened: enough to rebuild a reader for it
+/// without sending a request (see the header cache).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectIdentity {
+    pub size: u64,
+    pub etag: Option<String>,
+    /// `None` when the server sent no `Last-Modified` (`object_store` reports the epoch then).
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ObjectIdentity {
+    fn from_meta(meta: &ObjectMeta) -> Self {
+        Self {
+            size: meta.size,
+            etag: meta.e_tag.clone(),
+            last_modified: (meta.last_modified.timestamp() > 0).then_some(meta.last_modified),
+        }
+    }
+
+    /// Token that changes with the object's content: its ETag, else `"{size}:{last-modified}"`.
+    pub(crate) fn version(&self) -> String {
+        self.etag.clone().unwrap_or_else(|| {
+            format!("{}:{}", self.size, self.last_modified.map_or(0, |t| t.timestamp()))
+        })
+    }
+
+    fn precondition(&self, validation: Validation) -> Precondition {
+        if validation != Validation::IfMatch {
+            return Precondition::None;
+        }
+        match (&self.etag, self.last_modified) {
+            (Some(etag), _) if !etag.starts_with("W/") => Precondition::IfMatch(etag.clone()),
+            (_, Some(time)) => Precondition::UnmodifiedSince(time),
+            _ => Precondition::None,
+        }
+    }
+
+    /// Whether reads under `validation` carry a condition that detects a replaced object.
+    pub(crate) fn is_validatable(&self, validation: Validation) -> bool {
+        !matches!(self.precondition(validation), Precondition::None)
+    }
+}
+
 /// The condition attached to every range request after the open.
 #[derive(Clone)]
 enum Precondition {
@@ -176,18 +219,6 @@ enum Precondition {
 }
 
 impl Precondition {
-    fn of(meta: &ObjectMeta, validation: Validation) -> Self {
-        if validation != Validation::IfMatch {
-            return Self::None;
-        }
-        match &meta.e_tag {
-            Some(etag) if !etag.starts_with("W/") => Self::IfMatch(etag.clone()),
-            // object_store reports a missing Last-Modified as the epoch.
-            _ if meta.last_modified.timestamp() > 0 => Self::UnmodifiedSince(meta.last_modified),
-            _ => Self::None,
-        }
-    }
-
     fn apply(&self, options: &mut GetOptions) {
         match self {
             Self::None => {}
@@ -197,18 +228,152 @@ impl Precondition {
     }
 }
 
+/// The object does not exist (`404`). Returned (instead of a plain message) by the open
+/// functions so the header cache can remember it for a short time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceNotFound {
+    message: String,
+}
+
+impl std::fmt::Display for SourceNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SourceNotFound {}
+
+impl SourceNotFound {
+    pub(crate) fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+/// `message` as an error: [`SourceNotFound`] if `cause` is a `404`, else a plain message.
+fn open_failure(cause: &(dyn std::error::Error + 'static), message: String) -> Box<dyn std::error::Error + Send + Sync> {
+    if cause.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) {
+        Box::new(SourceNotFound { message })
+    } else {
+        message.into()
+    }
+}
+
+/// Where an object lives: the shared client and limiter, the path in the store and the
+/// identifier (URL without query).
+struct Target {
+    entry: Arc<StoreEntry>,
+    path: ObjectPath,
+    identifier: String,
+}
+
+async fn s3_target(config: &S3Config, options: &IoOptions) -> AnyResult<Target> {
+    Ok(Target {
+        entry: s3_store_entry(config, options).await?,
+        path: ObjectPath::from(config.key.as_str()),
+        identifier: format!("s3://{}/{}", config.bucket, config.key),
+    })
+}
+
+/// A query string is sent unchanged with every request (presigned or SAS URLs work); such URLs
+/// get a private client rather than a shared one, and the query is left out of the identifier.
+fn http_target(source: &str, options: &IoOptions) -> AnyResult<Target> {
+    let url = url::Url::parse(source)?;
+    let host = url.host_str().ok_or("Missing host in URL")?.to_string();
+    let path = ObjectPath::from_url_path(url.path())?;
+    if path.as_ref().is_empty() {
+        return Err(format!("Missing object path in URL: {source}").into());
+    }
+    let mut base = url.clone();
+    base.set_path("/");
+    base.set_fragment(None);
+    let has_query = base.query().is_some();
+    let mut identifier = url.clone();
+    identifier.set_query(None);
+    identifier.set_fragment(None);
+    let identifier = identifier.to_string();
+
+    let allow_http = url.scheme() == "http";
+    let build = || -> AnyResult<Arc<dyn ObjectStore>> {
+        Ok(Arc::new(
+            HttpBuilder::new()
+                .with_url(base.as_str())
+                .with_client_options(client_options(options, allow_http))
+                .with_retry(retry_config(options))
+                .build()?,
+        ))
+    };
+    let entry = if has_query {
+        Arc::new(StoreEntry {
+            store: build()?,
+            limiter: Arc::new(Semaphore::new(options.max_in_flight_per_store.max(1))),
+        })
+    } else {
+        let key = format!("http|{}://{}:{:?}|{:?}", url.scheme(), host, url.port(), options);
+        shared_store(&key, options, build)?
+    };
+    Ok(Target { entry, path, identifier })
+}
+
+async fn resolve_target(source: &str, options: &IoOptions) -> AnyResult<Target> {
+    if source.starts_with("s3://") {
+        s3_target(&S3Config::from_url(source)?, options).await
+    } else if source.starts_with("http://") || source.starts_with("https://") {
+        http_target(source, options)
+    } else {
+        Err(format!("Not a remote URL (expected s3://, http:// or https://): {source}").into())
+    }
+}
+
+/// The parts of a remote source's identity that are known without any I/O.
+pub(crate) struct SourceKeyParts {
+    /// Which server and credentials the object is read through. Excludes the query string.
+    pub origin: String,
+    /// Object path within the origin
+    pub path: String,
+    /// URL without query or fragment ([`AsyncRangeReader::identifier`])
+    pub identifier: String,
+}
+
+pub(crate) fn source_key_parts(source: &str) -> AnyResult<SourceKeyParts> {
+    if source.starts_with("s3://") {
+        let config = S3Config::from_url(source)?;
+        Ok(SourceKeyParts {
+            origin: format!(
+                "s3|{}|{:?}|{:?}|{:?}|{}|{}",
+                config.bucket,
+                config.endpoint_url,
+                config.access_key_id,
+                config.secret_access_key.as_deref().map(fingerprint),
+                config.allow_http,
+                config.skip_signature,
+            ),
+            identifier: format!("s3://{}/{}", config.bucket, config.key),
+            path: config.key,
+        })
+    } else if source.starts_with("http://") || source.starts_with("https://") {
+        let mut url = url::Url::parse(source)?;
+        let host = url.host_str().ok_or("Missing host in URL")?.to_string();
+        let origin = format!("http|{}://{}:{:?}", url.scheme(), host, url.port());
+        url.set_query(None);
+        url.set_fragment(None);
+        Ok(SourceKeyParts { origin, path: url.path().to_string(), identifier: url.to_string() })
+    } else {
+        Err(format!("Not a remote URL (expected s3://, http:// or https://): {source}").into())
+    }
+}
+
 /// Async range reader over one S3 or HTTP(S) object.
 pub struct ObjectStoreRangeReader {
     store: Arc<dyn ObjectStore>,
     limiter: Arc<Semaphore>,
     path: ObjectPath,
-    size: u64,
     identifier: String,
-    prefix: Bytes,
-    etag: Option<String>,
-    /// Identity of this version of the object: its ETag, else `"{size}:{last-modified}"`.
+    identity: ObjectIdentity,
+    /// Version token ([`ObjectIdentity::version`])
     version: String,
-    last_modified: Option<i64>,
+    /// First bytes of the object, kept from the open (empty for readers rebuilt from a cached
+    /// identity); reads inside it are served from memory.
+    prefix: Bytes,
     options: IoOptions,
     validation: Validation,
     precondition: Precondition,
@@ -258,81 +423,34 @@ impl ObjectStoreRangeReader {
     /// # Errors
     /// Returns an error if the configuration is invalid or the object cannot be read.
     pub async fn open_s3_with(config: S3Config, options: &IoOptions, validation: Validation) -> AnyResult<Self> {
-        let entry = s3_store_entry(&config, options).await?;
-
-        let identifier = format!("s3://{}/{}", config.bucket, config.key);
-        let path = ObjectPath::from(config.key.as_str());
-        Self::open_object(entry, path, identifier, options, validation).await.map_err(|e| {
-            let missing_credentials_hint = !config.skip_signature
-                && config.access_key_id.is_none()
-                && !e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. }));
+        let target = s3_target(&config, options).await?;
+        Self::open_object(target, options, validation).await.map_err(|e| {
+            let not_found = e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. }));
+            let missing_credentials_hint = !config.skip_signature && config.access_key_id.is_none() && !not_found;
             let hint = if missing_credentials_hint {
                 ". No AWS credentials are configured; if this is a public bucket set \
                  AWS_SKIP_SIGNATURE=true (or S3Config::skip_signature) for anonymous access"
             } else {
                 ""
             };
-            format!("Failed to open s3://{}/{}: {e}{hint}", config.bucket, config.key).into()
+            open_failure(&*e, format!("Failed to open s3://{}/{}: {e}{hint}", config.bucket, config.key))
         })
     }
 
-    /// Open an `http://` / `https://` object.
-    ///
-    /// A query string is sent unchanged with every request (presigned or SAS URLs work);
-    /// such URLs get a private client rather than a shared one, and the query is left out of
-    /// [`identifier`](AsyncRangeReader::identifier).
+    /// Open an `http://` / `https://` object (see [`http_target`] for query strings).
     async fn open_http(source: &str, options: &IoOptions, validation: Validation) -> AnyResult<Self> {
-        let url = url::Url::parse(source)?;
-        let host = url.host_str().ok_or("Missing host in URL")?.to_string();
-        let path = ObjectPath::from_url_path(url.path())?;
-        if path.as_ref().is_empty() {
-            return Err(format!("Missing object path in URL: {source}").into());
-        }
-        let mut base = url.clone();
-        base.set_path("/");
-        base.set_fragment(None);
-        let has_query = base.query().is_some();
-        let mut identifier = url.clone();
-        identifier.set_query(None);
-        identifier.set_fragment(None);
-        let identifier = identifier.to_string();
-
-        let allow_http = url.scheme() == "http";
-        let build = || -> AnyResult<Arc<dyn ObjectStore>> {
-            Ok(Arc::new(
-                HttpBuilder::new()
-                    .with_url(base.as_str())
-                    .with_client_options(client_options(options, allow_http))
-                    .with_retry(retry_config(options))
-                    .build()?,
-            ))
-        };
-        let entry = if has_query {
-            Arc::new(StoreEntry {
-                store: build()?,
-                limiter: Arc::new(Semaphore::new(options.max_in_flight_per_store.max(1))),
-            })
-        } else {
-            let key = format!("http|{}://{}:{:?}|{:?}", url.scheme(), host, url.port(), options);
-            shared_store(&key, options, build)?
-        };
-
-        Self::open_object(entry, path, identifier.clone(), options, validation)
+        let target = http_target(source, options)?;
+        let identifier = target.identifier.clone();
+        Self::open_object(target, options, validation)
             .await
-            .map_err(|e| format!("Failed to open {identifier}: {e}").into())
+            .map_err(|e| open_failure(&*e, format!("Failed to open {identifier}: {e}")))
     }
 
-    /// Fetch the prefix (and with it size and version info) of `path`.
-    async fn open_object(
-        entry: Arc<StoreEntry>,
-        path: ObjectPath,
-        identifier: String,
-        options: &IoOptions,
-        validation: Validation,
-    ) -> AnyResult<Self> {
-        let permit = Arc::clone(&entry.limiter).acquire_owned().await?;
-        let store = Arc::clone(&entry.store);
-        let request_path = path.clone();
+    /// Fetch the prefix (and with it size and version info) of the object.
+    async fn open_object(target: Target, options: &IoOptions, validation: Validation) -> AnyResult<Self> {
+        let permit = Arc::clone(&target.entry.limiter).acquire_owned().await?;
+        let store = Arc::clone(&target.entry.store);
+        let request_path = target.path.clone();
         let (meta, prefix) = spawn_io(async move {
             let _permit = permit;
             let result = store
@@ -346,35 +464,58 @@ impl ObjectStoreRangeReader {
             Ok::<_, object_store::Error>((meta, prefix))
         })
         .await??;
+        Ok(Self::from_identity(target, options, validation, ObjectIdentity::from_meta(&meta), prefix))
+    }
 
-        let version = meta.e_tag.clone().unwrap_or_else(|| format!("{}:{}", meta.size, meta.last_modified.timestamp()));
-        let precondition = Precondition::of(&meta, validation);
-        Ok(Self {
-            store: Arc::clone(&entry.store),
-            limiter: Arc::clone(&entry.limiter),
-            path,
-            size: meta.size,
-            identifier,
+    /// A reader for an object whose identity was learned earlier: no request is sent, the
+    /// prefix is empty (reads inside it go to the network) and every read is conditioned on the
+    /// known version, so a changed object is detected on the first read.
+    pub(crate) async fn open_known(
+        source: &str,
+        options: &IoOptions,
+        validation: Validation,
+        identity: &ObjectIdentity,
+    ) -> AnyResult<Self> {
+        let target = resolve_target(source, options).await?;
+        Ok(Self::from_identity(target, options, validation, identity.clone(), Bytes::new()))
+    }
+
+    fn from_identity(
+        target: Target,
+        options: &IoOptions,
+        validation: Validation,
+        identity: ObjectIdentity,
+        prefix: Bytes,
+    ) -> Self {
+        Self {
+            store: Arc::clone(&target.entry.store),
+            limiter: Arc::clone(&target.entry.limiter),
+            path: target.path,
+            identifier: target.identifier,
+            version: identity.version(),
+            precondition: identity.precondition(validation),
+            identity,
             prefix,
-            etag: meta.e_tag,
-            version,
-            last_modified: Some(meta.last_modified.timestamp()),
             options: options.clone(),
             validation,
-            precondition,
-        })
+        }
+    }
+
+    /// What the server reported about the object when it was opened.
+    pub(crate) fn object_identity(&self) -> &ObjectIdentity {
+        &self.identity
     }
 
     /// The object's ETag, if the server provided one.
     #[must_use]
     pub fn etag(&self) -> Option<&str> {
-        self.etag.as_deref()
+        self.identity.etag.as_deref()
     }
 
-    /// The object's last-modified time as seconds since the Unix epoch.
+    /// The object's last-modified time as seconds since the Unix epoch, if the server sent one.
     #[must_use]
     pub fn last_modified_unix(&self) -> Option<i64> {
-        self.last_modified
+        self.identity.last_modified.map(|t| t.timestamp())
     }
 }
 
@@ -386,11 +527,11 @@ impl AsyncRangeReader for ObjectStoreRangeReader {
             }
             let end = offset
                 .checked_add(len as u64)
-                .filter(|end| *end <= self.size)
+                .filter(|end| *end <= self.identity.size)
                 .ok_or_else(|| {
                     format!(
                         "Range {offset}+{len} is outside {} ({} bytes)",
-                        self.identifier, self.size
+                        self.identifier, self.identity.size
                     )
                 })?;
             if end <= self.prefix.len() as u64 {
@@ -420,7 +561,7 @@ impl AsyncRangeReader for ObjectStoreRangeReader {
     }
 
     fn size(&self) -> u64 {
-        self.size
+        self.identity.size
     }
 
     fn identifier(&self) -> &str {
@@ -433,8 +574,12 @@ impl AsyncRangeReader for ObjectStoreRangeReader {
 
     fn reopen(&self) -> BoxFuture<'_, AnyResult<Arc<dyn AsyncRangeReader>>> {
         Box::pin(async move {
-            let entry = Arc::new(StoreEntry { store: Arc::clone(&self.store), limiter: Arc::clone(&self.limiter) });
-            let fresh = Self::open_object(entry, self.path.clone(), self.identifier.clone(), &self.options, self.validation)
+            let target = Target {
+                entry: Arc::new(StoreEntry { store: Arc::clone(&self.store), limiter: Arc::clone(&self.limiter) }),
+                path: self.path.clone(),
+                identifier: self.identifier.clone(),
+            };
+            let fresh = Self::open_object(target, &self.options, self.validation)
                 .await
                 .map_err(|e| format!("Failed to reopen {}: {e}", self.identifier))?;
             Ok(Arc::new(fresh) as Arc<dyn AsyncRangeReader>)
@@ -455,8 +600,20 @@ impl AsyncRangeReader for ObjectStoreRangeReader {
 /// # Errors
 /// Returns an error if the source cannot be opened.
 pub async fn create_async_range_reader(source: &str, options: &IoOptions) -> AnyResult<Arc<dyn AsyncRangeReader>> {
+    create_async_range_reader_with(source, options, Validation::default()).await
+}
+
+/// Like [`create_async_range_reader`] with an explicit [`Validation`] mode for remote sources.
+///
+/// # Errors
+/// Returns an error if the source cannot be opened.
+pub async fn create_async_range_reader_with(
+    source: &str,
+    options: &IoOptions,
+    validation: Validation,
+) -> AnyResult<Arc<dyn AsyncRangeReader>> {
     if source.starts_with("s3://") || source.starts_with("http://") || source.starts_with("https://") {
-        Ok(Arc::new(ObjectStoreRangeReader::open_with_options(source, options).await?))
+        Ok(Arc::new(ObjectStoreRangeReader::open_with_validation(source, options, validation).await?))
     } else {
         Ok(Arc::new(SyncToAsync::new(Arc::new(LocalRangeReader::new(source)?))))
     }

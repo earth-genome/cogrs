@@ -101,15 +101,10 @@ impl TileCache {
         self.entries.put(key, CacheEntry { data, size_bytes });
     }
 
-    /// Remove every entry whose source is `identifier` or a version of it.
-    fn remove_source(&mut self, identifier: &str) -> usize {
-        let versioned = format!("{identifier}{VERSION_SEPARATOR}");
-        let doomed: Vec<TileKey> = self
-            .entries
-            .iter()
-            .filter(|(key, _)| &*key.source == identifier || key.source.starts_with(&versioned))
-            .map(|(key, _)| key.clone())
-            .collect();
+    /// Remove every entry whose source identity satisfies `matches`.
+    fn remove_where(&mut self, matches: impl Fn(&str) -> bool) -> usize {
+        let doomed: Vec<TileKey> =
+            self.entries.iter().filter(|(key, _)| matches(&key.source)).map(|(key, _)| key.clone()).collect();
         for key in &doomed {
             if let Some(entry) = self.entries.pop(key) {
                 self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
@@ -197,7 +192,14 @@ pub fn insert_by_path(path: &Path, index: usize, data: Arc<Vec<f32>>) {
 /// Drop every cached tile of the source with this `identifier`, whatever its version. Returns
 /// the number of tiles removed.
 pub fn invalidate_source(identifier: &str) -> usize {
-    TILE_CACHE.lock().remove_source(identifier)
+    let versioned = format!("{identifier}{VERSION_SEPARATOR}");
+    TILE_CACHE.lock().remove_where(|source| source == identifier || source.starts_with(&versioned))
+}
+
+/// Drop the cached tiles of exactly one source identity ([`source_id`]): one version of a source,
+/// leaving its other versions alone. Returns the number of tiles removed.
+pub fn invalidate_identity(identity: &str) -> usize {
+    TILE_CACHE.lock().remove_where(|source| source == identity)
 }
 
 /// Drop every cached tile.
@@ -278,6 +280,16 @@ mod tests {
         assert_eq!(invalidate_source("tc://inv/a"), 2);
         assert!(get_shared(&v1, 3, Some(1)).is_none() && get_shared(&v2, 3, Some(1)).is_none());
         assert!(get_shared(&other, 3, Some(1)).is_some(), "a source sharing the prefix is untouched");
+    }
+
+    #[test]
+    fn invalidate_identity_removes_one_version_only() {
+        let (v1, v2) = (source_id("tc://ident/a", Some("1")), source_id("tc://ident/a", Some("2")));
+        insert_shared(&v1, 0, None, tile(8));
+        insert_shared(&v2, 0, None, tile(8));
+        assert_eq!(invalidate_identity(&v1), 1);
+        assert!(get_shared(&v1, 0, None).is_none());
+        assert!(get_shared(&v2, 0, None).is_some());
     }
 
     #[test]

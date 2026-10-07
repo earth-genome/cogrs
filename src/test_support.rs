@@ -443,6 +443,8 @@ impl ServedObject {
 #[derive(Clone, Debug)]
 pub(crate) struct RecordedRequest {
     pub path: String,
+    /// Query string without the `?`, if the request had one
+    pub query: Option<String>,
     pub range: Option<(usize, usize)>,
     pub if_match: Option<String>,
     pub if_unmodified_since: Option<String>,
@@ -506,7 +508,11 @@ impl ObjectServer {
                         if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
                             return;
                         }
-                        let path = request_line.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap().to_string();
+                        let target = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                        let (path, query) = match target.split_once('?') {
+                            Some((path, query)) => (path.to_string(), Some(query.to_string())),
+                            None => (target, None),
+                        };
                         let (mut range, mut if_match, mut if_unmodified_since) = (None, None, None);
                         loop {
                             let mut line = String::new();
@@ -529,6 +535,7 @@ impl ObjectServer {
                             server.respond(&request_line, &path, range, if_match.clone(), if_unmodified_since.clone());
                         server.state.lock().requests.push(RecordedRequest {
                             path,
+                            query,
                             range: requested,
                             if_match,
                             if_unmodified_since,
@@ -605,6 +612,11 @@ impl ObjectServer {
 
     pub(crate) fn set_honor_conditionals(&self, honor: bool) {
         self.state.lock().honor_conditionals = honor;
+    }
+
+    /// Answer 503 to requests whose range starts at or after `offset` (`None`: stop failing).
+    pub(crate) fn fail_from(&self, offset: Option<usize>) {
+        self.state.lock().fail_from = offset;
     }
 
     pub(crate) fn requests(&self) -> Vec<RecordedRequest> {

@@ -29,6 +29,7 @@ pub mod casting;
 pub mod cog_reader;
 pub mod geometry;
 pub mod geotiff_writer;
+pub mod header_cache;
 pub mod lzw_fallback;
 pub mod point_query;
 mod point_query_async;
@@ -59,6 +60,7 @@ mod gdal_comparison_tests;
 
 pub use cog_reader::{
     CogReader,
+    CogReaderBuilder,
     CogMetadata,
     CogDataType,
     Compression,
@@ -66,6 +68,13 @@ pub use cog_reader::{
     OverviewMetadata,
     OverviewQualityHint,
 };
+
+// ============================================================================
+// Header cache
+// ============================================================================
+
+pub use header_cache::{CacheConfig, CacheMode, CacheStats, CogCache, HeaderCacheStats};
+pub use tile_cache::TileCacheStats;
 
 // ============================================================================
 // Point Queries
@@ -143,7 +152,7 @@ pub use async_io::{
     fetch_ranges,
     is_source_changed,
 };
-pub use remote::{ObjectStoreRangeReader, Validation, create_async_range_reader};
+pub use remote::{ObjectStoreRangeReader, SourceNotFound, Validation, create_async_range_reader, create_async_range_reader_with};
 
 // ============================================================================
 // S3 Support
