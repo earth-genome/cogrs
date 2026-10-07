@@ -249,16 +249,8 @@ pub fn read_entry_values_f64(
     file.seek(SeekFrom::Start(current_pos))?;
 
     let mut values = Vec::with_capacity(entry.count as usize);
-    for chunk in raw_bytes.chunks_exact(8) {
-        let value = if little_endian {
-            f64::from_le_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            ])
-        } else {
-            f64::from_be_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            ])
-        };
+    for chunk in raw_bytes.as_chunks::<8>().0 {
+        let value = if little_endian { f64::from_le_bytes(*chunk) } else { f64::from_be_bytes(*chunk) };
         values.push(value);
     }
 
