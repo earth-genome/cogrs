@@ -183,10 +183,11 @@ fn z14_neighbourhood() -> Vec<(u32, u32, u32)> {
 }
 
 async fn extract(reader: &CogReader, (z, x, y): (u32, u32, u32)) -> TileData {
-    // BENCH_RESAMPLING=bilinear|bicubic (default nearest)
+    // BENCH_RESAMPLING=bilinear|bicubic|cubic (default nearest)
     let method = match std::env::var("BENCH_RESAMPLING").as_deref() {
         Ok("bilinear") => cogrs::ResamplingMethod::Bilinear,
         Ok("bicubic") => cogrs::ResamplingMethod::Bicubic,
+        Ok("cubic") => cogrs::ResamplingMethod::Cubic,
         _ => cogrs::ResamplingMethod::Nearest,
     };
     TileExtractor::new(reader).xyz(z, x, y).size(256).resampling(method).extract().await.expect("extract")

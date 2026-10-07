@@ -178,7 +178,12 @@ async fn output_matches_the_synchronous_reader_exactly() {
     let (_mock, remote) = open_mock("mock://x/parity", Duration::from_millis(5), no_coalescing()).await;
     for (z, x, y) in [(3, 2, 3), (4, 4, 6), (4, 5, 7), (5, 8, 12), (2, 1, 1), (6, 17, 25)] {
         for (name, method) in
-            [("nearest", ResamplingMethod::Nearest), ("bilinear", ResamplingMethod::Bilinear), ("bicubic", ResamplingMethod::Bicubic)]
+            [
+                ("nearest", ResamplingMethod::Nearest),
+                ("bilinear", ResamplingMethod::Bilinear),
+                ("bicubic", ResamplingMethod::Bicubic),
+                ("cubic", ResamplingMethod::Cubic),
+            ]
         {
             let got = TileExtractor::new(&remote).xyz(z, x, y).size(128).resampling(method).extract().await.unwrap();
             let r = CogReader::from_reader_with_hint(
@@ -328,7 +333,12 @@ async fn a_small_interior_patch_of_the_output_tile_is_fully_rendered() {
     let spec = patch_spec(3857, (b.minx + 0.375 * w, b.maxy - 0.375 * w), px, 512, 64);
     let covered = (b.minx + 0.375 * w, b.maxy - 0.625 * w, b.minx + 0.625 * w, b.maxy - 0.375 * w);
     for (name, method) in
-        [("nearest", ResamplingMethod::Nearest), ("bilinear", ResamplingMethod::Bilinear), ("bicubic", ResamplingMethod::Bicubic)]
+        [
+                ("nearest", ResamplingMethod::Nearest),
+                ("bilinear", ResamplingMethod::Bilinear),
+                ("bicubic", ResamplingMethod::Bicubic),
+                ("cubic", ResamplingMethod::Cubic),
+            ]
     {
         let r = memory_reader(&format!("mem://plan/interior/{name}"), &spec);
         let tile = TileExtractor::new(&r).xyz(3, 2, 3).size(128).resampling(method).extract().await.unwrap();
@@ -614,10 +624,10 @@ fn seam_spec() -> CogSpec {
     spec
 }
 
-/// Mitchell-Netravali (B = C = 1/3), written out independently of the library.
-fn mitchell(x: f64) -> f64 {
+/// Mitchell-Netravali with parameters `(b, c)`, written out independently of the library:
+/// `(1/3, 1/3)` is `Bicubic`, `(0, 1/2)` (Catmull-Rom) is `Cubic`.
+fn mitchell(x: f64, b: f64, c: f64) -> f64 {
     let x = x.abs();
-    let (b, c) = (1.0 / 3.0, 1.0 / 3.0);
     if x < 1.0 {
         ((12.0 - 9.0 * b - 6.0 * c) * x.powi(3) + (-18.0 + 12.0 * b + 6.0 * c) * x.powi(2) + (6.0 - 2.0 * b)) / 6.0
     } else if x < 2.0 {
@@ -637,11 +647,12 @@ fn seam_reference(method: ResamplingMethod, cu: f64, cv: f64) -> f64 {
         ResamplingMethod::Bilinear => {
             (1.0 - fx) * (1.0 - fy) * at(0, 0) + fx * (1.0 - fy) * at(1, 0) + (1.0 - fx) * fy * at(0, 1) + fx * fy * at(1, 1)
         }
-        ResamplingMethod::Bicubic => {
+        ResamplingMethod::Bicubic | ResamplingMethod::Cubic => {
+            let (b, c) = if method == ResamplingMethod::Cubic { (0.0, 0.5) } else { (1.0 / 3.0, 1.0 / 3.0) };
             let (mut sum, mut weights) = (0.0, 0.0);
             for dx in -1..=2isize {
                 for dy in -1..=2isize {
-                    let w = mitchell(dx as f64 - fx) * mitchell(dy as f64 - fy);
+                    let w = mitchell(dx as f64 - fx, b, c) * mitchell(dy as f64 - fy, b, c);
                     sum += w * at(dx, dy);
                     weights += w;
                 }
@@ -685,7 +696,7 @@ async fn interpolation_reads_source_tiles_across_a_tile_boundary() {
         }
         assert_eq!(nearest.tiles_read, tiles.len(), "window {w}: Nearest must not read extra tiles");
 
-        for method in [ResamplingMethod::Bilinear, ResamplingMethod::Bicubic] {
+        for method in [ResamplingMethod::Bilinear, ResamplingMethod::Bicubic, ResamplingMethod::Cubic] {
             let r = fresh(w, &format!("{method:?}"));
             let tile = TileExtractor::new(&r).bounds(bounds).size(size).resampling(method).extract().await.unwrap();
             assert!(tile.tiles_read > nearest.tiles_read, "window {w} {method:?}: no tile read across the boundary ({} vs {})", tile.tiles_read, nearest.tiles_read);

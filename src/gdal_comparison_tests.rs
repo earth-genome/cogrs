@@ -305,15 +305,32 @@ async fn bilinear_downsampling_matches_gdalwarp_on_a_synthetic_raster() {
     }
 }
 
-/// GDAL's `cubic` is Catmull-Rom, cogrs's bicubic is Mitchell (B = C = 1/3), so values differ
-/// even where the footprint matches: on this noisy texture by 1.4 to 3.7 on average (range about
-/// 250 to 750, noise amplitude 150), max 16. The bound is set between that and the fixed 4x4
-/// footprint's 9.5 to 19 mean, 51 to 85 max, so it fails if the kernel is not scaled.
+/// `Cubic` is GDAL's Catmull-Rom kernel, stretched like the bilinear one when downsampling.
 #[tokio::test]
-async fn bicubic_downsampling_matches_gdalwarp_on_a_synthetic_raster() {
-    for (ratio, c) in downsample_synthetic(ResamplingMethod::Bicubic, "cubic", &[1.5, 2.5, 4.0]).await {
-        assert!(c.mean_abs_diff < 5.0, "x{ratio}: mean |diff| {:.3}", c.mean_abs_diff);
-        assert!(c.max_abs_diff < 25.0, "x{ratio}: max |diff| {:.3}", c.max_abs_diff);
+async fn cubic_downsampling_matches_gdalwarp_on_a_synthetic_raster() {
+    for (ratio, c) in downsample_synthetic(ResamplingMethod::Cubic, "cubic", &[1.5, 2.5, 4.0]).await {
+        assert!(c.identical_pct > 99.0, "x{ratio}: {:.2}% identical", c.identical_pct);
+        assert!(c.max_abs_diff < 0.01, "x{ratio}: max |diff| {}", c.max_abs_diff);
+    }
+}
+
+/// The fixed 4x4 footprint (output pixel smaller than a source pixel) on the noisy synthetic
+/// raster. Measured: max |diff| below 0.0005 on values up to 750 (only 30% of the `f32` results
+/// are bit-identical: the weights are summed in a different order).
+#[tokio::test]
+async fn cubic_upsampling_matches_gdalwarp_on_a_synthetic_raster() {
+    for (ratio, c) in downsample_synthetic(ResamplingMethod::Cubic, "cubic", &[0.4, 0.7]).await {
+        assert!(c.max_abs_diff < 0.01, "x{ratio}: max |diff| {}", c.max_abs_diff);
+    }
+}
+
+/// `Bicubic` (Mitchell) is not what `gdalwarp -r cubic` computes: on the same noisy texture it
+/// differs by a few units on average, which `Cubic` does not.
+#[tokio::test]
+async fn bicubic_is_not_gdalwarp_cubic() {
+    for (ratio, c) in downsample_synthetic(ResamplingMethod::Bicubic, "cubic", &[0.7, 2.5]).await {
+        assert!(c.identical_pct < 50.0, "x{ratio}: {:.2}% identical", c.identical_pct);
+        assert!(c.mean_abs_diff > 0.5, "x{ratio}: mean |diff| {:.3}", c.mean_abs_diff);
     }
 }
 
@@ -355,12 +372,38 @@ async fn bilinear_downsampling_matches_gdalwarp_on_a_textured_raster() {
     assert!(c.max_abs_diff < 0.5, "max |diff| {:.3}", c.max_abs_diff);
 }
 
-/// Measured: mean |diff| 0.56, max 11 (Catmull-Rom against Mitchell, see the synthetic test);
-/// the fixed footprint has mean 0.93 and max 26.
+/// Measured: mean |diff| 0.002, max 0.05 (8-bit data compared as floats), the same residue as
+/// bilinear: GDAL's scale estimate comes from a whole-pixel source window.
 #[tokio::test]
-async fn bicubic_downsampling_matches_gdalwarp_on_a_textured_raster() {
-    let Some(c) = run("natural_earth cubic downsampled", WORLD, &world_downsampled_window(), ResamplingMethod::Bicubic, "cubic").await else { return };
+async fn cubic_downsampling_matches_gdalwarp_on_a_textured_raster() {
+    let Some(c) = run("natural_earth cubic downsampled", WORLD, &world_downsampled_window(), ResamplingMethod::Cubic, "cubic").await else { return };
     assert_eq!(c.validity_mismatch, 0);
-    assert!(c.mean_abs_diff < 0.75, "mean |diff| {:.4}", c.mean_abs_diff);
-    assert!(c.max_abs_diff < 15.0, "max |diff| {:.3}", c.max_abs_diff);
+    assert!(c.mean_abs_diff < 0.01, "mean |diff| {:.4}", c.mean_abs_diff);
+    assert!(c.max_abs_diff < 0.5, "max |diff| {:.3}", c.max_abs_diff);
+}
+
+#[tokio::test]
+async fn cubic_matches_gdalwarp_on_a_textured_pixel_is_area_raster() {
+    let Some(c) = run("natural_earth cubic", WORLD, &world_window(), ResamplingMethod::Cubic, "cubic").await else { return };
+    assert_eq!(c.validity_mismatch, 0);
+    assert!(c.max_abs_diff < 0.01, "max |diff| {}", c.max_abs_diff);
+}
+
+#[tokio::test]
+async fn cubic_matches_gdalwarp_on_a_pixel_is_point_raster() {
+    let Some(c) = run("copernicus_dem cubic", DEM, &dem_window(), ResamplingMethod::Cubic, "cubic").await else { return };
+    assert!(c.max_abs_diff < 0.01, "max |diff| {}", c.max_abs_diff);
+}
+
+#[tokio::test]
+async fn cubic_matches_gdalwarp_on_a_pixel_is_area_raster() {
+    let Some(c) = run("gray_3857 cubic", GRAY, &gray_window(), ResamplingMethod::Cubic, "cubic").await else { return };
+    assert!(c.max_abs_diff < 0.01, "max |diff| {}", c.max_abs_diff);
+}
+
+#[tokio::test]
+async fn cubic_downsampling_matches_gdalwarp_on_the_dem() {
+    let Some(c) = run("copernicus_dem cubic downsampled", DEM, &dem_downsampled_window(), ResamplingMethod::Cubic, "cubic").await else { return };
+    assert_eq!(c.validity_mismatch, 0);
+    assert!(c.max_abs_diff < 0.01, "max |diff| {}", c.max_abs_diff);
 }

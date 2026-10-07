@@ -22,10 +22,11 @@ use crate::{
     ResamplingMethod, TileData, TileExtractor,
 };
 
-const METHODS: [(&str, ResamplingMethod); 3] = [
+const METHODS: [(&str, ResamplingMethod); 4] = [
     ("nearest", ResamplingMethod::Nearest),
     ("bilinear", ResamplingMethod::Bilinear),
     ("bicubic", ResamplingMethod::Bicubic),
+    ("cubic", ResamplingMethod::Cubic),
 ];
 
 /// FNV-1a over the f32 bit patterns, with every NaN canonicalised.

@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `ResamplingMethod::Cubic`: Catmull-Rom cubic convolution (Keys, a = -0.5), the kernel of
+  `gdalwarp -r cubic`, both for the fixed 4x4 footprint and, stretched by the downsampling
+  ratio, when an output pixel covers several source pixels. Masking is the same as for
+  `Bicubic`. Against `gdalwarp -r cubic` the output is 100% bit-identical on a same-CRS
+  synthetic raster downsampled by 1.5 to 4, and within 0.0005 (float rounding) when
+  upsampling. `ResamplingMethod::Bicubic` is unchanged (Mitchell-Netravali, B = C = 1/3; no
+  `gdalwarp` method uses it) and its docs now say so. `ResamplingMethod` is not
+  `#[non_exhaustive]`, so an exhaustive `match` on it needs a `Cubic` arm: a minor breaking
+  change for such callers
 - `TileData::to_webp()` / `TileData::to_webp_with(&WebpOptions)`: lossless RGBA8 WebP
   encoding of extracted tiles (pure Rust, via the `image` crate). Supports 1 (gray),
   3 (RGB) and 4 (RGBA) bands; nodata/NaN pixels become transparent; values are rounded

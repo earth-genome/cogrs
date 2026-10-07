@@ -149,6 +149,18 @@ let tile = TileExtractor::new(&reader)
 # }
 ```
 
+### Resampling
+
+| `ResamplingMethod` | Kernel | `gdalwarp` equivalent |
+|---|---|---|
+| `Nearest` (default) | pixel containing the output pixel centre | `-r near` (bit-identical) |
+| `Bilinear` | tent, 2x2 taps | `-r bilinear` |
+| `Cubic` | Catmull-Rom (Keys, a = -0.5), 4x4 taps | `-r cubic` |
+| `Bicubic` | Mitchell-Netravali (B = C = 1/3), 4x4 taps | none (softer than `Cubic`) |
+
+When an output pixel covers more than about one source pixel, the bilinear and both cubic
+kernels are stretched by that ratio (anti-aliasing), as `gdalwarp` does.
+
 ## Caching
 
 A tile server opens the same image for every request, so two caches sit behind

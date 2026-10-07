@@ -59,11 +59,22 @@ pub enum ResamplingMethod {
     /// covers more than about one source pixel the kernel is stretched by that ratio
     /// (anti-aliasing, like `gdalwarp`), so it reads proportionally more source pixels.
     Bilinear,
-    /// Bicubic interpolation - highest quality, but slower.
-    /// Uses a 4x4 grid of source pixels with cubic weighting (Mitchell-Netravali,
-    /// B = C = 1/3; `gdalwarp -r cubic` uses Catmull-Rom), stretched like [`Self::Bilinear`]
+    /// Bicubic interpolation with the Mitchell-Netravali kernel (B = C = 1/3), slower than
+    /// [`Self::Bilinear`]. Uses a 4x4 grid of source pixels, stretched like [`Self::Bilinear`]
     /// when downsampling.
+    ///
+    /// Softer than [`Self::Cubic`] and with less ringing. **No `gdalwarp -r` method uses this
+    /// kernel** (`-r cubic` is Catmull-Rom, see [`Self::Cubic`]), so output differs from
+    /// `gdalwarp`; pick [`Self::Cubic`] to match it.
     Bicubic,
+    /// Cubic convolution with the Catmull-Rom kernel (Keys, a = -0.5; Mitchell-Netravali
+    /// B = 0, C = 0.5): the same kernel as `gdalwarp -r cubic` (GDAL's `CubicKernel`). Uses a
+    /// 4x4 grid of source pixels, stretched like [`Self::Bilinear`] when downsampling. Sharper
+    /// than [`Self::Bicubic`], with some overshoot at hard edges.
+    ///
+    /// Masking is the same as for [`Self::Bicubic`]. Added after the other variants; the enum
+    /// is not `#[non_exhaustive]`, so an exhaustive `match` downstream needs a new arm.
+    Cubic,
 }
 
 /// Extracted tile data with band information
@@ -162,6 +173,26 @@ fn bicubic_weight(x: f64) -> f64 {
     }
 }
 
+/// Catmull-Rom weight (Keys, a = -0.5), GDAL's `CubicKernel` (`alg/gdalresamplingkernels.h`):
+/// `gdalwarp -r cubic`. Unlike the Mitchell kernel it interpolates: `1` at `0`, `0` at `+-1`.
+#[inline(always)]
+fn cubic_weight(x: f64) -> f64 {
+    let x = x.abs();
+    if x <= 1.0 {
+        x * x * (1.5 * x - 2.5) + 1.0
+    } else if x <= 2.0 {
+        x * x * (-0.5 * x + 2.5) - 4.0 * x + 2.0
+    } else {
+        0.0
+    }
+}
+
+/// Weight function of a four-tap method (`Bicubic`: Mitchell, `Cubic`: Catmull-Rom).
+#[inline]
+fn cubic_family_weight(resampling: ResamplingMethod) -> fn(f64) -> f64 {
+    if resampling == ResamplingMethod::Cubic { cubic_weight } else { bicubic_weight }
+}
+
 /// Bilinear (tent) weight: `1 - |x|` on `[-1, 1]`.
 #[inline(always)]
 fn bilinear_weight(x: f64) -> f64 {
@@ -183,7 +214,7 @@ struct AxisKernel {
     radius: isize,
 }
 
-/// Scaled kernels of an extraction that downsamples with `Bilinear` or `Bicubic`.
+/// Scaled kernels of an extraction that downsamples with `Bilinear`, `Bicubic` or `Cubic`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DownsampleKernel {
     x: AxisKernel,
@@ -212,7 +243,7 @@ impl DownsampleKernel {
         let support = match resampling {
             ResamplingMethod::Nearest => return None,
             ResamplingMethod::Bilinear => 1.0,
-            ResamplingMethod::Bicubic => 2.0,
+            ResamplingMethod::Bicubic | ResamplingMethod::Cubic => 2.0,
         };
         let (sx, sy) = (axis_scale(ratio[0]), axis_scale(ratio[1]));
         if sx >= GDAL_FIXED_FOOTPRINT_MIN_SCALE && sy >= GDAL_FIXED_FOOTPRINT_MIN_SCALE {
@@ -663,7 +694,8 @@ impl<'a> TileExtractor<'a> {
     /// Set the resampling method.
     ///
     /// Default is `ResamplingMethod::Nearest` (fastest).
-    /// Use `Bilinear` for smoother results or `Bicubic` for highest quality.
+    /// Use `Bilinear` for smoother results, `Cubic` to match `gdalwarp -r cubic`, or `Bicubic`
+    /// (Mitchell) for softer cubic output.
     ///
     /// # Example
     ///
@@ -1847,7 +1879,7 @@ fn nearest_pixel(v: f64, size: usize) -> usize {
 
 /// First and last source pixel (clamped to the level) that `resampling` reads along one axis
 /// for pixel-centre coordinate `v`: the nearest pixel, the bilinear pair `floor(v)..=floor(v)+1`
-/// or the bicubic quad `floor(v)-1..=floor(v)+2` and, when `axis` carries a downsampling kernel,
+/// or the bicubic/cubic quad `floor(v)-1..=floor(v)+2` and, when `axis` carries a downsampling kernel,
 /// its widened footprint (`DownsampleKernel::span`). Must match the taps in `render_extraction`.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 fn tap_span(v: f64, size: usize, resampling: ResamplingMethod, axis: Option<AxisKernel>) -> (usize, usize) {
@@ -1858,7 +1890,7 @@ fn tap_span(v: f64, size: usize, resampling: ResamplingMethod, axis: Option<Axis
         }
         (_, Some(axis)) => DownsampleKernel::span(axis, v),
         (ResamplingMethod::Bilinear, None) => (v.floor() as isize, v.floor() as isize + 1),
-        (ResamplingMethod::Bicubic, None) => (v.floor() as isize - 1, v.floor() as isize + 2),
+        (ResamplingMethod::Bicubic | ResamplingMethod::Cubic, None) => (v.floor() as isize - 1, v.floor() as isize + 2),
     };
     let clamp = |i: isize| i.max(0).min(size as isize - 1) as usize;
     (clamp(lo), clamp(hi))
@@ -2344,8 +2376,9 @@ fn render_extraction(
                         );
                     }
                 }
-                ResamplingMethod::Bicubic => {
-                    // Bicubic interpolation using 4x4 grid of pixels
+                ResamplingMethod::Bicubic | ResamplingMethod::Cubic => {
+                    // Bicubic / cubic interpolation using 4x4 grid of pixels
+                    let weight = cubic_family_weight(resampling);
                     #[allow(clippy::cast_possible_truncation)]
                     let x0 = src_pixel_x.floor() as isize;
 
@@ -2359,10 +2392,10 @@ fn render_extraction(
                     // (these are the same for all bands and all X in the 4x4 grid row)
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
                     let y_weights: [(usize, f64); 4] = [
-                        ((y0_floor - 1).max(0).min(eff_height as isize - 1) as usize, bicubic_weight(-1.0 - fy)),
-                        ((y0_floor).max(0).min(eff_height as isize - 1) as usize, bicubic_weight(-fy)),
-                        ((y0_floor + 1).max(0).min(eff_height as isize - 1) as usize, bicubic_weight(1.0 - fy)),
-                        ((y0_floor + 2).max(0).min(eff_height as isize - 1) as usize, bicubic_weight(2.0 - fy)),
+                        ((y0_floor - 1).max(0).min(eff_height as isize - 1) as usize, weight(-1.0 - fy)),
+                        ((y0_floor).max(0).min(eff_height as isize - 1) as usize, weight(-fy)),
+                        ((y0_floor + 1).max(0).min(eff_height as isize - 1) as usize, weight(1.0 - fy)),
+                        ((y0_floor + 2).max(0).min(eff_height as isize - 1) as usize, weight(2.0 - fy)),
                     ];
 
                     for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
@@ -2373,7 +2406,7 @@ fn render_extraction(
                             #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
                             let px = (x0 + i).max(0).min(eff_width as isize - 1) as usize;
                             #[allow(clippy::cast_precision_loss)]
-                            let wx = bicubic_weight(i as f64 - fx);
+                            let wx = weight(i as f64 - fx);
 
                             for &(py, wy) in &y_weights {
                                 #[allow(clippy::cast_possible_truncation)]
@@ -2455,11 +2488,11 @@ fn bilinear_masked(
     nearest().unwrap_or(fill)
 }
 
-/// Weighted bicubic interpolation over 16 `(value, weight)` taps.
+/// Weighted bicubic / cubic interpolation over 16 `(value, weight)` taps.
 ///
 /// Same masking rule as [`bilinear_masked`]: any invalid tap yields the nearest
 /// sample. Renormalising the remaining weights is not used because the
-/// Mitchell kernel has negative lobes, so partial weight sums are unstable.
+/// Mitchell and Catmull-Rom kernels have negative lobes, so partial weight sums are unstable.
 #[inline]
 fn bicubic_masked(
     taps: &[(Option<f32>, f32); 16],
@@ -2490,17 +2523,14 @@ fn axis_weights(resampling: ResamplingMethod, axis: AxisKernel, v: f64, size: us
     let (first, last) = DownsampleKernel::span(axis, v);
     let (lo, hi) = (first.max(0), last.min(size as isize - 1));
     out.clear();
+    let weight = if resampling == ResamplingMethod::Bilinear { bilinear_weight } else { cubic_family_weight(resampling) };
     for i in lo..=hi {
-        let x = (i as f64 - v) * axis.scale;
-        out.push(match resampling {
-            ResamplingMethod::Bilinear => bilinear_weight(x),
-            _ => bicubic_weight(x),
-        });
+        out.push(weight((i as f64 - v) * axis.scale));
     }
     if lo > hi { (1, 0) } else { (lo as usize, hi as usize) }
 }
 
-/// Bilinear / bicubic interpolation with a kernel stretched by the downsampling ratio (see
+/// Bilinear / bicubic / cubic interpolation with a kernel stretched by the downsampling ratio (see
 /// [`AxisKernel`]): every valid source pixel inside the kernel footprint is weighted and the
 /// result is normalised by the weights actually used.
 ///
@@ -2676,6 +2706,39 @@ mod tests {
     }
 
     #[test]
+    fn test_cubic_weight_is_catmull_rom() {
+        // interpolating: 1 at 0, 0 at the other integers
+        assert_eq!(cubic_weight(0.0), 1.0);
+        for x in [1.0, 2.0, 3.0, -1.0, -2.0] {
+            assert!(cubic_weight(x).abs() < 1e-15, "{x}");
+        }
+        // Catmull-Rom (B = 0, C = 1/2) written out from Mitchell-Netravali formula (8)
+        let (b, c) = (0.0f64, 0.5f64);
+        let mitchell = |x: f64| {
+            let x = x.abs();
+            if x < 1.0 {
+                ((12.0 - 9.0 * b - 6.0 * c) * x.powi(3) + (-18.0 + 12.0 * b + 6.0 * c) * x.powi(2) + (6.0 - 2.0 * b)) / 6.0
+            } else if x < 2.0 {
+                ((-b - 6.0 * c) * x.powi(3) + (6.0 * b + 30.0 * c) * x.powi(2) + (-12.0 * b - 48.0 * c) * x + (8.0 * b + 24.0 * c)) / 6.0
+            } else {
+                0.0
+            }
+        };
+        for i in -250..=250 {
+            let x = f64::from(i) / 100.0;
+            assert!((cubic_weight(x) - mitchell(x)).abs() < 1e-12, "{x}");
+            assert_eq!(cubic_weight(x), cubic_weight(-x));
+        }
+        // partition of unity
+        for f in [0.0, 0.1, 0.5, 0.77] {
+            let sum: f64 = (-1..=2).map(|i| cubic_weight(f64::from(i) - f)).sum();
+            assert!((sum - 1.0).abs() < 1e-12, "{f}");
+        }
+        // and different from the Mitchell kernel `Bicubic` uses
+        assert!((cubic_weight(0.5) - bicubic_weight(0.5)).abs() > 0.01);
+    }
+
+    #[test]
     fn test_bicubic_masked_matches_formula_when_all_valid() {
         let mut taps = [(Some(0.0f32), 0.0f32); 16];
         let (mut sum, mut wsum) = (0.0f32, 0.0f32);
@@ -2758,7 +2821,7 @@ mod tests {
         let reader = CogReader::open(path.to_str().unwrap()).unwrap();
         assert_eq!(reader.metadata.nodata, None);
 
-        for method in [ResamplingMethod::Nearest, ResamplingMethod::Bilinear, ResamplingMethod::Bicubic] {
+        for method in [ResamplingMethod::Nearest, ResamplingMethod::Bilinear, ResamplingMethod::Bicubic, ResamplingMethod::Cubic] {
             let tile = extract_edge_tile(&reader, method).await;
             assert_eq!((tile.width, tile.height, tile.bands), (256, 256, 1));
             let at = |x: usize, y: usize| tile.pixels[y * 256 + x];
@@ -2774,8 +2837,12 @@ mod tests {
             for y in 4..252 {
                 for x in 0..(EDGE_RASTER_W - 4) {
                     let v = at(x, y);
-                    // Bicubic (Mitchell) can overshoot slightly
-                    let slack = if method == ResamplingMethod::Bicubic { 25.0 } else { 0.0 };
+                    // Bicubic (Mitchell) can overshoot slightly, Cubic (Catmull-Rom, sharper) more
+                    let slack = match method {
+                        ResamplingMethod::Bicubic => 25.0,
+                        ResamplingMethod::Cubic => 50.0,
+                        _ => 0.0,
+                    };
                     assert!((1.0 - slack..=250.0 + slack).contains(&v), "{method:?}: ({x},{y}) = {v}");
                 }
             }
@@ -3738,6 +3805,7 @@ mod global_cog_tests {
             ResamplingMethod::Nearest,
             ResamplingMethod::Bilinear,
             ResamplingMethod::Bicubic,
+            ResamplingMethod::Cubic,
         ];
 
         for method in methods {
@@ -3776,16 +3844,18 @@ mod downsample_tests {
 
     #[test]
     fn kernel_follows_gdalwarp_scale_rules() {
-        use ResamplingMethod::{Bicubic, Bilinear, Nearest};
+        use ResamplingMethod::{Bicubic, Bilinear, Cubic, Nearest};
         // nearest never scales; upsampling and ratios below 1/0.95 keep the fixed footprint
         assert_eq!(kernel([4.0, 4.0], Nearest), None);
         for ratio in [0.3, 1.0, 1.04, 1.0526] {
             assert_eq!(kernel([ratio, ratio], Bilinear), None, "ratio {ratio}");
             assert_eq!(kernel([ratio, ratio], Bicubic), None, "ratio {ratio}");
+            assert_eq!(kernel([ratio, ratio], Cubic), None, "ratio {ratio}");
         }
         // radius = ceil(support / scale): bilinear 1 / s, bicubic 2 / s
         let k = kernel([2.5, 2.5], Bilinear).unwrap();
         assert_eq!((k.x.scale, k.x.radius), (0.4, 3));
+        assert_eq!(kernel([2.5, 2.5], Cubic), kernel([2.5, 2.5], Bicubic));
         let k = kernel([2.5, 2.5], Bicubic).unwrap();
         assert_eq!((k.x.scale, k.x.radius), (0.4, 5));
         // a ratio within 0.05 of a whole number snaps to it
@@ -3802,7 +3872,7 @@ mod downsample_tests {
 
     #[test]
     fn tap_span_covers_the_scaled_footprint() {
-        use ResamplingMethod::{Bicubic, Bilinear};
+        use ResamplingMethod::{Bicubic, Bilinear, Cubic};
         let k = kernel([4.0, 4.0], Bilinear).unwrap();
         // floor(v) + 1 - radius ..= floor(v) + radius, clamped to the level
         assert_eq!(tap_span(10.3, 100, Bilinear, Some(k.x)), (7, 14));
@@ -3813,6 +3883,9 @@ mod downsample_tests {
         // without a kernel: the fixed pairs and quads
         assert_eq!(tap_span(10.3, 100, Bilinear, None), (10, 11));
         assert_eq!(tap_span(10.3, 100, Bicubic, None), (9, 12));
+        assert_eq!(tap_span(10.3, 100, Cubic, None), (9, 12));
+        let k = kernel([4.0, 4.0], Cubic).unwrap();
+        assert_eq!(tap_span(10.3, 100, Cubic, Some(k.x)), (3, 18));
         // an unscaled axis of a scaled extraction reads the same taps
         let k = kernel([4.0, 1.0], Bicubic).unwrap();
         assert_eq!(tap_span(10.3, 100, Bicubic, Some(k.y)), tap_span(10.3, 100, Bicubic, None));
