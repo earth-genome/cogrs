@@ -311,6 +311,25 @@ fn rgb_u8_spec() -> CogSpec {
     }
 }
 
+/// [`rgb_u8_spec`] geometry with nodata 0: an all-nodata collar plus speckle that sets single
+/// bands to 0, so many pixels are nodata in some bands only.
+fn rgb_u8_partial_nodata_spec() -> CogSpec {
+    CogSpec {
+        nodata: Some(0.0),
+        overviews: 2,
+        sparse: vec![],
+        pixel: |b, x, y| {
+            let h = (x * 7919 + y * 104_729 + b * 1_299_709) % 97;
+            if x + y / 3 < 250 || h < 4 {
+                0.0
+            } else {
+                ((x * 3 + y * 5 + b * 40) % 251) as f64 + 1.0
+            }
+        },
+        ..rgb_u8_spec()
+    }
+}
+
 fn f32_4326_spec() -> CogSpec {
     CogSpec {
         width: 1000,
@@ -430,6 +449,14 @@ async fn golden_synthetic() {
         let t = TileExtractor::new(&rh).xyz(4, 4, 6).size(128).extract().await.unwrap();
         g.rec(format!("{case}/hinted/{hname}/xyz/4/4/6"), summarize_tile(&t));
     }
+
+    // --- 3-band u8 with nodata 0 set per band as well as across all bands ---------------------
+    let case = "rgb_u8_partial_nodata";
+    let r = open_memory(case, &rgb_u8_partial_nodata_spec(), OverviewQualityHint::ComputeAtRuntime);
+    record_metadata(&mut g, case, &r);
+    let tiles = [(3, 2, 3), (4, 4, 6), (4, 5, 7), (5, 8, 12), (6, 17, 25)];
+    record_extracts(&mut g, case, &r, &tiles, &[2, 0]).await;
+    record_shifted_extracts(&mut g, case, &r, 5, 8, 12).await;
 
     // --- f32, 4326 source, nodata, sparse tiles ----------------------------------------------
     let case = "f32_4326_nodata";

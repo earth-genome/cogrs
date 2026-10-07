@@ -177,6 +177,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Downsampling bilinear/bicubic/cubic of a multi-band source with nodata judged the kernel's
+  centre band by band: a pixel that is nodata in some bands only (an RGB pixel with blue 0 at
+  nodata 0) was passed through as nodata in those bands. As in `gdalwarp` reading the source's
+  own nodata value (`UNIFIED_SRC_NODATA` unset, which `GDALWarpOperation::WarpRegionToBuffer`
+  runs as `PARTIAL`: unified mask built, per-band masks kept), the centre pixel is now invalid
+  only if it is nodata in every selected band (`TileExtractor::bands`, like `gdalwarp -b`);
+  otherwise each band is interpolated from its own valid taps (tap validity stays per band,
+  as in GDAL). Single-band and no-nodata output is unchanged; on a 3-band synthetic raster with
+  partial nodata, 98.99% of samples at ratio 1.3 (bilinear) matched `gdalwarp`, now 100%, and
+  every changed pixel was one that had nodata in some bands only. `gdalwarp -srcnodata 0`
+  (`UNIFIED_SRC_NODATA=YES`, taps judged across all bands) is a different GDAL mode that
+  cogrs does not follow, as it has no counterpart for a source's own nodata
 - The 129th synchronous call made inside one tokio task never returned: the blocking adapter
   (`AsyncToSync`, which backs `CogReader::read_tile`, `sample*` and the other synchronous methods
   of remote and async-opened readers) waited on a join handle that tokio's cooperative budget

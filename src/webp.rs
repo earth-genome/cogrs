@@ -22,6 +22,9 @@
 //! - any of its bands is `NaN`, or
 //! - **all** of its bands equal the nodata value.
 //!
+//! This is the same all-bands rule the extractor applies to the centre of its downsampling
+//! kernel (an input pixel is nodata only if every selected band is), as `gdalwarp` does.
+//!
 //! The nodata value is taken from [`TileData::nodata`] (copied from the COG
 //! metadata at extraction time) unless [`WebpOptions::nodata`] overrides it.
 //! For 4-band sources the resulting alpha is `min(source alpha, mask)`.
