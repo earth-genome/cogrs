@@ -27,6 +27,7 @@ pub mod geometry;
 pub mod geotiff_writer;
 pub mod lzw_fallback;
 pub mod point_query;
+mod point_query_async;
 pub mod range_reader;
 pub mod raster;
 pub mod s3;

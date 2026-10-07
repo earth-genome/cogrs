@@ -89,6 +89,53 @@ pub fn registered_store_count() -> usize {
     STORES.lock().len()
 }
 
+/// The shared store (client + request limiter) for the bucket named by `config`, created on first
+/// use: explicit config > `AWS_REGION` > `AWS_DEFAULT_REGION` > region detected from the bucket.
+async fn s3_store_entry(config: &S3Config, options: &IoOptions) -> AnyResult<Arc<StoreEntry>> {
+    let region = resolve_region(&config.bucket, config.region.as_deref(), config.endpoint_url.as_deref()).await;
+    let key = format!(
+        "s3|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}",
+        config.bucket,
+        config.endpoint_url,
+        region,
+        config.access_key_id,
+        config.secret_access_key.as_deref().map(fingerprint),
+        config.allow_http,
+        config.skip_signature,
+        options,
+    );
+    shared_store(&key, options, || {
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name(&config.bucket)
+            .with_client_options(client_options(options, config.allow_http))
+            .with_retry(retry_config(options));
+        if let Some(region) = &region {
+            builder = builder.with_region(region);
+        }
+        if let Some(endpoint) = &config.endpoint_url {
+            builder = builder.with_endpoint(endpoint);
+        }
+        if let Some(access_key) = &config.access_key_id {
+            builder = builder.with_access_key_id(access_key);
+        }
+        if let Some(secret_key) = &config.secret_access_key {
+            builder = builder.with_secret_access_key(secret_key);
+        }
+        if config.allow_http {
+            builder = builder.with_allow_http(true);
+        }
+        if config.skip_signature {
+            builder = builder.with_skip_signature(true);
+        }
+        Ok(Arc::new(builder.build()?) as Arc<dyn ObjectStore>)
+    })
+}
+
+/// The shared `object_store` client for `config`'s bucket (used to list objects).
+pub(crate) async fn s3_object_store(config: &S3Config, options: &IoOptions) -> AnyResult<Arc<dyn ObjectStore>> {
+    Ok(Arc::clone(&s3_store_entry(config, options).await?.store))
+}
+
 /// Async range reader over one S3 or HTTP(S) object.
 pub struct ObjectStoreRangeReader {
     store: Arc<dyn ObjectStore>,
@@ -130,43 +177,7 @@ impl ObjectStoreRangeReader {
     /// # Errors
     /// Returns an error if the configuration is invalid or the object cannot be read.
     pub async fn open_s3(config: S3Config, options: &IoOptions) -> AnyResult<Self> {
-        let region = resolve_region(&config.bucket, config.region.as_deref(), config.endpoint_url.as_deref()).await;
-        let key = format!(
-            "s3|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}",
-            config.bucket,
-            config.endpoint_url,
-            region,
-            config.access_key_id,
-            config.secret_access_key.as_deref().map(fingerprint),
-            config.allow_http,
-            config.skip_signature,
-            options,
-        );
-        let entry = shared_store(&key, options, || {
-            let mut builder = AmazonS3Builder::new()
-                .with_bucket_name(&config.bucket)
-                .with_client_options(client_options(options, config.allow_http))
-                .with_retry(retry_config(options));
-            if let Some(region) = &region {
-                builder = builder.with_region(region);
-            }
-            if let Some(endpoint) = &config.endpoint_url {
-                builder = builder.with_endpoint(endpoint);
-            }
-            if let Some(access_key) = &config.access_key_id {
-                builder = builder.with_access_key_id(access_key);
-            }
-            if let Some(secret_key) = &config.secret_access_key {
-                builder = builder.with_secret_access_key(secret_key);
-            }
-            if config.allow_http {
-                builder = builder.with_allow_http(true);
-            }
-            if config.skip_signature {
-                builder = builder.with_skip_signature(true);
-            }
-            Ok(Arc::new(builder.build()?) as Arc<dyn ObjectStore>)
-        })?;
+        let entry = s3_store_entry(&config, options).await?;
 
         let identifier = format!("s3://{}/{}", config.bucket, config.key);
         let path = ObjectPath::from(config.key.as_str());
