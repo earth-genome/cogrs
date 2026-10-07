@@ -14,16 +14,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and clamped to `0..=255`, with an optional explicit `(min, max)` linear rescale
 - `WebpOptions` (`nodata` override, `rescale`), re-exported from the crate root
 - `TileData::nodata`: the source COG's nodata value, set at extraction time
-- `PrefixCachedRangeReader`: serves reads inside the first 16 KiB of a source from
-  memory. `CogReader::open` now wraps non-local readers with it, so opening a remote
-  COG costs a single header request instead of many small sequential ones
-- `RangeReader::has_prefix_cache()` (default method, returns `false`)
-- `CogReader::open_async()` / `CogReader::open_async_with_hint()`: async entry points that
-  run the blocking open (S3 region detection, header/IFD reads, overview analysis) on
-  tokio's blocking pool. Safe on `multi_thread` and `current_thread` runtimes; use these
-  for S3/HTTP sources from async code
+- Native async remote I/O. `AsyncRangeReader` (object-safe, `BoxFuture`-based) is the core
+  I/O trait; `ObjectStoreRangeReader` serves `s3://` and `http(s)://` through `object_store`
+  (one implementation for both, retries and timeouts included), `create_async_range_reader`
+  builds one for any source, and `SyncToAsync` / `AsyncToSync` adapt between it and the
+  synchronous `RangeReader`. Remote I/O no longer occupies a tokio blocking thread while
+  waiting on the network
+- `IoOptions`: fan-out cap per fetch (16), in-flight cap per bucket/host (128), range
+  coalescing (gap 32 KiB, max 4 MiB), and retry/timeout settings (3 retries within 15 s,
+  5 s connect, 20 s request). Pass it with `CogReader::open_async_with_options`
+- Opening a remote COG is one ranged `GET` (header, IFDs, size, ETag; no `HEAD`, which also
+  makes presigned URLs usable) followed by one concurrent round trip for large tile-offset
+  arrays. HTTP(S) URLs may carry a query string (sent with every request; such URLs get a
+  private client). One `object_store` client is shared per bucket/host, so repeated opens
+  reuse connections. Requests are spawned on a private multi-thread I/O runtime (2-8
+  threads) and awaited from the caller's runtime, so the shared client's connections do not
+  depend on any caller runtime staying alive, and dropping a request future aborts the request
+- `TileExtractor`/`Reprojector` fetch all source tiles an output tile needs concurrently:
+  cache lookups, then one coalesced request set (adjacent tiles merge into one request),
+  with identical in-flight tiles de-duplicated across concurrent callers (cancellation
+  safe). Only decode and resampling run on the blocking pool
+- `CogReader` is `Clone` and cheap to clone: `metadata` is `Arc<CogMetadata>` and
+  `overviews` is `Arc<[OverviewMetadata]>`, so parsed metadata can be cached per source and
+  re-attached with `CogReader::from_parts(reader, metadata, overviews, min_usable_overview)`
+- `CogReader::open_async()` / `open_async_with_hint()` / `open_async_with_options()`,
+  `CogReader::from_async_reader()` / `from_async_reader_with_hint()`,
+  `CogReader::read_tile_async()` / `read_overview_tile_async()`,
+  `CogReader::compute_overview_quality_hint_async()`, `CogReader::identifier()` and
+  `CogReader::is_remote()`. Overview-quality sampling at open fetches its tiles concurrently
+- Async point queries: `CogReader::sample_async()`, `sample_crs_async()`,
+  `sample_lonlat_async()`, `sample_band_crs_async()`, `sample_points_crs_async()` and
+  `sample_points_lonlat_async()` fetch the one containing tile without blocking a thread
 - `CogReader::spawn_blocking(|reader| ..)`: run any sync operation (point queries, tile
   reads) on an opened reader on the blocking pool
+- `RangeReader::reads_inline()` (default `false`): marks readers that never block (memory)
+- `S3ScanOptions::skip_signature` (default from `AWS_SKIP_SIGNATURE`), `concurrency` and
+  `io`
 - S3 bucket region auto-detection: when no region is configured and no custom endpoint is
   set, the region is detected with an unauthenticated `HeadBucket` request and cached per
   bucket for the life of the process. Failure to detect falls back to `us-east-1` with a
@@ -52,14 +78,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Default` yield when no env var is set) now means "auto-detect" instead of being
   pre-filled with `us-east-1`. Custom endpoints (`AWS_ENDPOINT_URL`, MinIO) still default
   to `us-east-1` and never trigger detection
-- Blocking remote readers (`S3RangeReaderSync`, `HttpRangeReader`, legacy `S3RangeReader`,
-  and therefore `CogReader::open` for `s3://` / `http(s)://`) called on a tokio worker
-  thread now try to convert tokio's "Cannot start a runtime from within a runtime" panic
-  into an error naming `CogReader::open_async` (best effort, string-matched). This works
-  with unwinding panics only, and tokio's panic message is still printed by the panic hook;
-  with `panic = "abort"` the process aborts as before; and reqwest's blocking client only
-  detects the condition in debug builds, so in release builds `HttpRangeReader` may instead
-  silently block the worker thread. Always use `open_async` from async code
+- `CogReader::open` for `s3://` / `http(s)://`, `HttpRangeReader` and `S3RangeReaderSync` are
+  synchronous wrappers over the async backend: the request runs on a private I/O runtime and
+  the calling thread blocks until it completes. They no longer need an ambient tokio
+  runtime and never panic or deadlock inside one (on an async worker thread they block that
+  worker; from async code use `open_async`)
+- `S3CogSource::scan` reads object metadata with bounded concurrency (default 16) instead of
+  one object at a time, and no longer downloads overview tiles per object (entries only need
+  the IFDs)
+- `S3CogSource::scan` and S3 opens share one client per bucket
+
+### Removed
+
+- **Breaking:** `PrefixCachedRangeReader` and `RangeReader::has_prefix_cache()`. The remote
+  reader keeps the 16 KiB prefix it fetched on open
+- **Breaking:** `CogReader::clone_for_async()`; use `Clone`
+- **Breaking:** `CogReader::metadata` is now `Arc<CogMetadata>` and `CogReader::overviews`
+  is `Arc<[OverviewMetadata]>`. Field reads (`reader.metadata.width`) compile unchanged;
+  mutating them or passing them where owned values are expected does not
+- **Breaking:** `S3RangeReaderSync::new` / `from_async` and `create_range_reader` no longer
+  require a tokio runtime context
+- **Breaking:** `S3ScanOptions` has new public fields (`skip_signature`, `concurrency`, `io`);
+  construct it with `..Default::default()`
+- The legacy `S3RangeReader` (plain HTTPS, size 0, one new client per read), the
+  `catch_unwind`-based `blocking_call` guard and the `reqwest` `blocking` dependency
 
 ### Fixed
 
@@ -67,8 +109,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   target sets `bench = false` so criterion flags are not passed to libtest, and the
   benchmarks use a synthetic COG generated at startup (or a file given by the
   `COGRS_BENCH_COG` environment variable) instead of a missing test file
-- `S3CogSource::scan` panicked when called from async code (it opened each COG with the
-  blocking S3 reader on the runtime thread); metadata reads now run on the blocking pool
+- `S3CogSource::scan` ignored `AWS_SKIP_SIGNATURE` (anonymous listing of public buckets
+  failed) and panicked when called from async code; it is now fully async
 - `S3CogSource::scan` honors `AWS_DEFAULT_REGION` and bucket region detection like `S3Config`
 
 ## [0.0.4] - 2025-12-10

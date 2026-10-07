@@ -19,8 +19,8 @@ use cogrs::{CogReader, PointQuery, TileExtractor};
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let reader = CogReader::open_async("path/to/file.tif").await?;
 
-    // Point query (sync I/O; use `reader.spawn_blocking(..)` for remote sources)
-    let result = reader.sample_lonlat(-122.4, 37.8)?;
+    // Point query (async: the containing tile is fetched without blocking a thread)
+    let result = reader.sample_lonlat_async(-122.4, 37.8).await?;
 
     // XYZ tile extraction (async)
     let tile = TileExtractor::new(&reader)
@@ -34,14 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 ## Sources
 
-From async code (axum/tokio handlers, etc.) always open with `CogReader::open_async`. It runs
-the blocking header/IFD reads on tokio's blocking pool and works on both `multi_thread` and
-`current_thread` runtimes. S3 and HTTP sources need it: the synchronous `CogReader::open`
-blocks the calling thread. Called on an async worker thread it is converted to an error
-only on a best-effort basis: with unwinding panics tokio's panic message is still printed
-and an error naming `open_async` is returned; with `panic = "abort"` the process aborts;
-and in release builds the blocking HTTP reader may silently block the worker thread
-instead. Always use `open_async` from async code.
+Remote I/O (S3, HTTP(S)) is natively asynchronous. From async code (axum/tokio handlers, etc.)
+open with `CogReader::open_async` and extract with `TileExtractor`: waiting on the network
+never occupies a thread, and a tile that needs several source tiles fetches them
+concurrently (adjacent byte ranges are merged into one request, identical in-flight tiles
+are shared between concurrent requests). Only decoding and resampling use tokio's blocking
+pool. Works on `multi_thread` and `current_thread` runtimes.
 
 ```rust,no_run
 use cogrs::CogReader;
@@ -65,12 +63,39 @@ S3 configuration: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for credentials,
 `AWS_REGION`, then `AWS_DEFAULT_REGION`; if neither is set it is detected from the bucket
 (once per bucket per process) unless a custom endpoint is configured.
 
-Blocking APIs (`CogReader::open`, `sample_lonlat`, ...) are fine in plain threads and inside
-`spawn_blocking`. To call them from async code on an opened reader, use
-`reader.spawn_blocking(|r| r.sample_lonlat(lon, lat)).await`; tile extraction
-(`TileExtractor::extract`) is already async.
+Opening a remote COG is one ranged request (header, IFDs, size and ETag together), and every
+COG in the same bucket or host shares one HTTP client. Pass an `OverviewQualityHint` (see
+`open_async_with_hint`) to skip sampling tiles from the coarsest overview at open, and
+`IoOptions` (see `open_async_with_options`) to tune the concurrency limits, range
+coalescing, retries and timeouts:
+
+```rust,no_run
+use cogrs::{CogReader, IoOptions, OverviewQualityHint};
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let options = IoOptions { max_concurrent_requests: 8, ..IoOptions::default() };
+let reader = CogReader::open_async_with_options(
+    "s3://bucket/path/to/file.tif",
+    OverviewQualityHint::AllUsable,
+    &options,
+)
+.await?;
+// `CogReader` is cheap to clone (metadata is shared), so keep one per source and clone it
+// into handlers.
+let for_handler = reader.clone();
+# Ok(())
+# }
+```
+
+Plain threads (no async runtime) can use the synchronous API: `CogReader::open`,
+`read_tile`, `sample_lonlat`, ... Remote sources work there too; the request runs on a private
+I/O runtime while the calling thread blocks. On an async worker thread those calls block that
+worker, so use the `*_async` methods (or `reader.spawn_blocking(..)` for other sync work).
 
 ## Point Queries
+
+Async code uses `sample_lonlat_async` / `sample_crs_async` / `sample_points_lonlat_async`;
+the synchronous `PointQuery` trait below is for plain threads.
 
 ```rust,no_run
 use cogrs::{CogReader, PointQuery};
