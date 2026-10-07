@@ -59,6 +59,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   bucket for the life of the process. Failure to detect falls back to `us-east-1` with a
   warning
 - S3 open failures without credentials now mention `AWS_SKIP_SIGNATURE=true` for public buckets
+- Header cache: `CogCache` remembers the parsed header, overview metadata, object identity
+  (size, ETag, last-modified) and the computed overview-quality hint of remote COGs, so
+  re-opening a source sends no request and `ComputeAtRuntime` sampling runs once per source.
+  Concurrent first opens of one source share one request. Bounded by entry weight (64 MiB by
+  default, about 1.5 KiB plus 16 B per tile per entry), with `CacheConfig` for capacity, `ttl`
+  (1 h), `ttl_unvalidated` (60 s for servers without a usable validator) and `negative_ttl`
+  (5 s, `404` only). `CogCache::global()` is used by every `CogReader::open*` for `s3://` and
+  `http(s)://` sources (`COGRS_HEADER_CACHE=off` disables it, `COGRS_HEADER_CACHE_MB` sizes
+  it); `CogCache::new`, `CogCache::disabled` and `CogReader::builder(src).cache(..)
+  .cache_mode(CacheMode::{Use, Bypass, Refresh})` select another. `stats()` (`CacheStats`:
+  hits, misses, evictions, expirations, coalesced opens, 412 evictions, negative hits, plus the
+  decoded-tile cache), `invalidate(url)` and `clear()`. See the README's "Caching" section
+- `Validation { IfMatch, Ttl, Immutable }`: how reads are tied to the cached version. The
+  default sends the ETag as `If-Match` on every range request after the open (or
+  `If-Unmodified-Since` without a strong ETag); an overwritten object answers `412`, reported as
+  the typed `SourceChanged` error (`is_source_changed`)
+- `CogReader::reopen_after_change()`, and `AsyncRangeReader::reopen()` / `version()`
+  (`RangeReader::version()`): a source's version token (ETag, or size and mtime)
+- `SourceNotFound` (a `404` while opening), `io_stats()` (process-wide network requests and
+  bytes of the remote readers), `tile_cache::{set_capacity, clear, invalidate_source,
+  invalidate_identity, snapshot}` and `TileCacheStats`, `COGRS_TILE_CACHE_MB`
+- `bench_remote cache`: 64 concurrent open-per-request tiles through the header cache
 
 ### Changed
 
@@ -94,6 +116,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The synchronous and asynchronous point queries share one implementation (pixel lookup,
   per-band extraction, result construction). `PointQuery::sample_crs` and `CogReader::sample`
   now read a tile once and no longer copy it per band
+- Remote reads are conditional by default (see `Validation`), and opening a remote source goes
+  through the global header cache. Opt out with `COGRS_HEADER_CACHE=off` (no header caching;
+  reads stay conditional) or `Validation::Ttl` / `Validation::Immutable` (no conditions)
+- Extraction (`TileExtractor`, `Reprojector` and its streaming/chunk forms) and point queries
+  (`sample*`, `*_async`) that find the object replaced since the reader was opened run once more
+  against a fresh open instead of failing. The tile-index level `read_tile*` methods return
+  `SourceChanged`
+- Decoded tiles are keyed by the source's identifier *and version* (ETag; size and mtime for local
+  files) instead of the identifier alone; `ObjectStoreRangeReader::last_modified_unix` is `None`
+  when the server sent no `Last-Modified` (it was the epoch)
+- The decoded tile cache uses `parking_lot` (no poisoning panics), counts hits, misses and
+  evictions in atomics, and its capacity is configurable
 
 ### Removed
 
@@ -112,6 +146,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A COG overwritten under the same name (or a local file rewritten in place) was served from
+  decoded tiles of its previous contents; tiles are now keyed by version
+- The tile offset arrays of a remote COG were read without checking they belonged to the same
+  object version as the header (a torn open if the object changed in between); all reads after
+  the first are now conditional, and an open that fails the check is retried once
+- A failed S3 region probe (`AWS_REGION` unset) was repeated, up to 5 s, on every open; failures
+  are now remembered for 60 s
 - Rendered tiles were shifted by half a source pixel for `PixelIsArea` rasters (the common
   case): the renderer read the tiepoint-based coordinate as if integer values were pixel
   centres (that is the `PixelIsPoint` convention), so nearest took the pixel half a pixel to

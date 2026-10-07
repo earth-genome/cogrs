@@ -7,6 +7,7 @@ Pure Rust COG (Cloud Optimized `GeoTIFF`) reader library.
 - [Local, HTTP, and S3 sources](#sources)
 - [Point queries](#point-queries)
 - [XYZ tile extraction](#tile-extraction)
+- [Header and tile caching](#caching)
 - [Coordinate transforms](#coordinate-transforms)
 - [Compression: DEFLATE, LZW, ZSTD, JPEG, WebP](#compression)
 
@@ -139,6 +140,88 @@ let tile = TileExtractor::new(&reader)
 # Ok(())
 # }
 ```
+
+## Caching
+
+A tile server opens the same image for every request, so two caches sit behind
+`CogReader::open*` / `TileExtractor`:
+
+- **Header cache** (`CogCache`, remote sources only): the parsed header of each source, its
+  overview metadata, what the server reported about the object (size, ETag, last-modified)
+  and the computed overview-quality hint. Opening a cached source sends **no request**, and
+  the sampling that `OverviewQualityHint::ComputeAtRuntime` does runs once per source, not once
+  per open. Concurrent first opens of one source share a single request. Local files are not
+  cached (parsing them is cheap).
+- **Decoded tile cache** (process-wide, byte-bounded LRU): decompressed source tiles, keyed by
+  the source *and its version* (ETag, or size and modification time for local files), so a
+  replaced object can never be served from tiles decoded from its predecessor.
+
+| Setting | Default | |
+|---|---|---|
+| `CacheConfig::capacity_bytes` | 64 MiB | header entries weigh about 1.5 KiB + 16 B per tile: ~12 KB for a 10980 x 10980 COG with 512 px tiles, 0.8 to 3.3 MB for 100k x 100k |
+| `CacheConfig::ttl` | 1 hour | entries whose reads can be validated (below) |
+| `CacheConfig::ttl_unvalidated` | 60 seconds | entries from servers that give no usable validator |
+| `CacheConfig::negative_ttl` | 5 seconds | how long a `404` is remembered (`0` = off); `401`/`403`, server errors and timeouts never are |
+| `CacheConfig::validation` | `Validation::IfMatch` | see below |
+| tile cache capacity | 512 MiB | `tile_cache::set_capacity`, or `COGRS_TILE_CACHE_MB` |
+
+**When the object is overwritten.** Cached headers are only valid for the version they were read
+from. With the default `Validation::IfMatch`, every range request after the open carries the
+object's ETag as `If-Match` (or `If-Unmodified-Since` when the server has a `Last-Modified` but no
+strong ETag; weak ETags are never sent). A replaced object answers `412`, and the operation
+recovers on its own: the stale header entry and the old version's decoded tiles are dropped, the
+object is opened again (once, shared by all concurrent callers), and the extraction or point query
+runs again against the new header, once. The conditions travel with the requests that are sent
+anyway; they cost no round trip. `S3` honours them (verified against the real bucket by an
+ignored test), and so do HTTP servers that implement RFC 9110 `If-Match`.
+
+What it cannot detect: a server that ignores `If-Match`, or gives neither ETag nor
+`Last-Modified`, can only be caught when the entry's time to live runs out (`ttl_unvalidated`,
+60 s, for the latter). For objects that are never overwritten (date-versioned keys),
+`Validation::Immutable` sends no conditions and never expires entries; `Validation::Ttl`
+sends no conditions and expires entries after `ttl`. Low-level `read_tile*` calls report
+`SourceChanged` instead of retrying (a tile index only means something for the header it came
+from); a reader you keep for a long time stays pinned to the version it opened, like an open file
+handle, and every operation on it then costs one `412` plus a cached reopen: reopen the source
+(`open_async`) when you know it changed, or call `reader.reopen_after_change()`.
+
+```rust,no_run
+use cogrs::{CacheConfig, CacheMode, CogCache, CogReader, Validation};
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+// The global cache is used automatically; `COGRS_HEADER_CACHE=off` disables it, and
+// `COGRS_HEADER_CACHE_MB` sizes it.
+let reader = CogReader::open_async("s3://bucket/dated/2026-09-01/tci.tif").await?;
+
+// Your own cache (sized, immutable keys), passed explicitly; or `CogCache::disabled()`
+let cache = CogCache::new(CacheConfig { validation: Validation::Immutable, ..CacheConfig::default() });
+let reader = CogReader::builder("s3://bucket/dated/2026-09-01/tci.tif").cache(&cache).open_async().await?;
+// `CacheMode::Bypass` / `CacheMode::Refresh` per open
+let fresh = CogReader::builder("s3://bucket/live.tif").cache_mode(CacheMode::Refresh).open_async().await?;
+
+// You overwrote the object and want the next open to see it: drop it
+CogCache::global().invalidate("s3://bucket/live.tif");
+
+// Metrics: header hits/misses/evictions/expirations/coalesced opens/412 evictions/negative hits,
+// decoded-tile hits/misses/evictions, and network requests and bytes
+let stats = CogCache::global().stats();
+println!("{} header hits, {} tile hits", stats.headers.hits, stats.tiles.hits);
+println!("{:?}", cogrs::io_stats());
+# Ok(())
+# }
+```
+
+`stats()` costs a couple of atomic loads and one short lock; the counters are atomics, so reading
+them or counting a hit adds nothing to the hot path beyond the locks the caches already take.
+
+**Presigned and SAS URLs.** The query string is not part of a source's identity: two presigned
+URLs for one object share one header entry and the same decoded tiles, and each reader sends
+*its own* query string with its requests. That is what makes caching useful with per-request
+signed URLs, but it also means a cached header or tile can be served to a caller whose URL has
+expired or was never valid; access control stays with whoever hands out the URLs (S3 sources
+include the access key in the cache key, so credentials are not shared). The decoded tile cache
+has always worked this way. Use `CacheMode::Bypass` or a separate `CogCache` where that is not
+acceptable.
 
 ## WebP Output
 
