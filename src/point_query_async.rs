@@ -22,6 +22,10 @@ impl CogReader {
     /// # Errors
     /// Returns an error if reading or decompressing the tile containing the pixel fails.
     pub async fn sample_async(&self, band: usize, x: usize, y: usize) -> AnyResult<Option<f32>> {
+        self.with_revalidation(|reader| Box::pin(reader.sample_once(band, x, y))).await
+    }
+
+    async fn sample_once(&self, band: usize, x: usize, y: usize) -> AnyResult<Option<f32>> {
         let Some(tile_index) = self.metadata.tile_index_for_pixel(x, y) else {
             return Ok(None);
         };
@@ -39,6 +43,10 @@ impl CogReader {
     /// # Errors
     /// Returns an error if coordinate projection fails or if reading the tile fails.
     pub async fn sample_crs_async(&self, crs: i32, x: f64, y: f64) -> AnyResult<PointQueryResult> {
+        self.with_revalidation(|reader| Box::pin(reader.sample_crs_once(crs, x, y))).await
+    }
+
+    async fn sample_crs_once(&self, crs: i32, x: f64, y: f64) -> AnyResult<PointQueryResult> {
         let Some(pixel) = self.locate_pixel(crs, x, y)? else {
             return Ok(self.empty_point_result(crs));
         };

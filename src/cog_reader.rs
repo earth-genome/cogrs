@@ -16,13 +16,14 @@
 //! - Single transform inversion per tile (not per pixel)
 //! - Global LRU tile cache for decompressed data
 
-use crate::async_io::{block_on_io, AsyncRangeReader, AsyncToSync, IoOptions, SyncToAsync};
+use crate::async_io::{block_on_io, is_source_changed, AsyncRangeReader, AsyncToSync, IoOptions, SyncToAsync};
 use crate::range_reader::{create_range_reader, RangeReader};
 use crate::header_cache::{CacheMode, CogCache, ReaderOrigin};
 use crate::remote::{create_async_range_reader_with, Validation};
 use crate::tile_cache;
 use crate::tiff_utils::AnyResult;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -627,6 +628,40 @@ impl CogReader {
         }
     }
 
+    /// Run `op` on this reader; if it fails because the object changed since this reader was
+    /// opened ([`SourceChanged`](crate::SourceChanged)), run it once more on a fresh reader from
+    /// [`reopen_after_change`](Self::reopen_after_change).
+    ///
+    /// `op` must derive everything from the reader it is given (geometry, tile grid), since the
+    /// object may have changed shape. The retry happens at most once per call and its result is
+    /// returned as it is, so a source that keeps failing the check surfaces its error instead of
+    /// looping. Used by operations in geographic terms (extraction, point queries); the
+    /// tile-index level `read_tile*` methods report the error to the caller.
+    pub(crate) async fn with_revalidation<T, F>(&self, op: F) -> AnyResult<T>
+    where
+        F: for<'r> Fn(&'r CogReader) -> BoxFuture<'r, AnyResult<T>>,
+    {
+        match op(self).await {
+            Err(e) if is_source_changed(&*e) => {
+                let fresh = self.reopen_after_change().await?;
+                op(&fresh).await
+            }
+            other => other,
+        }
+    }
+
+    /// Blocking counterpart of [`with_revalidation`](Self::with_revalidation).
+    pub(crate) fn with_revalidation_sync<T>(&self, op: impl Fn(&CogReader) -> AnyResult<T>) -> AnyResult<T> {
+        match op(self) {
+            Err(e) if is_source_changed(&*e) => {
+                let stale = self.clone();
+                let fresh = block_on_io(async move { stale.reopen_after_change().await })??;
+                op(&fresh)
+            }
+            other => other,
+        }
+    }
+
     /// Run a synchronous operation on this reader (point queries, tile reads, ...) on tokio's
     /// blocking thread pool, without blocking the async runtime.
     ///
@@ -1126,12 +1161,14 @@ impl CogReader {
     /// # Errors
     /// Returns an error if reading or decompressing the tile containing the pixel fails.
     pub fn sample(&self, band: usize, x: usize, y: usize) -> AnyResult<Option<f32>> {
-        let Some(tile_index) = self.metadata.tile_index_for_pixel(x, y) else {
-            return Ok(None);
-        };
+        self.with_revalidation_sync(|reader| {
+            let Some(tile_index) = reader.metadata.tile_index_for_pixel(x, y) else {
+                return Ok(None);
+            };
 
-        let (tile, _) = self.read_tile_sync(TileRef { overview: None, index: tile_index })?;
-        Ok(self.value_in_tile(&tile, tile_index, band, x, y))
+            let (tile, _) = reader.read_tile_sync(TileRef { overview: None, index: tile_index })?;
+            Ok(reader.value_in_tile(&tile, tile_index, band, x, y))
+        })
     }
 
     /// The sample for `(band, x, y)` within the decoded full-resolution tile `tile_index`

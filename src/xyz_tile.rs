@@ -657,15 +657,13 @@ impl<'a> TileExtractor<'a> {
     /// Returns an error if bounds were not set, or if tile extraction fails.
     pub async fn extract(self) -> AnyResult<TileData> {
         let bounds = self.bounds.ok_or("Bounds not set: use .xyz() or .bounds()")?;
-        extract_tile_async(
-            self.reader,
-            bounds,
-            self.output_crs,
-            self.output_size,
-            self.resampling,
-            self.selected_bands,
-        )
-        .await
+        let Self { reader, output_crs, output_size, resampling, selected_bands, .. } = self;
+        // If the object was replaced since the reader was opened, extract again from a fresh open.
+        reader
+            .with_revalidation(|reader| {
+                Box::pin(extract_tile_async(reader, bounds, output_crs, output_size, resampling, selected_bands.clone()))
+            })
+            .await
     }
 
     /// Get the configured output size.
@@ -1397,8 +1395,39 @@ impl<'a> StreamingReprojector<'a> {
     }
 }
 
-/// Reproject the raster into `target_crs` (bounds/size/resolution as given or derived)
+/// Reproject the raster into `target_crs` (bounds/size/resolution as given or derived). If the
+/// object was replaced since the reader was opened, everything is derived again from a fresh open.
 async fn reproject(
+    reader: &CogReader,
+    target_crs: u32,
+    output_bounds: Option<BoundingBox>,
+    output_resolution: Option<(f64, f64)>,
+    output_size: Option<(usize, usize)>,
+    resampling: ResamplingMethod,
+    selected_bands: Option<&[usize]>,
+) -> Result<ReprojectedRaster, Box<dyn std::error::Error + Send + Sync>> {
+    // The retried future must own what it uses: the band list is copied for each attempt.
+    let bands = selected_bands.map(<[usize]>::to_vec);
+    reader
+        .with_revalidation(|reader| {
+            let bands = bands.clone();
+            Box::pin(async move {
+                reproject_once(
+                    reader,
+                    target_crs,
+                    output_bounds,
+                    output_resolution,
+                    output_size,
+                    resampling,
+                    bands.as_deref(),
+                )
+                .await
+            })
+        })
+        .await
+}
+
+async fn reproject_once(
     reader: &CogReader,
     target_crs: u32,
     output_bounds: Option<BoundingBox>,

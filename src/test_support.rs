@@ -462,6 +462,10 @@ struct ServerState {
     honor_conditionals: bool,
     /// Answer 503 to requests whose range starts at or after this offset.
     fail_from: Option<usize>,
+    /// Send a new ETag with every response and answer 412 to every conditional request: an
+    /// object that "changes" between any two requests.
+    flapping: bool,
+    flaps: u64,
 }
 
 /// Minimal range-capable HTTP/1.1 server on 127.0.0.1 whose objects can be replaced while it
@@ -493,6 +497,8 @@ impl ObjectServer {
                 delay,
                 honor_conditionals: true,
                 fail_from: None,
+                flapping: false,
+                flaps: 0,
             })),
             log: Arc::new(Mutex::new(Vec::new())),
         };
@@ -561,10 +567,14 @@ impl ObjectServer {
         if_match: Option<String>,
         if_unmodified_since: Option<String>,
     ) -> (Vec<u8>, u16, Option<(usize, usize)>) {
-        let (object, delay, honor, fail_from) = {
-            let state = self.state.lock();
+        let (object, delay, honor, fail_from, flap) = {
+            let mut state = self.state.lock();
             let object = state.objects.get(path).or(state.default.as_ref()).cloned();
-            (object, state.delay, state.honor_conditionals, state.fail_from)
+            let flap = state.flapping.then(|| {
+                state.flaps += 1;
+                state.flaps
+            });
+            (object, state.delay, state.honor_conditionals, state.fail_from, flap)
         };
         let resolved = range.map(|(a, b)| (a, b.unwrap_or(usize::MAX)));
         self.log.lock().push(format!("{} range={:?}", request_line.trim(), resolved));
@@ -576,7 +586,10 @@ impl ObjectServer {
         if fail_from.is_some_and(|from| resolved.map_or(0, |(a, _)| a) >= from) {
             return (empty("503 Service Unavailable"), 503, None);
         }
-        if honor && precondition_failed(&object, if_match.as_deref(), if_unmodified_since.as_deref()) {
+        let conditional = if_match.is_some() || if_unmodified_since.is_some();
+        if flap.is_some() && conditional
+            || flap.is_none() && honor && precondition_failed(&object, if_match.as_deref(), if_unmodified_since.as_deref())
+        {
             return (empty("412 Precondition Failed"), 412, None);
         }
         let last = object.data.len() - 1;
@@ -587,7 +600,8 @@ impl ObjectServer {
             body.len(),
             object.data.len()
         );
-        if let Some(etag) = &object.etag {
+        let etag = flap.map(|n| format!("\"flap{n}\"")).or_else(|| object.etag.clone());
+        if let Some(etag) = &etag {
             head.push_str(&format!("ETag: {etag}\r\n"));
         }
         if let Some(modified) = object.modified {
@@ -617,6 +631,11 @@ impl ObjectServer {
     /// Answer 503 to requests whose range starts at or after `offset` (`None`: stop failing).
     pub(crate) fn fail_from(&self, offset: Option<usize>) {
         self.state.lock().fail_from = offset;
+    }
+
+    /// Make the object "change" between any two requests (see `ServerState::flapping`).
+    pub(crate) fn set_flapping(&self, flapping: bool) {
+        self.state.lock().flapping = flapping;
     }
 
     pub(crate) fn requests(&self) -> Vec<RecordedRequest> {

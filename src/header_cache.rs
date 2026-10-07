@@ -1021,4 +1021,160 @@ mod tests {
         let stats = cache.stats().headers;
         assert_eq!((stats.entries, stats.hits, stats.misses), (0, 0, 0));
     }
+
+    // ---- Operations that find the object replaced run again once on a fresh open ----
+
+    use crate::cog_reader::TileRef;
+    use crate::range_reader::MemoryRangeReader;
+    use crate::xyz_tile::{BoundingBox, Reprojector, TileExtractor};
+
+    /// Two source windows over disjoint tiles of the 512 px raster (and of its 576 px successor).
+    fn window_a() -> BoundingBox {
+        BoundingBox::new(200.0, 4600.0, 1400.0, 5800.0)
+    }
+
+    fn window_b() -> BoundingBox {
+        BoundingBox::new(3000.0, 1500.0, 4500.0, 3000.0)
+    }
+
+    async fn extract(reader: &CogReader, bounds: BoundingBox) -> AnyResult<Vec<f32>> {
+        Ok(TileExtractor::new(reader).bounds(bounds).size(128).extract().await?.pixels)
+    }
+
+    fn same(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()))
+    }
+
+    /// The object as an uncached, in-memory reader would read it: the reference for what an
+    /// extraction must return.
+    fn direct(bytes: &[u8], id: &str) -> CogReader {
+        CogReader::from_reader_with_hint(Arc::new(MemoryRangeReader::new(bytes.to_vec(), id.to_string())), Hint::NoneUsable)
+            .unwrap()
+    }
+
+    fn unconditional_requests(server: &ObjectServer) -> usize {
+        server.requests().iter().filter(|r| r.if_match.is_none() && r.if_unmodified_since.is_none()).count()
+    }
+
+    fn cached_tiles(reader: &CogReader) -> usize {
+        (0..reader.overviews.first().map_or(0, |_| 0) + reader.metadata.tile_offsets.len())
+            .filter(|&i| reader.cached_tile(TileRef { overview: None, index: i }).is_some())
+            .count()
+    }
+
+    #[tokio::test]
+    async fn extraction_after_an_overwrite_returns_exactly_the_new_objects_pixels() {
+        let v1 = build_cog(&spec(512, pattern_a));
+        let v2 = build_cog(&spec(576, pattern_b));
+        let server = server(ServedObject::new(v1.clone()).etag(Some("\"v1\"")));
+        let url = format!("{}/o.tif", server.base());
+        let cache = cache_with(|_| {});
+        let reader = open(&cache, &url, Hint::NoneUsable).await.unwrap();
+
+        let a_old = extract(&reader, window_a()).await.unwrap();
+        assert!(same(&a_old, &extract(&direct(&v1, "mem://reval/v1"), window_a()).await.unwrap()));
+        assert!(cached_tiles(&reader) > 0, "the first extraction filled the tile cache");
+
+        // The object is overwritten: a different size, different pixels, a new ETag.
+        server.replace_default(Some(ServedObject::new(v2.clone()).etag(Some("\"v2\""))));
+        let opens_before = unconditional_requests(&server);
+
+        // Window B needs tiles that are not cached: the conditional read fails (412) and the
+        // extraction runs again on a fresh open of the new object.
+        let b_new = extract(&reader, window_b()).await.unwrap();
+        let truth = direct(&v2, "mem://reval/v2");
+        let expected = extract(&truth, window_b()).await.unwrap();
+        assert!(same(&b_new, &expected), "pixels must be exactly the new object's");
+        let b_old = extract(&direct(&v1, "mem://reval/v1b"), window_b()).await.unwrap();
+        assert!(!same(&b_new, &b_old), "the test must tell the two objects apart");
+
+        assert_eq!(unconditional_requests(&server) - opens_before, 1, "one fresh open");
+        assert_eq!(cache.stats().headers.stale_evictions, 1);
+        assert_eq!(cached_tiles(&reader), 0, "the old version's decoded tiles were dropped");
+
+        // The stale reader stays pinned to the old version and heals itself on each use: window A
+        // was cached for the old version only, so it is now read (and checked) again.
+        let a_new = extract(&reader, window_a()).await.unwrap();
+        assert!(same(&a_new, &extract(&truth, window_a()).await.unwrap()));
+        assert!(!same(&a_new, &a_old));
+        let fresh = open(&cache, &url, Hint::NoneUsable).await.unwrap();
+        assert_eq!(fresh.metadata.width, 576);
+        assert!(same(&extract(&fresh, window_b()).await.unwrap(), &expected));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_extractions_after_an_overwrite_share_one_reopen() {
+        let v2 = build_cog(&spec(576, pattern_b));
+        let server = ObjectServer::start(Some(object(512, pattern_a, "\"v1\"")), Duration::from_millis(20));
+        let url = format!("{}/c.tif", server.base());
+        let cache = cache_with(|_| {});
+        let reader = open(&cache, &url, Hint::NoneUsable).await.unwrap();
+
+        server.replace_default(Some(ServedObject::new(v2.clone()).etag(Some("\"v2\""))));
+        let before = unconditional_requests(&server);
+        let results = futures::future::join_all((0..32).map(|_| extract(&reader, window_b()))).await;
+        let expected = extract(&direct(&v2, "mem://reval/concurrent"), window_b()).await.unwrap();
+        for result in results {
+            assert!(same(&result.unwrap(), &expected));
+        }
+        assert_eq!(unconditional_requests(&server) - before, 1, "32 operations, one reopen");
+        assert_eq!(cache.stats().headers.stale_evictions, 1);
+    }
+
+    #[tokio::test]
+    async fn a_source_that_keeps_changing_fails_after_one_retry() {
+        let server = server(object(512, pattern_a, "\"v1\""));
+        let url = format!("{}/f.tif", server.base());
+        let cache = cache_with(|_| {});
+        let reader = open(&cache, &url, Hint::NoneUsable).await.unwrap();
+
+        // Every response carries a new ETag and every conditional read fails: a retry cannot help.
+        server.set_flapping(true);
+        let before = server.requests().len();
+        let err = extract(&reader, window_b()).await.unwrap_err();
+        assert!(crate::async_io::is_source_changed(&*err), "{err}");
+        let requests = server.requests();
+        let new = &requests[before..];
+        assert_eq!(new.iter().filter(|r| r.if_match.is_none()).count(), 1, "exactly one reopen: {new:?}");
+        assert!(new.len() < 40, "bounded work: {} requests", new.len());
+        assert!(new.iter().filter(|r| r.if_match.is_some()).all(|r| r.status == 412));
+    }
+
+    #[tokio::test]
+    async fn point_queries_after_an_overwrite_read_the_new_object() {
+        let v2 = build_cog(&spec(576, pattern_b));
+        let server = server(object(512, pattern_a, "\"v1\""));
+        let url = format!("{}/p.tif", server.base());
+        let cache = cache_with(|_| {});
+        let reader = open(&cache, &url, Hint::NoneUsable).await.unwrap();
+        assert_eq!(reader.sample_async(0, 20, 20).await.unwrap(), Some(pattern_a(0, 20, 20) as f32));
+
+        server.replace_default(Some(ServedObject::new(v2).etag(Some("\"v2\""))));
+        // Async: pixel (500, 500) lies in a tile that is not cached; the grids differ (8 v. 9 tiles across)
+        assert_eq!(reader.sample_async(0, 500, 500).await.unwrap(), Some(pattern_b(0, 500, 500) as f32));
+        // Sync, from a blocking thread
+        let sync_reader = reader.clone();
+        let value = tokio::task::spawn_blocking(move || sync_reader.sample(0, 100, 100)).await.unwrap().unwrap();
+        assert_eq!(value, Some(pattern_b(0, 100, 100) as f32));
+    }
+
+    #[tokio::test]
+    async fn reprojection_after_an_overwrite_uses_the_new_geometry() {
+        let v2 = build_cog(&spec(576, pattern_b));
+        let server = server(object(512, pattern_a, "\"v1\""));
+        let url = format!("{}/rp.tif", server.base());
+        let cache = cache_with(|_| {});
+        let reader = open(&cache, &url, Hint::NoneUsable).await.unwrap();
+
+        server.replace_default(Some(ServedObject::new(v2.clone()).etag(Some("\"v2\""))));
+        // Bounds from the new object's extent (it grew to the south)
+        let bounds = BoundingBox::new(3000.0, 700.0, 4500.0, 2200.0);
+        let run = |r: CogReader| async move {
+            Reprojector::new(&r).to_crs(3857).bounds(bounds).size(96, 96).extract().await.unwrap().pixels
+        };
+        let got = run(reader.clone()).await;
+        let expected = run(direct(&v2, "mem://reval/reproject")).await;
+        assert!(same(&got, &expected));
+        assert!(got.iter().any(|v| !v.is_nan()), "the window must be inside the new, larger extent");
+    }
 }

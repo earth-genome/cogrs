@@ -23,13 +23,21 @@ use ahash::AHashMap;
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
-use crate::async_io::RangeFetchError;
+use crate::async_io::{is_source_changed, RangeFetchError, SourceChanged};
 use crate::cog_reader::{CogReader, TileRef, TileSpan};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Outcome of fetching one tile, as shared with followers. Errors are shared as text.
-type TileResult = Result<Arc<Vec<f32>>, Arc<str>>;
+/// Why a tile could not be produced, as shared with followers. Messages are shared as text.
+#[derive(Clone)]
+enum TileFailure {
+    Message(Arc<str>),
+    /// The object changed since the reader was opened (carries the identifier).
+    SourceChanged(Arc<str>),
+}
+
+/// Outcome of fetching one tile, as shared with followers.
+type TileResult = Result<Arc<Vec<f32>>, TileFailure>;
 
 /// Decoded source tiles plus I/O statistics for the tiles this call fetched itself.
 #[derive(Default)]
@@ -95,6 +103,15 @@ fn tile_error(index: usize, overview: Option<usize>, cause: impl std::fmt::Displ
     format!("Failed to read source tile {index} (overview {overview:?}): {cause}").into()
 }
 
+/// The error for `failure`: [`SourceChanged`] unchanged (callers react to it), anything else
+/// named after the tile.
+fn failure_error(index: usize, overview: Option<usize>, failure: &TileFailure) -> BoxError {
+    match failure {
+        TileFailure::SourceChanged(identifier) => Box::new(SourceChanged { identifier: identifier.to_string() }),
+        TileFailure::Message(message) => tile_error(index, overview, message),
+    }
+}
+
 /// Fetch and decode `needed` tiles (indexes within `overview`'s level; `None` = full
 /// resolution).
 ///
@@ -153,7 +170,7 @@ pub(crate) async fn fetch_tiles(
                 Followed::Ready(data) => {
                     out.tiles.insert(index, data);
                 }
-                Followed::Failed(message) => return Err(tile_error(index, overview, message)),
+                Followed::Failed(failure) => return Err(failure_error(index, overview, &failure)),
                 // The leader went away without a result: resolve the tile again.
                 Followed::Abandoned => pending.push(index),
             }
@@ -190,11 +207,15 @@ async fn fetch_and_decode(
                         .map(|((index, _, _), _)| *index)
                 })
                 .unwrap_or(leaders[0].0);
-            let message: Arc<str> = e.to_string().into();
+            let failure = if is_source_changed(&*e) {
+                TileFailure::SourceChanged(reader.identifier().into())
+            } else {
+                TileFailure::Message(e.to_string().into())
+            };
             for (_, _, leader) in &leaders {
-                leader.publish(Err(Arc::clone(&message)));
+                leader.publish(Err(failure.clone()));
             }
-            return Err(tile_error(culprit, overview, message));
+            return Err(failure_error(culprit, overview, &failure));
         }
     };
 
@@ -217,9 +238,9 @@ async fn fetch_and_decode(
                     Ok((index, data, span.len))
                 }
                 Err(message) => {
-                    let message: Arc<str> = message.into();
-                    leader.publish(Err(Arc::clone(&message)));
-                    Err(tile_error(index, overview, message))
+                    let failure = TileFailure::Message(message.into());
+                    leader.publish(Err(failure.clone()));
+                    Err(failure_error(index, overview, &failure))
                 }
             }
         }
@@ -229,7 +250,7 @@ async fn fetch_and_decode(
 
 enum Followed {
     Ready(Arc<Vec<f32>>),
-    Failed(Arc<str>),
+    Failed(TileFailure),
     Abandoned,
 }
 
@@ -240,7 +261,7 @@ async fn wait_for_followers(
         let outcome = match rx.wait_for(Option::is_some).await {
             Ok(value) => match value.as_ref() {
                 Some(Ok(data)) => Followed::Ready(Arc::clone(data)),
-                Some(Err(message)) => Followed::Failed(Arc::clone(message)),
+                Some(Err(failure)) => Followed::Failed(failure.clone()),
                 None => Followed::Abandoned,
             },
             Err(_) => Followed::Abandoned,

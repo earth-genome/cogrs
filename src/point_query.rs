@@ -186,16 +186,18 @@ impl PointQuery for CogReader {
     }
 
     fn sample_crs(&self, crs: i32, x: f64, y: f64) -> AnyResult<PointQueryResult> {
-        let Some(pixel) = self.locate_pixel(crs, x, y)? else {
-            return Ok(self.empty_point_result(crs));
-        };
-        let Some(tile_index) = self.metadata.tile_index_for_pixel(pixel.0, pixel.1) else {
-            return Ok(self.empty_point_result(crs));
-        };
+        self.with_revalidation_sync(|reader| {
+            let Some(pixel) = reader.locate_pixel(crs, x, y)? else {
+                return Ok(reader.empty_point_result(crs));
+            };
+            let Some(tile_index) = reader.metadata.tile_index_for_pixel(pixel.0, pixel.1) else {
+                return Ok(reader.empty_point_result(crs));
+            };
 
-        // One tile read serves every band
-        let (tile, _) = self.read_tile_sync(TileRef { overview: None, index: tile_index })?;
-        Ok(self.point_result(crs, pixel, &tile, tile_index))
+            // One tile read serves every band
+            let (tile, _) = reader.read_tile_sync(TileRef { overview: None, index: tile_index })?;
+            Ok(reader.point_result(crs, pixel, &tile, tile_index))
+        })
     }
 
     fn sample_band_lonlat(&self, lon: f64, lat: f64, band: usize) -> AnyResult<Option<f32>> {
