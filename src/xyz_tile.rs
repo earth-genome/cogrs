@@ -88,6 +88,8 @@ pub struct TileData {
     /// Overview level used (None = full resolution, Some(n) = overview index)
     pub overview_used: Option<usize>,
     /// `NoData` value of the source COG (`None` if the COG declares none).
+    ///
+    /// Used by [`TileData::to_webp`] to mask nodata pixels as transparent.
     pub nodata: Option<f64>,
 }
 
@@ -2387,6 +2389,19 @@ mod tests {
                     assert_ne!(at(x, y), 0.0, "{method:?}: ({x},{y}) is 0.0");
                 }
             }
+
+            // to_webp: outside is alpha 0, inside alpha 255
+            let img = image::load_from_memory(&tile.to_webp().unwrap()).unwrap().to_rgba8();
+            for y in 0..256u32 {
+                for x in (EDGE_RASTER_W as u32 + 4)..256 {
+                    assert_eq!(img.get_pixel(x, y).0[3], 0, "{method:?}: webp ({x},{y})");
+                }
+            }
+            for y in 4..252u32 {
+                for x in 0..(EDGE_RASTER_W as u32 - 4) {
+                    assert_eq!(img.get_pixel(x, y).0[3], 255, "{method:?}: webp ({x},{y})");
+                }
+            }
         }
     }
 
@@ -2420,6 +2435,8 @@ mod tests {
         let tile = TileExtractor::new(&reader).xyz(2, 2, 2).size(64).extract().await.unwrap();
         assert_eq!(tile.pixels.len(), 64 * 64);
         assert!(tile.pixels.iter().all(|v| v.is_nan()));
+        let img = image::load_from_memory(&tile.to_webp().unwrap()).unwrap().to_rgba8();
+        assert!(img.pixels().all(|p| p.0[3] == 0));
     }
 
     #[tokio::test]

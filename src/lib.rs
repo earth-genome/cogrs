@@ -14,6 +14,7 @@
 //! - [`s3`]: S3-compatible storage backend
 //! - [`raster`]: Raster data abstraction trait
 //! - [`geotiff_writer`]: Write reprojected rasters to GeoTIFF files
+//! - [`webp`]: Lossless RGBA WebP encoding of extracted tiles ([`TileData::to_webp`])
 
 // ============================================================================
 // Public modules
@@ -33,6 +34,7 @@ pub mod tiff_chunked;
 pub mod tiff_utils;
 pub mod tile_cache;
 pub mod xyz_tile;
+pub mod webp;
 
 // ============================================================================
 // Core COG Types
@@ -71,6 +73,8 @@ pub use xyz_tile::{
     CoordTransformer,
     ResamplingMethod,
 };
+
+pub use webp::WebpOptions;
 
 // ============================================================================
 // Raster Reprojection

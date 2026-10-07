@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `TileData::to_webp()` / `TileData::to_webp_with(&WebpOptions)`: lossless RGBA8 WebP
+  encoding of extracted tiles (pure Rust, via the `image` crate). Supports 1 (gray),
+  3 (RGB) and 4 (RGBA) bands; nodata/NaN pixels become transparent; values are rounded
+  and clamped to `0..=255`, with an optional explicit `(min, max)` linear rescale
+- `WebpOptions` (`nodata` override, `rescale`), re-exported from the crate root
 - `TileData::nodata`: the source COG's nodata value, set at extraction time
 - `PrefixCachedRangeReader`: serves reads inside the first 16 KiB of a source from
   memory. `CogReader::open` now wraps non-local readers with it, so opening a remote

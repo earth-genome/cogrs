@@ -94,6 +94,31 @@ let tile = TileExtractor::new(&reader)
 # }
 ```
 
+## WebP Output
+
+Extracted tiles encode to lossless RGBA8 WebP (pure Rust). Pixels equal to the
+COG's nodata value (in all bands) or NaN become transparent; 1-band tiles are
+expanded to gray, 3-band to RGB, 4-band keeps its alpha. Values are rounded and
+clamped to `0..=255`; use `WebpOptions::rescale` for 16-bit/float data.
+Areas of a tile outside the COG extent are filled with the COG's nodata value
+(or `NaN` if it declares none), so edge tiles come out transparent there.
+
+```rust,no_run
+use cogrs::{CogReader, TileExtractor, WebpOptions};
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let reader = CogReader::open("imagery.tif")?;
+let tile = TileExtractor::new(&reader).xyz(10, 163, 395).extract().await?;
+
+let webp: Vec<u8> = tile.to_webp()?;
+
+// 16-bit source: map 0..3000 linearly onto 0..255, override nodata
+let opts = WebpOptions { rescale: Some((0.0, 3000.0)), nodata: Some(0.0) };
+let webp = tile.to_webp_with(&opts)?;
+# Ok(())
+# }
+```
+
 ## Coordinate Transforms
 
 ```rust
