@@ -81,6 +81,12 @@ pub trait RangeReader: Send + Sync {
         !id.starts_with("http://") && !id.starts_with("https://") && !id.starts_with("s3://")
     }
 
+    /// True when `read_range` never blocks on I/O (e.g. in-memory data), so async adapters
+    /// may call it directly instead of moving it to a blocking thread.
+    fn reads_inline(&self) -> bool {
+        false
+    }
+
     /// Whether this reader already serves the start of the file from memory.
     ///
     /// Used to avoid wrapping a reader in [`PrefixCachedRangeReader`] twice.
@@ -174,6 +180,10 @@ impl RangeReader for MemoryRangeReader {
 
     fn is_local(&self) -> bool {
         true // Memory is fast, treat as local
+    }
+
+    fn reads_inline(&self) -> bool {
+        true
     }
 }
 

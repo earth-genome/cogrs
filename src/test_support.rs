@@ -277,3 +277,111 @@ pub(crate) fn build_cog(spec: &CogSpec) -> Vec<u8> {
     }
     out
 }
+
+// ============================================================================
+// Mock async reader
+// ============================================================================
+
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures::future::BoxFuture;
+
+use crate::async_io::{AsyncRangeReader, IoOptions};
+use crate::tiff_utils::AnyResult;
+
+/// In-memory [`AsyncRangeReader`] that behaves like a remote source: every read takes
+/// `latency` (via `tokio::time::sleep`, so it works with paused time), and the calls made, the
+/// number in flight and the high-water mark are recorded.
+pub(crate) struct MockReader {
+    data: Bytes,
+    identifier: String,
+    latency: Duration,
+    options: IoOptions,
+    calls: Mutex<Vec<Range<u64>>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    /// Reads whose range overlaps one of these fail.
+    fail_ranges: Mutex<Vec<Range<u64>>>,
+}
+
+impl MockReader {
+    pub(crate) fn new(data: Vec<u8>, identifier: &str, latency: Duration) -> Self {
+        Self {
+            data: Bytes::from(data),
+            identifier: identifier.to_string(),
+            latency,
+            options: IoOptions::default(),
+            calls: Mutex::default(),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            fail_ranges: Mutex::default(),
+        }
+    }
+
+    pub(crate) fn with_options(mut self, options: IoOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    pub(crate) fn fail_on(&self, range: Range<u64>) {
+        self.fail_ranges.lock().unwrap().push(range);
+    }
+
+    /// Ranges requested so far, in call order.
+    pub(crate) fn calls(&self) -> Vec<Range<u64>> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn call_count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn reset(&self) {
+        self.calls.lock().unwrap().clear();
+        self.max_in_flight.store(0, Ordering::SeqCst);
+    }
+}
+
+impl AsyncRangeReader for MockReader {
+    fn read_range(&self, offset: u64, len: usize) -> BoxFuture<'_, AnyResult<Bytes>> {
+        Box::pin(async move {
+            let range = offset..offset + len as u64;
+            self.calls.lock().unwrap().push(range.clone());
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.latency).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if self.fail_ranges.lock().unwrap().iter().any(|f| f.start < range.end && range.start < f.end) {
+                return Err(format!("injected failure for {range:?}").into());
+            }
+            if range.end > self.data.len() as u64 {
+                return Err(format!("range {range:?} outside mock of {} bytes", self.data.len()).into());
+            }
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        })
+    }
+
+    fn size(&self) -> u64 {
+        self.data.len() as u64
+    }
+
+    fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    fn is_local(&self) -> bool {
+        false
+    }
+
+    fn io_options(&self) -> &IoOptions {
+        &self.options
+    }
+}

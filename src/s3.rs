@@ -46,14 +46,17 @@
 //! }
 //! ```
 
+use crate::async_io::{AsyncRangeReader, IoOptions};
 use crate::range_reader::{blocking_call, RangeReader};
+use crate::remote::ObjectStoreRangeReader;
 use crate::tiff_utils::AnyResult;
-use object_store::aws::{resolve_bucket_region, AmazonS3Builder};
-use object_store::path::Path as ObjectPath;
-use object_store::{ClientOptions, GetOptions, GetRange, ObjectStore};
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use object_store::aws::resolve_bucket_region;
+use object_store::ClientOptions;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::runtime::Handle;
 
@@ -225,12 +228,12 @@ impl S3Config {
     }
 }
 
-/// Async S3 range reader using `object_store`
+/// Async S3 range reader using `object_store`.
+///
+/// A thin, S3-specific front for [`ObjectStoreRangeReader`]; it implements
+/// [`AsyncRangeReader`].
 pub struct S3RangeReaderAsync {
-    store: Arc<dyn ObjectStore>,
-    path: ObjectPath,
-    size: u64,
-    url: String,
+    inner: ObjectStoreRangeReader,
 }
 
 impl S3RangeReaderAsync {
@@ -260,62 +263,15 @@ impl S3RangeReaderAsync {
     /// # Errors
     /// Returns an error if the S3 configuration is invalid or the object cannot be accessed.
     pub async fn from_config(config: S3Config) -> AnyResult<Self> {
-        let mut builder = AmazonS3Builder::new()
-            .with_bucket_name(&config.bucket);
+        Self::from_config_with_options(config, &IoOptions::default()).await
+    }
 
-        // explicit config > AWS_REGION > AWS_DEFAULT_REGION > detect from the bucket
-        let region =
-            resolve_region(&config.bucket, config.region.as_deref(), config.endpoint_url.as_deref()).await;
-        if let Some(region) = &region {
-            builder = builder.with_region(region);
-        }
-
-        if let Some(endpoint) = &config.endpoint_url {
-            builder = builder.with_endpoint(endpoint);
-        }
-
-        if let Some(access_key) = &config.access_key_id {
-            builder = builder.with_access_key_id(access_key);
-        }
-
-        if let Some(secret_key) = &config.secret_access_key {
-            builder = builder.with_secret_access_key(secret_key);
-        }
-
-        if config.allow_http {
-            builder = builder.with_allow_http(true);
-        }
-
-        if config.skip_signature {
-            builder = builder.with_skip_signature(true);
-        }
-
-        let store = builder.build()?;
-        let path = ObjectPath::from(config.key.as_str());
-
-        // Get file size via HEAD request
-        let meta = store.head(&path).await.map_err(|e| {
-            let hint = if !config.skip_signature
-                && config.access_key_id.is_none()
-                && !matches!(e, object_store::Error::NotFound { .. })
-            {
-                ". No AWS credentials are configured; if this is a public bucket set \
-                 AWS_SKIP_SIGNATURE=true (or S3Config::skip_signature) for anonymous access"
-            } else {
-                ""
-            };
-            format!("Failed to open s3://{}/{}: {e}{hint}", config.bucket, config.key)
-        })?;
-        let size = meta.size as u64;
-
-        let url = format!("s3://{}/{}", config.bucket, config.key);
-
-        Ok(Self {
-            store: Arc::new(store),
-            path,
-            size,
-            url,
-        })
+    /// Create a new S3 range reader from a config and explicit [`IoOptions`]
+    ///
+    /// # Errors
+    /// Returns an error if the S3 configuration is invalid or the object cannot be accessed.
+    pub async fn from_config_with_options(config: S3Config, options: &IoOptions) -> AnyResult<Self> {
+        Ok(Self { inner: ObjectStoreRangeReader::open_s3(config, options).await? })
     }
 
     /// Read a range of bytes asynchronously
@@ -323,31 +279,45 @@ impl S3RangeReaderAsync {
     /// # Errors
     /// Returns an error if the S3 read operation fails due to network issues or invalid ranges.
     pub async fn read_range_async(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
-        let range = Range {
-            start: offset,
-            end: offset + length as u64,
-        };
-
-        let options = GetOptions {
-            range: Some(GetRange::Bounded(range)),
-            ..Default::default()
-        };
-
-        let result = self.store.get_opts(&self.path, options).await?;
-        let bytes = result.bytes().await?;
-        Ok(bytes.to_vec())
+        Ok(self.inner.read_range(offset, length).await?.into())
     }
 
     /// Get the file size
-    #[must_use] 
+    #[must_use]
     pub fn size(&self) -> u64 {
-        self.size
+        self.inner.size()
     }
 
     /// Get the S3 URL
-    #[must_use] 
+    #[must_use]
     pub fn url(&self) -> &str {
-        &self.url
+        self.inner.identifier()
+    }
+}
+
+impl AsyncRangeReader for S3RangeReaderAsync {
+    fn read_range(&self, offset: u64, len: usize) -> BoxFuture<'_, AnyResult<Bytes>> {
+        self.inner.read_range(offset, len)
+    }
+
+    fn read_ranges<'a>(&'a self, ranges: &'a [Range<u64>]) -> BoxFuture<'a, AnyResult<Vec<Bytes>>> {
+        self.inner.read_ranges(ranges)
+    }
+
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    fn identifier(&self) -> &str {
+        self.inner.identifier()
+    }
+
+    fn is_local(&self) -> bool {
+        false
+    }
+
+    fn io_options(&self) -> &IoOptions {
+        self.inner.io_options()
     }
 }
 
@@ -405,11 +375,11 @@ impl RangeReader for S3RangeReaderSync {
     }
 
     fn size(&self) -> u64 {
-        self.inner.size
+        self.inner.size()
     }
 
     fn identifier(&self) -> &str {
-        &self.inner.url
+        self.inner.url()
     }
 
     fn is_local(&self) -> bool {

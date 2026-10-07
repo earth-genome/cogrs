@@ -20,6 +20,7 @@
 // Public modules
 // ============================================================================
 
+pub mod async_io;
 pub mod casting;
 pub mod cog_reader;
 pub mod geometry;
@@ -31,6 +32,7 @@ pub mod raster;
 pub mod s3;
 pub mod source;
 pub mod tiff_chunked;
+pub mod remote;
 pub mod tiff_utils;
 pub mod tile_cache;
 pub mod xyz_tile;
@@ -121,6 +123,15 @@ pub use range_reader::{
     PrefixCachedRangeReader,
     create_range_reader,
 };
+
+pub use async_io::{
+    AsyncRangeReader,
+    AsyncToSync,
+    IoOptions,
+    SyncToAsync,
+    fetch_ranges,
+};
+pub use remote::{ObjectStoreRangeReader, create_async_range_reader};
 
 // ============================================================================
 // S3 Support
