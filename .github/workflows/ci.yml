@@ -18,11 +18,13 @@ jobs:
     runs-on: ubuntu-24.04
     container: ghcr.io/osgeo/gdal:ubuntu-small-3.12.2
     steps:
+      # The GDAL image already has curl, unzip, python3+osgeo and the GDAL headers. Added:
+      # build-essential (cc/linker), libclang-dev + pkg-config (gdal-sys bindgen), git (cargo git dep).
       - name: Install build deps
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config git curl ca-certificates
-      - uses: actions/checkout@v4
+          apt-get update -o Acquire::Retries=3
+          apt-get install -y --no-install-recommends -o Acquire::Retries=3 build-essential libclang-dev pkg-config git
+      - uses: actions/checkout@v7
       # Pinned: newer stable clippy adds lints (e.g. chunks_exact_to_as_chunks) that the
       # codebase hasn't been migrated to yet.
       - uses: dtolnay/rust-toolchain@1.93.1
@@ -40,14 +42,14 @@ jobs:
       # (ships headers, gdal_translate and python3 osgeo).
       - name: Install build deps and fixture tools
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential libclang-dev pkg-config git curl ca-certificates unzip libtiff-tools python3-numpy
-      - uses: actions/checkout@v4
+          apt-get update -o Acquire::Retries=3
+          apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
+            build-essential libclang-dev pkg-config git libtiff-tools python3-numpy
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Cache test fixtures
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             tests/data/*.tif
@@ -72,9 +74,9 @@ jobs:
     steps:
       - name: Install build deps
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config git curl ca-certificates
-      - uses: actions/checkout@v4
+          apt-get update -o Acquire::Retries=3
+          apt-get install -y --no-install-recommends -o Acquire::Retries=3 build-essential libclang-dev pkg-config git
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
