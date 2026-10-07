@@ -56,10 +56,30 @@ use object_store::ClientOptions;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Process-wide cache of detected bucket regions.
 static BUCKET_REGIONS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
+
+/// How long a failed region probe is remembered. Without this, every open of an object in a
+/// bucket whose region cannot be detected (no route, the probe's 5 s connect timeout, a bucket
+/// that denies it) waits for the probe again.
+const REGION_FAILURE_TTL: Duration = Duration::from_secs(60);
+
+/// Buckets whose region probe failed, with when and why.
+static REGION_FAILURES: LazyLock<Mutex<HashMap<String, (Instant, String)>>> = LazyLock::new(Mutex::default);
+
+/// Whether a failure recorded at `at` is still remembered at `now`.
+fn failure_is_fresh(at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(at) < REGION_FAILURE_TTL
+}
+
+/// Why a bucket's region could not be detected; `remembered` if this is a recent failure that
+/// was not probed again.
+struct DetectFailure {
+    message: String,
+    remembered: bool,
+}
 
 /// Treat unset and empty/whitespace values alike.
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -105,12 +125,16 @@ pub(crate) async fn resolve_region(
     }
     match detect_bucket_region(bucket).await {
         Ok(region) => Some(region),
-        Err(e) => {
+        Err(failure) if failure.remembered => {
+            tracing::debug!(bucket, error = %failure.message, "S3 bucket region unknown (recent failure); using the default");
+            None
+        }
+        Err(failure) => {
             tracing::warn!(
                 bucket,
-                error = %e,
-                "Could not detect S3 bucket region; falling back to us-east-1. \
-                 Set AWS_REGION to avoid detection"
+                error = %failure.message,
+                "Could not detect S3 bucket region; falling back to us-east-1 \
+                 (not probing again for 60 s). Set AWS_REGION to avoid detection"
             );
             None
         }
@@ -126,24 +150,44 @@ pub(crate) fn region_from_env() -> Option<String> {
     )
 }
 
-/// Resolve a bucket's region, using the process-wide cache.
-async fn detect_bucket_region(bucket: &str) -> AnyResult<String> {
+/// Resolve a bucket's region, using the process-wide caches of regions and of recent failures.
+async fn detect_bucket_region(bucket: &str) -> Result<String, DetectFailure> {
     let cache = &*BUCKET_REGIONS;
     if let Some(region) = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(bucket) {
         return Ok(region.clone());
+    }
+    let recent_failure = REGION_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(bucket)
+        .filter(|(at, _)| failure_is_fresh(*at, Instant::now()))
+        .map(|(_, message)| message.clone());
+    if let Some(message) = recent_failure {
+        return Err(DetectFailure { message, remembered: true });
     }
 
     let options = ClientOptions::new()
         .with_connect_timeout(Duration::from_secs(5))
         .with_timeout(Duration::from_secs(10));
-    let region = resolve_bucket_region(bucket, &options).await?;
-    tracing::debug!(bucket, %region, "Detected S3 bucket region");
-
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(bucket.to_string(), region.clone());
-    Ok(region)
+    match resolve_bucket_region(bucket, &options).await {
+        Ok(region) => {
+            tracing::debug!(bucket, %region, "Detected S3 bucket region");
+            REGION_FAILURES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(bucket);
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(bucket.to_string(), region.clone());
+            Ok(region)
+        }
+        Err(e) => {
+            let message = e.to_string();
+            REGION_FAILURES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(bucket.to_string(), (Instant::now(), message.clone()));
+            Err(DetectFailure { message, remembered: false })
+        }
+    }
 }
 
 /// S3 configuration for connecting to S3-compatible storage
@@ -450,7 +494,33 @@ mod region_tests {
             .lock()
             .unwrap()
             .insert("cogrs-test-cached-bucket".to_string(), "ap-south-1".to_string());
-        let region = detect_bucket_region("cogrs-test-cached-bucket").await.unwrap();
+        let region = detect_bucket_region("cogrs-test-cached-bucket").await.ok().unwrap();
         assert_eq!(region, "ap-south-1");
+    }
+
+    #[tokio::test]
+    async fn a_failed_region_probe_is_not_repeated_for_a_minute() {
+        // A recent failure must return without any network access (a probe would take seconds).
+        REGION_FAILURES
+            .lock()
+            .unwrap()
+            .insert("cogrs-test-failing-bucket".to_string(), (Instant::now(), "connection refused".to_string()));
+        let started = Instant::now();
+        let failure = detect_bucket_region("cogrs-test-failing-bucket").await.err().unwrap();
+        assert!(failure.remembered);
+        assert_eq!(failure.message, "connection refused");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        // ... and the open that asked proceeds with the default region instead of failing (unless
+        // the environment names a region, in which case nothing is probed at all)
+        let expected = region_from_env();
+        assert_eq!(resolve_region("cogrs-test-failing-bucket", None, None).await, expected);
+    }
+
+    #[test]
+    fn failures_are_remembered_for_the_ttl_only() {
+        let now = Instant::now();
+        assert!(failure_is_fresh(now, now));
+        assert!(failure_is_fresh(now, now + REGION_FAILURE_TTL - Duration::from_secs(1)));
+        assert!(!failure_is_fresh(now, now + REGION_FAILURE_TTL));
     }
 }
