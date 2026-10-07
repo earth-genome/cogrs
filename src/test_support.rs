@@ -2,8 +2,8 @@
 //!
 //! The crate's [`GeoTiffWriter`](crate::GeoTiffWriter) only writes single-strip files, so tests
 //! that need tiling, overviews, sparse tiles, predictors or particular CRSs build their input
-//! here. Everything is little-endian classic TIFF with the header, IFDs and tag values placed
-//! before the tile data, like a real COG.
+//! here. Everything is little-endian, classic TIFF or BigTIFF, with the header, IFDs and tag
+//! values placed before the tile data, like a real COG.
 
 use std::io::Write;
 
@@ -67,56 +67,120 @@ impl CogSpec {
     }
 }
 
+/// TIFF flavour of an encoded file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Layout {
+    /// Version 42: 4-byte offsets, 12-byte IFD entries, values up to 4 bytes inline
+    Classic,
+    /// Version 43: 8-byte offsets, 20-byte IFD entries, values up to 8 bytes inline.
+    /// `long8_arrays` writes TileOffsets / TileByteCounts as LONG8 (as libtiff does) instead
+    /// of LONG.
+    Big { long8_arrays: bool },
+}
+
+impl Layout {
+    fn is_big(self) -> bool {
+        matches!(self, Layout::Big { .. })
+    }
+
+    fn header_len(self) -> usize {
+        if self.is_big() { 16 } else { 8 }
+    }
+
+    fn count_len(self) -> usize {
+        if self.is_big() { 8 } else { 2 }
+    }
+
+    fn entry_len(self) -> usize {
+        if self.is_big() { 20 } else { 12 }
+    }
+
+    /// Size of an offset and of the inline value field.
+    fn offset_len(self) -> usize {
+        if self.is_big() { 8 } else { 4 }
+    }
+}
+
 struct Entry {
     tag: u16,
     ftype: u16,
-    count: u32,
+    count: u64,
     data: Vec<u8>,
 }
 
 fn shorts(tag: u16, v: &[u16]) -> Entry {
-    Entry { tag, ftype: 3, count: v.len() as u32, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+    Entry { tag, ftype: 3, count: v.len() as u64, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 }
 
 fn longs(tag: u16, v: &[u32]) -> Entry {
-    Entry { tag, ftype: 4, count: v.len() as u32, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+    Entry { tag, ftype: 4, count: v.len() as u64, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+}
+
+fn long8s(tag: u16, v: &[u64]) -> Entry {
+    Entry { tag, ftype: 16, count: v.len() as u64, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+}
+
+/// A tile offset / byte count array: LONG, or LONG8 where the layout asks for it.
+fn array(tag: u16, v: &[u64], layout: Layout) -> Entry {
+    if layout == (Layout::Big { long8_arrays: true }) {
+        long8s(tag, v)
+    } else {
+        longs(tag, &v.iter().map(|&x| u32::try_from(x).expect("fits a LONG")).collect::<Vec<_>>())
+    }
 }
 
 fn doubles(tag: u16, v: &[f64]) -> Entry {
-    Entry { tag, ftype: 12, count: v.len() as u32, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+    Entry { tag, ftype: 12, count: v.len() as u64, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 }
 
 fn ascii(tag: u16, s: &str) -> Entry {
     let mut data = s.as_bytes().to_vec();
     data.push(0);
-    Entry { tag, ftype: 2, count: data.len() as u32, data }
+    Entry { tag, ftype: 2, count: data.len() as u64, data }
 }
 
 /// Serialize an IFD that starts at `ifd_start`; out-of-line values follow the IFD.
-fn encode_ifd(mut entries: Vec<Entry>, ifd_start: u32, next_ifd: u32) -> Vec<u8> {
+fn encode_ifd(mut entries: Vec<Entry>, ifd_start: u64, next_ifd: u64, layout: Layout) -> Vec<u8> {
     entries.sort_by_key(|e| e.tag);
-    let table_len = 2 + entries.len() * 12 + 4;
+    let (offset_len, big) = (layout.offset_len(), layout.is_big());
+    let table_len = layout.count_len() + entries.len() * layout.entry_len() + offset_len;
     let mut table = Vec::with_capacity(table_len);
     let mut extra: Vec<u8> = Vec::new();
-    table.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    if big {
+        table.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    } else {
+        table.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    }
     for e in &entries {
         table.extend_from_slice(&e.tag.to_le_bytes());
         table.extend_from_slice(&e.ftype.to_le_bytes());
-        table.extend_from_slice(&e.count.to_le_bytes());
-        if e.data.len() <= 4 {
+        if big {
+            table.extend_from_slice(&e.count.to_le_bytes());
+        } else {
+            table.extend_from_slice(&u32::try_from(e.count).expect("classic count").to_le_bytes());
+        }
+        if e.data.len() <= offset_len {
             let mut inline = e.data.clone();
-            inline.resize(4, 0);
+            inline.resize(offset_len, 0);
             table.extend_from_slice(&inline);
         } else {
-            let off = ifd_start as usize + table_len + extra.len();
-            table.extend_from_slice(&(off as u32).to_le_bytes());
+            let off = ifd_start + table_len as u64 + extra.len() as u64;
+            if big {
+                table.extend_from_slice(&off.to_le_bytes());
+            } else {
+                table.extend_from_slice(&u32::try_from(off).expect("classic offset").to_le_bytes());
+            }
             extra.extend_from_slice(&e.data);
             if extra.len() % 2 == 1 {
                 extra.push(0);
             }
         }
     }
-    table.extend_from_slice(&next_ifd.to_le_bytes());
+    if big {
+        table.extend_from_slice(&next_ifd.to_le_bytes());
+    } else {
+        table.extend_from_slice(&u32::try_from(next_ifd).expect("classic offset").to_le_bytes());
+    }
     table.extend_from_slice(&extra);
     table
 }
@@ -179,7 +243,7 @@ fn encode_tile(spec: &CogSpec, level: usize, tile_idx: usize) -> Vec<u8> {
     }
 }
 
-fn ifd_entries(spec: &CogSpec, level: usize, offsets: &[u32], counts: &[u32], point: bool) -> Vec<Entry> {
+fn ifd_entries(spec: &CogSpec, level: usize, offsets: &[u64], counts: &[u64], point: bool, layout: Layout) -> Vec<Entry> {
     let (w, h) = spec.level_dims(level);
     let bits = (spec.sample.bytes() * 8) as u16;
     let mut e = vec![
@@ -192,8 +256,8 @@ fn ifd_entries(spec: &CogSpec, level: usize, offsets: &[u32], counts: &[u32], po
         shorts(284, &[1]),
         longs(322, &[spec.tile as u32]),
         longs(323, &[spec.tile as u32]),
-        longs(324, offsets),
-        longs(325, counts),
+        array(324, offsets, layout),
+        array(325, counts, layout),
     ];
     if spec.sample == Sample::F32 {
         e.push(shorts(339, &vec![3; spec.bands]));
@@ -232,6 +296,16 @@ pub(crate) fn build_cog(spec: &CogSpec) -> Vec<u8> {
 /// Like [`build_cog`], optionally with `PixelIsPoint` raster registration (`spec.origin` stays the
 /// outer corner of pixel (0, 0); the tiepoint is written as the pixel's centre).
 pub(crate) fn build_cog_registered(spec: &CogSpec, point: bool) -> Vec<u8> {
+    build_cog_layout(spec, point, Layout::Classic)
+}
+
+/// Encode `spec` as a little-endian BigTIFF (`long8_arrays`: TileOffsets/TileByteCounts as LONG8).
+pub(crate) fn build_bigtiff_cog(spec: &CogSpec, long8_arrays: bool) -> Vec<u8> {
+    build_cog_layout(spec, false, Layout::Big { long8_arrays })
+}
+
+/// Encode `spec` in the given TIFF `layout`.
+pub(crate) fn build_cog_layout(spec: &CogSpec, point: bool, layout: Layout) -> Vec<u8> {
     let levels = spec.overviews + 1;
     let tiles: Vec<Vec<Vec<u8>>> = (0..levels)
         .map(|l| (0..spec.tiles_across(l) * spec.tiles_down(l)).map(|i| encode_tile(spec, l, i)).collect())
@@ -241,19 +315,19 @@ pub(crate) fn build_cog_registered(spec: &CogSpec, point: bool) -> Vec<u8> {
     let sizes: Vec<usize> = (0..levels)
         .map(|l| {
             let n = tiles[l].len();
-            encode_ifd(ifd_entries(spec, l, &vec![0; n], &vec![0; n], point), 0, 0).len()
+            encode_ifd(ifd_entries(spec, l, &vec![0; n], &vec![0; n], point, layout), 0, 0, layout).len()
         })
         .collect();
     let mut starts = Vec::with_capacity(levels);
-    let mut pos = 8usize;
+    let mut pos = layout.header_len();
     for s in &sizes {
         starts.push(pos);
         pos += s;
     }
 
     // Tile data follows the IFD area, level by level.
-    let mut offsets: Vec<Vec<u32>> = Vec::new();
-    let mut counts: Vec<Vec<u32>> = Vec::new();
+    let mut offsets: Vec<Vec<u64>> = Vec::new();
+    let mut counts: Vec<Vec<u64>> = Vec::new();
     let mut data_pos = pos;
     for level_tiles in &tiles {
         let mut o = Vec::new();
@@ -263,8 +337,8 @@ pub(crate) fn build_cog_registered(spec: &CogSpec, point: bool) -> Vec<u8> {
                 o.push(0);
                 c.push(0);
             } else {
-                o.push(data_pos as u32);
-                c.push(t.len() as u32);
+                o.push(data_pos as u64);
+                c.push(t.len() as u64);
                 data_pos += t.len();
             }
         }
@@ -274,11 +348,18 @@ pub(crate) fn build_cog_registered(spec: &CogSpec, point: bool) -> Vec<u8> {
 
     let mut out = Vec::with_capacity(data_pos);
     out.extend_from_slice(b"II");
-    out.extend_from_slice(&42u16.to_le_bytes());
-    out.extend_from_slice(&(starts[0] as u32).to_le_bytes());
+    if layout.is_big() {
+        out.extend_from_slice(&43u16.to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(starts[0] as u64).to_le_bytes());
+    } else {
+        out.extend_from_slice(&42u16.to_le_bytes());
+        out.extend_from_slice(&(starts[0] as u32).to_le_bytes());
+    }
     for l in 0..levels {
-        let next = if l + 1 < levels { starts[l + 1] as u32 } else { 0 };
-        let ifd = encode_ifd(ifd_entries(spec, l, &offsets[l], &counts[l], point), starts[l] as u32, next);
+        let next = if l + 1 < levels { starts[l + 1] as u64 } else { 0 };
+        let ifd = encode_ifd(ifd_entries(spec, l, &offsets[l], &counts[l], point, layout), starts[l] as u64, next, layout);
         assert_eq!(ifd.len(), sizes[l]);
         out.extend_from_slice(&ifd);
     }
