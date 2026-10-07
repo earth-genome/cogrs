@@ -500,16 +500,15 @@ mod region_tests {
 
     #[tokio::test]
     async fn a_failed_region_probe_is_not_repeated_for_a_minute() {
-        // A recent failure must return without any network access (a probe would take seconds).
+        // A recent failure is answered from memory: the message is the recorded one, which a
+        // fresh probe of this made-up bucket could not produce.
         REGION_FAILURES
             .lock()
             .unwrap()
             .insert("cogrs-test-failing-bucket".to_string(), (Instant::now(), "connection refused".to_string()));
-        let started = Instant::now();
         let failure = detect_bucket_region("cogrs-test-failing-bucket").await.err().unwrap();
         assert!(failure.remembered);
         assert_eq!(failure.message, "connection refused");
-        assert!(started.elapsed() < Duration::from_millis(500));
         // ... and the open that asked proceeds with the default region instead of failing (unless
         // the environment names a region, in which case nothing is probed at all)
         let expected = region_from_env();

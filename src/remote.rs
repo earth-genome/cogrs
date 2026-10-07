@@ -789,7 +789,7 @@ mod local_server_tests {
 #[cfg(test)]
 mod runtime_independence_tests {
     use super::*;
-    use crate::test_support::serve_bytes;
+    use crate::test_support::{serve_bytes, ObjectServer, ServedObject};
     use std::time::Duration;
 
     fn new_runtime() -> tokio::runtime::Runtime {
@@ -829,11 +829,17 @@ mod runtime_independence_tests {
     /// Dropping a request future cancels the request (the task on the I/O runtime is aborted).
     #[test]
     fn cancelling_a_read_is_safe_and_leaves_the_reader_usable() {
-        let (base, _log) = serve_bytes(vec![5u8; 200_000], Duration::from_millis(50));
+        let server = ObjectServer::start(Some(ServedObject::new(vec![5u8; 200_000])), Duration::ZERO);
+        // A gate nobody can pass: the server holds the read for ever, so the timeout below must
+        // win however fast or slow the machine is.
+        server.set_gate(Some((100_000, usize::MAX, Duration::from_secs(30))));
+        let base = server.base().to_string();
         new_runtime().block_on(async {
             let reader = ObjectStoreRangeReader::open(&format!("{base}/cancel.bin")).await.unwrap();
             let slow = tokio::time::timeout(Duration::from_millis(5), reader.read_range(100_000, 1000)).await;
             assert!(slow.is_err(), "expected the read to be cancelled");
+            // The reader is still usable once the server answers again
+            server.set_gate(None);
             assert_eq!(reader.read_range(100_000, 1000).await.unwrap().len(), 1000);
         });
     }

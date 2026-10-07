@@ -207,22 +207,20 @@ fn remote_extractions_do_not_occupy_blocking_threads_while_waiting() {
         .enable_all()
         .build()
         .unwrap();
-    let latency = Duration::from_millis(300);
-    let elapsed = rt.block_on(async {
+    // Every read waits until 12 reads are pending at once: they can only all be pending if no
+    // extraction holds the single blocking thread (or any other shared resource) while it waits
+    // for the network. If one did, the gate would never open and the test fails after 30 s.
+    let gate = crate::test_support::AsyncGate::new(12);
+    rt.block_on(async {
         let mut opened = Vec::new();
         for i in 0..12 {
             let (mock, reader) = open_mock(&format!("mock://x/starve/{i}"), Duration::ZERO, no_coalescing()).await;
-            mock.set_latency(latency);
+            mock.set_gate(Arc::clone(&gate));
             opened.push(reader);
         }
-        let start = std::time::Instant::now();
         let results = futures::future::join_all(opened.iter().map(|r| extract(r, 4, 4, 6))).await;
         assert!(results.iter().all(|t| t.tiles_read > 0));
-        start.elapsed()
     });
-    // If each extraction held the only blocking thread for its 300 ms round trip this would
-    // take 12 * 300 ms = 3.6 s.
-    assert!(elapsed < Duration::from_millis(2000), "took {elapsed:?}");
 }
 
 #[tokio::test]

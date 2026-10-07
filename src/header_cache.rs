@@ -814,7 +814,10 @@ mod tests {
         assert_eq!(tiny.stats().headers.entries, 0);
     }
 
-    #[tokio::test]
+    // Virtual time: the cache's clock is tokio's, so `sleep` jumps the clock instead of waiting,
+    // and nothing here depends on how fast the machine is. (The I/O itself runs on the crate's
+    // own runtime and is not affected.)
+    #[tokio::test(start_paused = true)]
     async fn entries_expire_after_their_time_to_live() {
         let ttl = Duration::from_millis(60);
         let wait = Duration::from_millis(150);
@@ -890,7 +893,7 @@ mod tests {
         assert!((tile[0] - pattern_b(0, 0, 0) as f32).abs() < 1e-3);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_missing_object_is_remembered_briefly() {
         let server = ObjectServer::start(None, Duration::ZERO);
         let url = format!("{}/missing.tif", server.base());

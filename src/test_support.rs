@@ -399,6 +399,8 @@ pub(crate) struct MockReader {
     max_in_flight: AtomicUsize,
     /// Reads whose range overlaps one of these fail.
     fail_ranges: Mutex<Vec<Range<u64>>>,
+    /// Reads wait at this gate before their latency starts.
+    gate: Mutex<Option<std::sync::Arc<AsyncGate>>>,
 }
 
 impl MockReader {
@@ -412,6 +414,7 @@ impl MockReader {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             fail_ranges: Mutex::default(),
+            gate: Mutex::default(),
         }
     }
 
@@ -437,8 +440,10 @@ impl MockReader {
         self.max_in_flight.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn set_latency(&self, latency: Duration) {
-        *self.latency.lock() = latency;
+    /// Make every read wait until the gate's `target` reads are pending at once (see
+    /// [`AsyncGate`]).
+    pub(crate) fn set_gate(&self, gate: std::sync::Arc<AsyncGate>) {
+        *self.gate.lock() = Some(gate);
     }
 
     pub(crate) fn reset(&self) {
@@ -454,9 +459,15 @@ impl AsyncRangeReader for MockReader {
             self.calls.lock().push(range.clone());
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            let gate = self.gate.lock().clone();
+            let gated = match gate {
+                Some(gate) => gate.arrive(GATE_TIMEOUT).await,
+                None => Ok(()),
+            };
             let latency = *self.latency.lock();
             tokio::time::sleep(latency).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            gated?;
             if self.fail_ranges.lock().iter().any(|f| f.start < range.end && range.start < f.end) {
                 return Err(format!("injected failure for {range:?}").into());
             }
@@ -481,6 +492,71 @@ impl AsyncRangeReader for MockReader {
 
     fn io_options(&self) -> &IoOptions {
         &self.options
+    }
+}
+
+/// Longest a [`Gate`] / [`AsyncGate`] waits for the other arrivals. A generous bound only
+/// there so a test that would otherwise wait for ever fails; it is never what a passing test
+/// waits for.
+const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Holds arrivals until `target` of them are waiting at once, then releases all of them (and
+/// every later arrival at once). A test uses it to *prove* that requests overlap, with no
+/// clock: if the code under test issued them one after the other, the first would wait for ever
+/// for the second and the wait times out instead.
+pub(crate) struct AsyncGate {
+    target: usize,
+    arrived: AtomicUsize,
+    open: tokio::sync::Semaphore,
+}
+
+impl AsyncGate {
+    pub(crate) fn new(target: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { target, arrived: AtomicUsize::new(0), open: tokio::sync::Semaphore::new(0) })
+    }
+
+    /// Arrive and wait for the others; `Err` if they do not all arrive within the timeout.
+    async fn arrive(&self, timeout: Duration) -> AnyResult<()> {
+        if self.arrived.fetch_add(1, Ordering::SeqCst) + 1 == self.target {
+            self.open.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+        }
+        match tokio::time::timeout(timeout, self.open.acquire()).await {
+            Ok(Ok(permit)) => {
+                permit.forget();
+                Ok(())
+            }
+            _ => Err(format!("gate: fewer than {} reads were in flight together", self.target).into()),
+        }
+    }
+}
+
+/// [`AsyncGate`] for the threads of [`ObjectServer`].
+pub(crate) struct Gate {
+    target: usize,
+    arrived: Mutex<usize>,
+    open: parking_lot::Condvar,
+}
+
+impl Gate {
+    fn new(target: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { target, arrived: Mutex::new(0), open: parking_lot::Condvar::new() })
+    }
+
+    /// Arrive and wait for the others; false if they do not all arrive within the timeout.
+    fn arrive(&self, timeout: Duration) -> bool {
+        let mut arrived = self.arrived.lock();
+        *arrived += 1;
+        if *arrived >= self.target {
+            self.open.notify_all();
+            return true;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while *arrived < self.target {
+            if self.open.wait_until(&mut arrived, deadline).timed_out() {
+                return *arrived >= self.target;
+            }
+        }
+        true
     }
 }
 
@@ -547,6 +623,9 @@ struct ServerState {
     /// object that "changes" between any two requests.
     flapping: bool,
     flaps: u64,
+    /// Hold requests whose range starts at or after the offset until `target` of them are
+    /// pending at once (see [`Gate`]); answer 503 if that does not happen within the timeout.
+    gate: Option<(usize, std::sync::Arc<Gate>, Duration)>,
 }
 
 /// Minimal range-capable HTTP/1.1 server on 127.0.0.1 whose objects can be replaced while it
@@ -558,6 +637,8 @@ pub(crate) struct ObjectServer {
     base: String,
     state: std::sync::Arc<Mutex<ServerState>>,
     log: std::sync::Arc<Mutex<Vec<String>>>,
+    in_flight: std::sync::Arc<AtomicUsize>,
+    max_in_flight: std::sync::Arc<AtomicUsize>,
 }
 
 impl ObjectServer {
@@ -580,8 +661,11 @@ impl ObjectServer {
                 fail_from: None,
                 flapping: false,
                 flaps: 0,
+                gate: None,
             })),
             log: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
         };
         let shared = server.clone();
         std::thread::spawn(move || {
@@ -648,18 +732,26 @@ impl ObjectServer {
         if_match: Option<String>,
         if_unmodified_since: Option<String>,
     ) -> (Vec<u8>, u16, Option<(usize, usize)>) {
-        let (object, delay, honor, fail_from, flap) = {
+        let (object, delay, honor, fail_from, flap, gate) = {
             let mut state = self.state.lock();
             let object = state.objects.get(path).or(state.default.as_ref()).cloned();
             let flap = state.flapping.then(|| {
                 state.flaps += 1;
                 state.flaps
             });
-            (object, state.delay, state.honor_conditionals, state.fail_from, flap)
+            (object, state.delay, state.honor_conditionals, state.fail_from, flap, state.gate.clone())
         };
         let resolved = range.map(|(a, b)| (a, b.unwrap_or(usize::MAX)));
         self.log.lock().push(format!("{} range={:?}", request_line.trim(), resolved));
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        let start = resolved.map_or(0, |(a, _)| a);
+        let gate_failed = gate.is_some_and(|(from, gate, timeout)| start >= from && !gate.arrive(timeout));
         std::thread::sleep(delay);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if gate_failed {
+            return (b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_vec(), 503, None);
+        }
         let empty = |status: &str| format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").into_bytes();
         let Some(object) = object else {
             return (empty("404 Not Found"), 404, None);
@@ -717,6 +809,18 @@ impl ObjectServer {
     /// Make the object "change" between any two requests (see `ServerState::flapping`).
     pub(crate) fn set_flapping(&self, flapping: bool) {
         self.state.lock().flapping = flapping;
+    }
+
+    /// Hold requests whose range starts at or after `from` until `target` of them are pending at
+    /// the same time (503 after `timeout`): lets a test prove that requests overlap without
+    /// measuring any time. `None` removes the gate.
+    pub(crate) fn set_gate(&self, gate: Option<(usize, usize, Duration)>) {
+        self.state.lock().gate = gate.map(|(from, target, timeout)| (from, Gate::new(target), timeout));
+    }
+
+    /// The most requests that were being served at the same time.
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
     }
 
     pub(crate) fn requests(&self) -> Vec<RecordedRequest> {

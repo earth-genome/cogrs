@@ -3836,7 +3836,7 @@ mod async_open_tests {
     // Remote open over a local HTTP server (no external network).
 
     use crate::test_support::{build_cog, serve_bytes, CogSpec, Sample};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     fn http_spec(width: usize, tile: usize, overviews: usize) -> CogSpec {
         CogSpec {
@@ -3890,19 +3890,26 @@ mod async_open_tests {
 
     #[tokio::test]
     async fn open_async_fetches_large_tag_arrays_concurrently() {
-        // 16384 tiles: the offset and byte-count arrays (64 KiB each) lie beyond the prefix.
-        let delay = Duration::from_millis(150);
+        // 16384 tiles: the offset and byte-count arrays (64 KiB each) lie beyond the prefix, and
+        // so do the pixel scale, tiepoint and GeoKey values that follow them.
+        use crate::test_support::{ObjectServer, ServedObject};
         let bytes = build_cog(&http_spec(2048, 16, 0));
-        let (base, log) = serve_bytes(bytes.clone(), delay);
+        let server = ObjectServer::start(Some(ServedObject::new(bytes.clone())), Duration::ZERO);
+        // The server holds every request that starts after the IFD (offset 100) until five are
+        // pending at once: the five out-of-line values. They only get answered if the open
+        // issues all five reads together; had it read the arrays one after the other, the first
+        // would wait for the second for ever and the open would fail after 30 s.
+        server.set_gate(Some((100, 5, Duration::from_secs(30))));
 
-        let start = Instant::now();
-        let remote = CogReader::open_async_with_hint(&format!("{base}/big.tif"), OverviewQualityHint::NoneUsable)
+        let remote = CogReader::builder(&format!("{}/big.tif", server.base()))
+            .hint(OverviewQualityHint::NoneUsable)
+            .cache(&crate::header_cache::CogCache::disabled())
+            .open_async()
             .await
             .unwrap();
-        let elapsed = start.elapsed();
-        assert!(log.lock().len() >= 3, "arrays were not fetched remotely: {:?}", log.lock());
-        // prefix round trip + one round trip for all the arrays together
-        assert!(elapsed < delay * 5 / 2, "open took {elapsed:?}; arrays are being fetched serially");
+        assert_eq!(server.requests().len(), 6, "prefix + five values: {:?}", server.requests());
+        assert!(server.max_in_flight() >= 5, "the reads never overlapped");
+        assert!(server.requests().iter().all(|r| r.status == 206), "{:?}", server.requests());
 
         let local = CogReader::from_reader_with_hint(
             Arc::new(crate::range_reader::MemoryRangeReader::new(bytes, "mem://open-parity-big".into())),
