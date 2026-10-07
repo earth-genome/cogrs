@@ -383,7 +383,7 @@ async fn run_cache(url: &str, kind: &str) {
     println!(
         "{{\"scenario\":\"cache\",\"mode\":\"{mode}\",\"hint\":\"{}\",\"kind\":\"{kind}\",\"wall_ms\":{:.1},\"rps\":{:.1},\
          \"p50_ms\":{:.1},\"p95_ms\":{:.1},\"max_ms\":{:.1},\"requests\":{},\"net_bytes\":{},\"tiles_read\":{tiles_read},\
-         \"tile_bytes\":{bytes},\"header_hits\":{},\"header_misses\":{},\"coalesced_opens\":{},\"header_entries\":{},\
+         \"tile_bytes\":{bytes},\"header_hits\":{},\"header_misses\":{},\"coalesced_opens\":{},\"header_entries\":{},\"header_bytes\":{},\
          \"rss_mb_before\":{rss_before:.1},\"rss_mb\":{rss_after:.1},\"rss_peak_mb\":{rss_peak:.1}}}",
         if matches!(hint(), OverviewQualityHint::AllUsable) { "all" } else { "compute" },
         ms(wall),
@@ -397,6 +397,7 @@ async fn run_cache(url: &str, kind: &str) {
         stats.headers.misses,
         stats.headers.coalesced_opens,
         stats.headers.entries,
+        stats.headers.bytes,
     );
 }
 
