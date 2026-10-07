@@ -85,15 +85,27 @@ rgb_u8_partial_nodata/xyz/5/8/12/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nod
 rgb_u8_partial_nodata/xyz/5/8/12/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=0d59d4d4671612bb
 rgb_u8_partial_nodata/xyz/5/8/12/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=5ec11bc4099c6140
 rgb_u8_partial_nodata/xyz/6/17/25/nearest	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=eef98d17be9421a4
-rgb_u8_partial_nodata/xyz/6/17/25/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=870314e9f36fb58c
-rgb_u8_partial_nodata/xyz/6/17/25/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=52b4222cd55a2e0f
-rgb_u8_partial_nodata/xyz/6/17/25/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=128d1c8b2f34a8ef
+rgb_u8_partial_nodata/xyz/6/17/25/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=f2c240acd03ffc80
+rgb_u8_partial_nodata/xyz/6/17/25/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=be404b7713ad33fc
+rgb_u8_partial_nodata/xyz/6/17/25/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=b86ac63418fbea3c
+rgb_u8_partial_nodata/xyz/7/35/51/nearest	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=598f13c2629d88c5
+rgb_u8_partial_nodata/xyz/7/35/51/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=c158842b96c20c19
+rgb_u8_partial_nodata/xyz/7/35/51/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=7c2016e59accc14d
+rgb_u8_partial_nodata/xyz/7/35/51/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=c2be76f6fd86d2eb
+rgb_u8_partial_nodata/xyz/7/36/51/nearest	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=6b778eca4def7267
+rgb_u8_partial_nodata/xyz/7/36/51/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=2486330e85f67d5c
+rgb_u8_partial_nodata/xyz/7/36/51/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=f1b1030ce3e2a6e7
+rgb_u8_partial_nodata/xyz/7/36/51/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=291d616bcf8bcd97
 rgb_u8_partial_nodata/xyz/3/2/3/96x64	96x64x3 bytes=0 tiles=0 ovr=Some(0) nodata=Some(0.0) n=18432 valid=18432 digest=a91fde19bf85b8d0
 rgb_u8_partial_nodata/xyz/3/2/3/bands[2, 0]	100x100x2 bytes=0 tiles=0 ovr=Some(0) nodata=Some(0.0) n=20000 valid=20000 digest=7421f0a506aec15f
 rgb_u8_partial_nodata/shifted/5/8/12/nearest	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=9ed02db77f0ecb2c
 rgb_u8_partial_nodata/shifted/5/8/12/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=a566b45b49ba6f30
 rgb_u8_partial_nodata/shifted/5/8/12/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=b4a7f92fc6a660c1
 rgb_u8_partial_nodata/shifted/5/8/12/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=753c518c5042590e
+rgb_u8_partial_nodata/shifted/7/35/51/nearest	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=ce71c82a427e0ccd
+rgb_u8_partial_nodata/shifted/7/35/51/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=b667aba9ec25c2c3
+rgb_u8_partial_nodata/shifted/7/35/51/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=e443804c73551a24
+rgb_u8_partial_nodata/shifted/7/35/51/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=bac8d636e2f4e3b4
 f32_4326_nodata/meta	1000x800 tile=128x128 across=8 down=7 bands=1 Float32 Deflate predictor=1 crs=Some(4326) nodata=Some(-9999.0) tiled=true scale=Some([0.01, 0.01, 0.0]) tie=Some([0.0, 0.0, 0.0, -10.0, 50.0, 0.0]) offsets=4f86df026e066c75 counts=6257020806cebe7d
 f32_4326_nodata/overview0	500x400 tile=128x128 across=4 down=4 scale=2 offsets=3cb3d0904f7d5694 counts=3295187e3afa25fd
 f32_4326_nodata/overview1	250x200 tile=128x128 across=2 down=2 scale=4 offsets=97eb13183d277322 counts=395a3f91f45a9953

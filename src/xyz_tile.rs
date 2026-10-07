@@ -55,7 +55,7 @@ pub enum ResamplingMethod {
     #[default]
     Nearest,
     /// Bilinear interpolation - smoother results, good balance of quality and speed.
-    /// Linearly interpolates between the 4 nearest source pixels. Where an output pixel
+    /// Linearly interpolates between the 4 nearest source pixels (`gdalwarp -r bilinear`). Where an output pixel
     /// covers more than about one source pixel the kernel is stretched by that ratio
     /// (anti-aliasing, like `gdalwarp`), so it reads proportionally more source pixels.
     Bilinear,
@@ -72,7 +72,10 @@ pub enum ResamplingMethod {
     /// 4x4 grid of source pixels, stretched like [`Self::Bilinear`] when downsampling. Sharper
     /// than [`Self::Bicubic`], with some overshoot at hard edges.
     ///
-    /// Masking is the same as for [`Self::Bicubic`]. Added after the other variants; the enum
+    /// Like `gdalwarp`, the 4x4 window is used only where every tap is a valid sample inside the
+    /// raster; elsewhere (within two pixels of the raster edge, or next to `NaN`/nodata) the
+    /// pixel is interpolated bilinearly over the valid taps. [`Self::Bicubic`] does the same
+    /// next to invalid taps but replicates the edge pixels instead of leaving the window. Added after the other variants; the enum
     /// is not `#[non_exhaustive]`, so an exhaustive `match` downstream needs a new arm.
     Cubic,
 }
@@ -84,12 +87,15 @@ pub struct TileData {
     ///
     /// Output pixels with no source data (outside the COG extent, or in sparse
     /// source tiles) hold [`TileData::nodata`] if the COG declares one, else
-    /// `NaN`. With bilinear/bicubic resampling, any output pixel whose
-    /// interpolation window touches `NaN`/nodata falls back to the nearest
-    /// source sample rather than blending it in. When downsampling (output pixels
-    /// covering more than about one source pixel) the window is much wider, so
-    /// `NaN`/nodata source pixels are left out and the rest renormalised instead,
-    /// unless the nearest source pixel itself is invalid: then that sample is kept.
+    /// `NaN`. Interpolation never blends `NaN`/nodata/unread source pixels in: their
+    /// weights are left out and the rest renormalised, as `gdalwarp` does. Bilinear does this
+    /// over its 2x2 taps; [`ResamplingMethod::Cubic`] and [`ResamplingMethod::Bicubic`] use their
+    /// 4x4 window only if every tap is valid (and, for `Cubic`, inside the raster, as GDAL
+    /// does) and otherwise interpolate bilinearly, because their weights have negative lobes.
+    /// When downsampling (output pixels covering more than about one source pixel) every
+    /// kernel is much wider and the valid taps are renormalised with its own weights. In every
+    /// case the pixel is left at nodata/fill when the valid weight is negligible, and when the
+    /// nearest source pixel itself is invalid (in all selected bands, see below) that sample is kept.
     ///
     /// With several bands, validity of an *interpolation tap* is judged per band (a sample
     /// equal to the band's nodata value, or `NaN`), but a *nearest source pixel* counts as invalid
@@ -2247,11 +2253,12 @@ fn render_extraction(
     let mut pixel_data = vec![fill; tile_size_x * tile_size_y * num_output_bands];
 
     let mapping = &plan.mapping;
+    // Per output band of the current pixel: the fixed-footprint interpolation found an invalid tap
+    let mut pending = vec![false; num_output_bands];
 
-    // Helper to sample a pixel from the cached tile data
-    // band is the SOURCE band index (not output band index)
+    // Helper to locate a pixel in the cached tile data: its tile and the offset of its first band
     // Uses bit shifts for power-of-2 tile sizes (common case: 256, 512)
-    let sample_pixel = |px: usize, py: usize, source_band: usize| -> Option<f32> {
+    let locate = |px: usize, py: usize| -> Option<(&[f32], usize)> {
         // Fast path: use bit shifts for power-of-2 tile sizes
         let (tile_col, local_x) = if let Some(shift) = tile_width_shift {
             (px >> shift, px & tile_width_mask)
@@ -2267,9 +2274,12 @@ fn render_extraction(
 
         let tile_idx = tile_row * eff_tiles_across + tile_col;
         let tile_data = tile_data_cache.get(&tile_idx)?;
-
-        let pixel_idx = (local_y * eff_tile_width + local_x) * source_bands + source_band;
-        tile_data.get(pixel_idx).copied()
+        Some((tile_data.as_slice(), (local_y * eff_tile_width + local_x) * source_bands))
+    };
+    // Helper to sample a pixel; band is the SOURCE band index (not output band index)
+    let sample_pixel = |px: usize, py: usize, source_band: usize| -> Option<f32> {
+        let (tile, base) = locate(px, py)?;
+        tile.get(base + source_band).copied()
     };
 
     // Downsampling with bilinear/bicubic: the scaled kernel reads whole source footprints
@@ -2325,7 +2335,7 @@ fn render_extraction(
                 continue;
             }
 
-            // Nearest source pixel column (also the fallback for interpolation near invalid data)
+            // Nearest source pixel column (also what a nodata kernel centre passes through)
             #[allow(clippy::cast_possible_truncation)]
             let src_px_int = src_pixel_x.round() as isize;
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
@@ -2340,105 +2350,107 @@ fn render_extraction(
                         }
                     }
                 }
-                ResamplingMethod::Bilinear => {
-                    // Bilinear interpolation using 4 nearest pixels
+                ResamplingMethod::Bilinear | ResamplingMethod::Bicubic | ResamplingMethod::Cubic => {
                     #[allow(clippy::cast_possible_truncation)]
                     let x0 = src_pixel_x.floor() as isize;
-                    let x1 = x0 + 1;
-                    let y1 = y0_floor + 1;
-
-                    // Fractional parts for interpolation weights
                     #[allow(clippy::cast_precision_loss)]
-                    let fx = src_pixel_x - x0 as f64;
-                    #[allow(clippy::cast_precision_loss)]
-                    let fy = src_pixel_y - y0_floor as f64;
+                    let (fx, fy) = (src_pixel_x - x0 as f64, src_pixel_y - y0_floor as f64);
 
-                    // Clamp to valid range
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-                    let x0c = x0.max(0).min(eff_width as isize - 1) as usize;
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-                    let x1c = x1.max(0).min(eff_width as isize - 1) as usize;
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-                    let y0c = y0_floor.max(0).min(eff_height as isize - 1) as usize;
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-                    let y1c = y1.max(0).min(eff_height as isize - 1) as usize;
-
-                    #[allow(clippy::cast_possible_truncation)]
-                    let weight_x = fx as f32;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let weight_y = fy as f32;
-
-                    for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
-                        let taps = [
-                            sample_pixel(x0c, y0c, source_band),
-                            sample_pixel(x1c, y0c, source_band),
-                            sample_pixel(x0c, y1c, source_band),
-                            sample_pixel(x1c, y1c, source_band),
-                        ];
-                        pixel_data[out_idx + out_band_idx] = bilinear_masked(
-                            taps,
-                            weight_x,
-                            weight_y,
-                            || sample_pixel(src_px_clamped, src_pixel_y_nearest, source_band),
-                            nodata_f32,
-                            fill,
-                        );
-                    }
-                }
-                ResamplingMethod::Bicubic | ResamplingMethod::Cubic => {
-                    // Bicubic / cubic interpolation using 4x4 grid of pixels
-                    let weight = cubic_family_weight(resampling);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let x0 = src_pixel_x.floor() as isize;
-
-                    // Fractional parts
-                    #[allow(clippy::cast_precision_loss)]
-                    let fx = src_pixel_x - x0 as f64;
-                    #[allow(clippy::cast_precision_loss)]
-                    let fy = src_pixel_y - y0_floor as f64;
-
-                    // Pre-compute Y weights and clamped coordinates for this row
-                    // (these are the same for all bands and all X in the 4x4 grid row)
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-                    let y_weights: [(usize, f64); 4] = [
-                        ((y0_floor - 1).max(0).min(eff_height as isize - 1) as usize, weight(-1.0 - fy)),
-                        ((y0_floor).max(0).min(eff_height as isize - 1) as usize, weight(-fy)),
-                        ((y0_floor + 1).max(0).min(eff_height as isize - 1) as usize, weight(1.0 - fy)),
-                        ((y0_floor + 2).max(0).min(eff_height as isize - 1) as usize, weight(2.0 - fy)),
-                    ];
-
-                    for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
-                        // Sample 4x4 grid centered around (x0, y0_floor)
-                        let mut taps = [(None, 0.0f32); 16];
-                        let mut n = 0;
-                        for i in -1..=2isize {
-                            #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-                            let px = (x0 + i).max(0).min(eff_width as isize - 1) as usize;
-                            #[allow(clippy::cast_precision_loss)]
-                            let wx = weight(i as f64 - fx);
-
-                            for &(py, wy) in &y_weights {
-                                #[allow(clippy::cast_possible_truncation)]
-                                let w = (wx * wy) as f32;
-                                taps[n] = (sample_pixel(px, py, source_band), w);
-                                n += 1;
-                            }
+                    // A tap's column/row: edge pixels are replicated outside the level, except for
+                    // `Cubic`, where GDAL treats a 4x4 window that leaves the level as unusable.
+                    let axis_tap = |i: isize, size: usize| -> Option<usize> {
+                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+                        if resampling == ResamplingMethod::Cubic {
+                            (0..size as isize).contains(&i).then_some(i as usize)
+                        } else {
+                            Some(i.max(0).min(size as isize - 1) as usize)
                         }
+                    };
+                    let weight = cubic_family_weight(resampling);
+                    // Bilinear: columns x0, x0 + 1; the cubic kernels: x0 - 1 ..= x0 + 2
+                    let (first, count) = if resampling == ResamplingMethod::Bilinear { (0, 2) } else { (-1, 4) };
+                    let mut cols = [(None, 0.0f64); 4];
+                    let mut rows = [(None, 0.0f64); 4];
+                    for k in 0..count {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let i = first + k as isize;
+                        #[allow(clippy::cast_precision_loss)]
+                        let d = i as f64;
+                        let (wx, wy) = match (resampling, k) {
+                            (ResamplingMethod::Bilinear, 0) => (1.0 - fx, 1.0 - fy),
+                            (ResamplingMethod::Bilinear, _) => (fx, fy),
+                            _ => (weight(d - fx), weight(d - fy)),
+                        };
+                        cols[k] = (axis_tap(x0 + i, eff_width), wx);
+                        rows[k] = (axis_tap(y0_floor + i, eff_height), wy);
+                    }
 
-                        pixel_data[out_idx + out_band_idx] = bicubic_masked(
-                            &taps,
-                            || sample_pixel(src_px_clamped, src_pixel_y_nearest, source_band),
-                            nodata_f32,
-                            fill,
-                        );
+                    // Where each tap lives (one tile lookup per tap, not per band) and its weight
+                    let taps_per_axis = count;
+                    let mut at = [None; 16];
+                    let mut weights = [0.0f32; 16];
+                    let mut n = 0;
+                    for &(col, wx) in &cols[..taps_per_axis] {
+                        for &(row, wy) in &rows[..taps_per_axis] {
+                            if let (Some(c), Some(r)) = (col, row) {
+                                at[n] = locate(c, r);
+                            }
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                weights[n] = (wx * wy) as f32;
+                            }
+                            n += 1;
+                        }
+                    }
+                    let value = |tap: usize, band: usize| at[tap].and_then(|(tile, base)| tile.get(base + band).copied());
+                    // Taps are in (x, y) order; the bilinear ones are v00, v10, v01, v11: the 2x2
+                    // itself, or the four around (x0, y0) inside the 4x4
+                    let core = if n == 4 { [0, 2, 1, 3] } else { [5, 9, 6, 10] };
+
+                    // Every tap valid: the plain formula; any invalid tap in any band: see below
+                    let mut any_pending = false;
+                    for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
+                        let interpolated = if n == 4 {
+                            #[allow(clippy::cast_possible_truncation)]
+                            bilinear_if_valid(core.map(|t| value(t, source_band)), fx as f32, fy as f32, nodata_f32)
+                        } else {
+                            let mut values = [None; 16];
+                            for (t, v) in values.iter_mut().enumerate() {
+                                *v = value(t, source_band);
+                            }
+                            cubic_if_valid(&values, &weights, nodata_f32, fill)
+                        };
+                        pending[out_band_idx] = interpolated.is_none();
+                        any_pending |= interpolated.is_none();
+                        if let Some(v) = interpolated {
+                            pixel_data[out_idx + out_band_idx] = v;
+                        }
+                    }
+                    if any_pending {
+                        // Some tap is missing, NaN or nodata. GDAL (`GWKGeneralCase`/`GWKRealCase`):
+                        // a pixel whose own source pixel is nodata in every band is not written;
+                        // otherwise each band is interpolated over its valid taps.
+                        let centre_invalid = output_bands.iter().all(|&band| {
+                            !sample_pixel(src_px_clamped, src_pixel_y_nearest, band).is_some_and(|v| !is_invalid_sample(v, nodata_f32))
+                        });
+                        for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
+                            if !pending[out_band_idx] {
+                                continue;
+                            }
+                            pixel_data[out_idx + out_band_idx] = if centre_invalid {
+                                sample_pixel(src_px_clamped, src_pixel_y_nearest, source_band).unwrap_or(fill)
+                            } else {
+                                bilinear_renormalised(core.map(|t| value(t, source_band)), fx, fy, nodata_f32).unwrap_or(fill)
+                            };
+                        }
                     }
                 }
             }
         }
     }
 
-    // Drop sample_pixel closure
-    let _ = sample_pixel;
+    // Drop the closures
+    let _ = (locate, sample_pixel);
 
     Ok(TileData {
         pixels: pixel_data,
@@ -2472,55 +2484,65 @@ fn is_invalid_sample(v: f32, nodata: Option<f32>) -> bool {
     v.is_nan() || nodata.is_some_and(|nd| v == nd)
 }
 
-/// Bilinear interpolation over taps `[v00, v10, v01, v11]` (x then y order).
-///
-/// If any tap is missing, `NaN` or nodata, interpolating would bleed invalid
-/// data into the result, so the nearest sample is returned instead (itself
-/// passed through unchanged, or `fill` when it is missing).
+/// A tap is usable when it exists (inside the level, tile read) and is neither `NaN` nor nodata.
 #[inline]
-fn bilinear_masked(
-    taps: [Option<f32>; 4],
-    weight_x: f32,
-    weight_y: f32,
-    nearest: impl FnOnce() -> Option<f32>,
-    nodata: Option<f32>,
-    fill: f32,
-) -> f32 {
-    if let [Some(v00), Some(v10), Some(v01), Some(v11)] = taps
-        && !taps.iter().flatten().any(|&v| is_invalid_sample(v, nodata))
-    {
-        return v00 * (1.0 - weight_x) * (1.0 - weight_y)
-            + v10 * weight_x * (1.0 - weight_y)
-            + v01 * (1.0 - weight_x) * weight_y
-            + v11 * weight_x * weight_y;
-    }
-    nearest().unwrap_or(fill)
+fn valid_tap(tap: Option<f32>, nodata: Option<f32>) -> Option<f32> {
+    tap.filter(|&v| !is_invalid_sample(v, nodata))
 }
 
-/// Weighted bicubic / cubic interpolation over 16 `(value, weight)` taps.
-///
-/// Same masking rule as [`bilinear_masked`]: any invalid tap yields the nearest
-/// sample. Renormalising the remaining weights is not used because the
-/// Mitchell and Catmull-Rom kernels have negative lobes, so partial weight sums are unstable.
+/// Bilinear interpolation over taps `[v00, v10, v01, v11]` (x then y order) when all four are
+/// usable, `None` otherwise (see [`bilinear_renormalised`]).
 #[inline]
-fn bicubic_masked(
-    taps: &[(Option<f32>, f32); 16],
-    nearest: impl FnOnce() -> Option<f32>,
-    nodata: Option<f32>,
-    fill: f32,
-) -> f32 {
-    let mut sum = 0.0f32;
-    let mut weight_sum = 0.0f32;
-    for &(v, w) in taps {
-        match v {
-            Some(v) if !is_invalid_sample(v, nodata) => {
-                sum += v * w;
-                weight_sum += w;
-            }
-            _ => return nearest().unwrap_or(fill),
+fn bilinear_if_valid(taps: [Option<f32>; 4], weight_x: f32, weight_y: f32, nodata: Option<f32>) -> Option<f32> {
+    let [Some(v00), Some(v10), Some(v01), Some(v11)] = taps.map(|t| valid_tap(t, nodata)) else {
+        return None;
+    };
+    Some(
+        v00 * (1.0 - weight_x) * (1.0 - weight_y)
+            + v10 * weight_x * (1.0 - weight_y)
+            + v01 * (1.0 - weight_x) * weight_y
+            + v11 * weight_x * weight_y,
+    )
+}
+
+/// A bilinear weight total below this means no usable data (GDAL `GWKBilinearResample4Sample`:
+/// `dfAccumulatorDivisor < 0.00001`).
+const MIN_BILINEAR_WEIGHT: f64 = 0.000_01;
+
+/// Bilinear interpolation over the usable ones of the taps `[v00, v10, v01, v11]`, the weights of
+/// the others dropped and the rest divided by their sum: GDAL's fixed 2x2 formula with a source
+/// mask (`GWKBilinearResample4Sample`, `alg/gdalwarpkernel.cpp`: it adds a tap only if its density
+/// exceeds `SRC_DENSITY_THRESHOLD_DOUBLE`, then divides by `dfAccumulatorDivisor`). `None` when the
+/// usable weight is below [`MIN_BILINEAR_WEIGHT`]: GDAL reports no density and writes nothing.
+#[inline]
+fn bilinear_renormalised(taps: [Option<f32>; 4], fx: f64, fy: f64, nodata: Option<f32>) -> Option<f32> {
+    let weights = [(1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy];
+    let (mut sum, mut total) = (0.0f64, 0.0f64);
+    for (tap, w) in taps.into_iter().zip(weights) {
+        if let Some(v) = valid_tap(tap, nodata) {
+            sum += f64::from(v) * w;
+            total += w;
         }
     }
-    if weight_sum > 0.0 { sum / weight_sum } else { fill }
+    #[allow(clippy::cast_possible_truncation)]
+    (total >= MIN_BILINEAR_WEIGHT).then(|| (sum / total) as f32)
+}
+
+/// Weighted bicubic / cubic interpolation over 16 taps and their weights when all taps are usable,
+/// `None` otherwise. GDAL does the same for `-r cubic` (`GWKCubicResample4Sample`): if any tap of
+/// the 4x4 window is missing, invalid or outside the level it does not renormalise the cubic
+/// weights (which have negative lobes) but falls back to bilinear over the 2x2 core, which
+/// [`bilinear_renormalised`] then does. `fill` is returned for degenerate weights.
+#[inline]
+fn cubic_if_valid(values: &[Option<f32>; 16], weights: &[f32; 16], nodata: Option<f32>, fill: f32) -> Option<f32> {
+    let mut sum = 0.0f32;
+    let mut weight_sum = 0.0f32;
+    for (&v, &w) in values.iter().zip(weights) {
+        let v = valid_tap(v, nodata)?;
+        sum += v * w;
+        weight_sum += w;
+    }
+    Some(if weight_sum > 0.0 { sum / weight_sum } else { fill })
 }
 
 /// Weights of the source pixels one scaled kernel reads along an axis, written to `out`
@@ -2545,9 +2567,8 @@ fn axis_weights(resampling: ResamplingMethod, axis: AxisKernel, v: f64, size: us
 ///
 /// Invalid taps (`NaN`, nodata, unread tiles) are left out and the rest renormalised, which is
 /// what GDAL's masked warp does (`GWKResample` skips zero-density pixels and divides by the
-/// accumulated weight). The fixed-footprint path falls back to the nearest pixel instead, but a
-/// scaled footprint spans tens of pixels, so near any nodata edge that fallback would turn the
-/// edge into a staircase of nearest samples.
+/// accumulated weight). The fixed-footprint path renormalises over the 2x2 bilinear taps the same
+/// way (see [`bilinear_renormalised`]).
 struct ScaledSampler<'a> {
     tiles: &'a ahash::AHashMap<usize, std::sync::Arc<Vec<f32>>>,
     resampling: ResamplingMethod,
@@ -2698,34 +2719,54 @@ mod tests {
     }
 
     #[test]
-    fn test_bilinear_masked_matches_formula_when_all_valid() {
+    fn test_bilinear_if_valid_matches_formula_when_all_valid() {
         let t = [10.0, 20.0, 30.0, 40.0];
         for &(wx, wy) in &[(0.0, 0.0), (0.25, 0.75), (0.5, 0.5), (1.0, 1.0)] {
-            let got = bilinear_masked(t.map(Some), wx, wy, || panic!("nearest must not be needed"), Some(0.0), f32::NAN);
-            assert_eq!(got, bilinear_reference(t, wx, wy));
+            assert_eq!(bilinear_if_valid(t.map(Some), wx, wy, Some(0.0)), Some(bilinear_reference(t, wx, wy)));
         }
         // 0.0 is a valid sample when no nodata is declared
-        let got = bilinear_masked([Some(0.0), Some(4.0), Some(0.0), Some(4.0)], 0.5, 0.5, || panic!(), None, f32::NAN);
-        assert_eq!(got, 2.0);
+        assert_eq!(bilinear_if_valid([Some(0.0), Some(4.0), Some(0.0), Some(4.0)], 0.5, 0.5, None), Some(2.0));
     }
 
     #[test]
-    fn test_bilinear_masked_invalid_tap_falls_back_to_nearest() {
-        let taps = [Some(10.0), Some(f32::NAN), Some(30.0), Some(40.0)];
-        assert_eq!(bilinear_masked(taps, 0.3, 0.3, || Some(10.0), None, -1.0), 10.0);
-        // nodata tap, even with zero weight, must not be blended in
-        let taps = [Some(10.0), Some(0.0), Some(30.0), Some(40.0)];
-        assert_eq!(bilinear_masked(taps, 0.0, 0.0, || Some(10.0), Some(0.0), -1.0), 10.0);
-        // missing tap (unread source tile)
-        let taps = [Some(10.0), None, Some(30.0), Some(40.0)];
-        assert_eq!(bilinear_masked(taps, 0.9, 0.9, || Some(40.0), None, -1.0), 40.0);
-        // nearest is itself invalid: passed through, not replaced by fill
-        let taps = [Some(0.0), Some(1.0), Some(2.0), Some(3.0)];
-        assert_eq!(bilinear_masked(taps, 0.1, 0.1, || Some(0.0), Some(0.0), -1.0), 0.0);
-        assert!(bilinear_masked(taps, 0.1, 0.1, || Some(f32::NAN), Some(0.0), -1.0).is_nan());
-        // nearest missing -> fill
-        assert_eq!(bilinear_masked([None; 4], 0.5, 0.5, || None, None, -1.0), -1.0);
-        assert!(bilinear_masked([None; 4], 0.5, 0.5, || None, None, f32::NAN).is_nan());
+    fn test_bilinear_if_valid_rejects_any_unusable_tap() {
+        let ok = [Some(10.0), Some(20.0), Some(30.0), Some(40.0)];
+        assert!(bilinear_if_valid(ok, 0.3, 0.3, None).is_some());
+        for bad in [Some(f32::NAN), Some(0.0), None] {
+            for i in 0..4 {
+                let mut taps = ok;
+                taps[i] = bad;
+                // a nodata or NaN tap is rejected even at zero weight
+                assert_eq!(bilinear_if_valid(taps, 0.0, 0.0, Some(0.0)), None, "{bad:?} at {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_bilinear_renormalised_divides_by_the_weights_of_the_valid_taps() {
+        // fx = 0.25, fy = 0.5: weights .375 .125 .375 .125; the second tap is dropped
+        let want = (10.0 * 0.375 + 30.0 * 0.375 + 40.0 * 0.125) / 0.875;
+        for dropped in [Some(f32::NAN), Some(-9999.0), None] {
+            let got = bilinear_renormalised([Some(10.0), dropped, Some(30.0), Some(40.0)], 0.25, 0.5, Some(-9999.0)).unwrap();
+            assert!((f64::from(got) - want).abs() < 1e-5, "{dropped:?}: {got}");
+        }
+        // all valid: the plain formula
+        let got = bilinear_renormalised([Some(10.0), Some(20.0), Some(30.0), Some(40.0)], 0.25, 0.5, None).unwrap();
+        assert!((got - bilinear_reference([10.0, 20.0, 30.0, 40.0], 0.25, 0.5)).abs() < 1e-5);
+        // one valid tap: its value, whatever its weight (above the threshold)
+        assert_eq!(bilinear_renormalised([None, None, None, Some(7.0)], 0.01, 0.01, None), Some(7.0));
+    }
+
+    #[test]
+    fn test_bilinear_renormalised_needs_usable_weight() {
+        // GDAL: dfAccumulatorDivisor < 0.00001 -> no value (the caller writes fill)
+        // only the (1, 1) tap valid, weight fx * fy
+        assert_eq!(bilinear_renormalised([None, None, None, Some(7.0)], 0.003, 0.003, None), None); // 9e-6
+        assert_eq!(bilinear_renormalised([None, None, None, Some(7.0)], 0.004, 0.004, None), Some(7.0)); // 1.6e-5
+        // a valid tap with zero weight does not count
+        assert_eq!(bilinear_renormalised([None, Some(5.0), Some(6.0), Some(7.0)], 0.0, 0.0, None), None);
+        assert_eq!(bilinear_renormalised([None; 4], 0.5, 0.5, None), None);
+        assert_eq!(bilinear_renormalised([Some(f32::NAN); 4], 0.5, 0.5, None), None);
     }
 
     #[test]
@@ -2762,34 +2803,35 @@ mod tests {
     }
 
     #[test]
-    fn test_bicubic_masked_matches_formula_when_all_valid() {
-        let mut taps = [(Some(0.0f32), 0.0f32); 16];
-        let (mut sum, mut wsum) = (0.0f32, 0.0f32);
-        for (i, tap) in taps.iter_mut().enumerate() {
-            let v = 10.0 + i as f32;
-            let w = bicubic_weight(i as f64 * 0.1 - 0.7) as f32;
-            *tap = (Some(v), w);
-            sum += v * w;
-            wsum += w;
+    fn test_cubic_if_valid_matches_formula_when_all_valid() {
+        for weight in [bicubic_weight, cubic_weight] {
+            let (mut values, mut weights) = ([None; 16], [0.0f32; 16]);
+            let (mut sum, mut wsum) = (0.0f32, 0.0f32);
+            for i in 0..16 {
+                let v = 10.0 + i as f32;
+                let w = weight(i as f64 * 0.1 - 0.7) as f32;
+                (values[i], weights[i]) = (Some(v), w);
+                sum += v * w;
+                wsum += w;
+            }
+            assert_eq!(cubic_if_valid(&values, &weights, Some(0.0), f32::NAN), Some(sum / wsum));
         }
-        let got = bicubic_masked(&taps, || panic!("nearest must not be needed"), Some(0.0), f32::NAN);
-        assert_eq!(got, sum / wsum);
     }
 
     #[test]
-    fn test_bicubic_masked_invalid_tap_falls_back_to_nearest() {
-        let mut taps = [(Some(50.0f32), 1.0 / 16.0); 16];
-        taps[7].0 = Some(f32::NAN);
-        assert_eq!(bicubic_masked(&taps, || Some(50.0), None, -1.0), 50.0);
-        taps[7].0 = Some(0.0); // nodata
-        assert_eq!(bicubic_masked(&taps, || Some(50.0), Some(0.0), -1.0), 50.0);
-        taps[7].0 = None; // missing
-        assert_eq!(bicubic_masked(&taps, || Some(50.0), None, -1.0), 50.0);
-        // nearest missing -> fill
-        assert_eq!(bicubic_masked(&taps, || None, None, -1.0), -1.0);
+    fn test_cubic_if_valid_rejects_any_unusable_tap() {
+        let weights = [1.0f32 / 16.0; 16];
+        let mut values = [Some(50.0f32); 16];
+        assert_eq!(cubic_if_valid(&values, &weights, None, -1.0), Some(50.0));
+        for bad in [Some(f32::NAN), Some(0.0), None] {
+            values[7] = bad;
+            assert_eq!(cubic_if_valid(&values, &weights, Some(0.0), -1.0), None, "{bad:?}");
+        }
+        // a nodata value is only invalid when declared
+        values[7] = Some(0.0);
+        assert!(cubic_if_valid(&values, &weights, None, -1.0).is_some());
         // degenerate weights with all-valid taps -> fill
-        let zero_w = [(Some(5.0f32), 0.0f32); 16];
-        assert_eq!(bicubic_masked(&zero_w, || panic!(), None, -1.0), -1.0);
+        assert_eq!(cubic_if_valid(&[Some(5.0); 16], &[0.0; 16], None, -1.0), Some(-1.0));
     }
 
     // ------------------------------------------------------------------

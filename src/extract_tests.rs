@@ -714,3 +714,97 @@ async fn interpolation_reads_source_tiles_across_a_tile_boundary() {
         }
     }
 }
+
+// --- Interpolation next to invalid taps ---
+
+const HOLE_SIZE: usize = 128;
+
+/// `HOLE_SIZE` square, nodata 0: a two-pixel wide vertical strip crossing the tile seam rows, and
+/// a single-pixel hole. Everything else is a gradient that is never 0.
+fn hole_spec() -> CogSpec {
+    let mut spec = patch_spec(3857, (0.0, HOLE_SIZE as f64 * 10.0), 10.0, HOLE_SIZE, 64);
+    spec.nodata = Some(0.0);
+    spec.pixel = |_, x, y| if ((70..72).contains(&x) && (30..100).contains(&y)) || (x, y) == (40, 40) { 0.0 } else { (x * 7 + y * 11 + 1) as f64 };
+    spec
+}
+
+/// What GDAL computes for a 2x2 / 4x4 window around pixel-centre coordinates `(cu, cv)` when some
+/// taps are nodata (`GWKBilinearResample4Sample`, `GWKCubicResample4Sample`), written out
+/// independently of the library. Returns the value and whether the window had an invalid tap.
+fn hole_reference(method: ResamplingMethod, cu: f64, cv: f64) -> (f64, bool) {
+    let spec = hole_spec();
+    let value = |x: isize, y: isize| -> Option<f64> {
+        if !(0..HOLE_SIZE as isize).contains(&x) || !(0..HOLE_SIZE as isize).contains(&y) {
+            return None;
+        }
+        let v = (spec.pixel)(0, x as usize, y as usize);
+        (v != 0.0).then_some(v)
+    };
+    let (x0, y0) = (cu.floor() as isize, cv.floor() as isize);
+    let (fx, fy) = (cu - x0 as f64, cv - y0 as f64);
+    // the pixel containing the output pixel's centre: nodata there leaves the pixel at nodata (0)
+    if value(cu.round() as isize, cv.round() as isize).is_none() {
+        return (0.0, true);
+    }
+    let bilinear = |invalid: bool| {
+        let taps = [((0, 0), (1.0 - fx) * (1.0 - fy)), ((1, 0), fx * (1.0 - fy)), ((0, 1), (1.0 - fx) * fy), ((1, 1), fx * fy)];
+        let (mut sum, mut total) = (0.0, 0.0);
+        for ((dx, dy), w) in taps {
+            if let Some(v) = value(x0 + dx, y0 + dy) {
+                sum += v * w;
+                total += w;
+            }
+        }
+        (if total < 1e-5 { 0.0 } else { sum / total }, invalid)
+    };
+    match method {
+        ResamplingMethod::Bilinear => {
+            let all = (0..2).all(|dy| (0..2).all(|dx| value(x0 + dx, y0 + dy).is_some()));
+            bilinear(!all)
+        }
+        _ => {
+            let (b, c) = if method == ResamplingMethod::Cubic { (0.0, 0.5) } else { (1.0 / 3.0, 1.0 / 3.0) };
+            let window: Vec<(isize, isize)> = (-1..=2).flat_map(|dx| (-1..=2).map(move |dy| (dx, dy))).collect();
+            if window.iter().all(|&(dx, dy)| value(x0 + dx, y0 + dy).is_some()) {
+                let (mut sum, mut weights) = (0.0, 0.0);
+                for (dx, dy) in window {
+                    let w = mitchell(dx as f64 - fx, b, c) * mitchell(dy as f64 - fy, b, c);
+                    sum += w * value(x0 + dx, y0 + dy).unwrap();
+                    weights += w;
+                }
+                (sum / weights, false)
+            } else {
+                // GDAL does not renormalise the cubic weights: it interpolates bilinearly
+                bilinear(true)
+            }
+        }
+    }
+}
+
+/// Upsampled windows (a source pixel is 2 to 3 output pixels) over the strip, the hole and the
+/// tile seam: every pixel equals GDAL's value, including those with a nodata tap in the window.
+#[tokio::test(start_paused = true)]
+async fn interpolation_next_to_nodata_renormalises_the_valid_taps_like_gdal() {
+    let spec = hole_spec();
+    let size = 128;
+    for method in [ResamplingMethod::Bilinear, ResamplingMethod::Cubic, ResamplingMethod::Bicubic] {
+        let mut touched = 0;
+        for (w, window) in [(30.0, 63.9), (64.1, 98.0)].into_iter().enumerate() {
+            let r = memory_reader(&format!("mem://holes/{w}/{method:?}"), &spec);
+            let bounds = BoundingBox::new(window.0 * 10.0, (HOLE_SIZE as f64 - window.1) * 10.0, window.1 * 10.0, (HOLE_SIZE as f64 - window.0) * 10.0);
+            let tile = TileExtractor::new(&r).bounds(bounds).size(size).resampling(method).extract().await.unwrap();
+            let res = (window.1 - window.0) / size as f64;
+            let mut worst = 0.0f64;
+            for oy in 0..size {
+                for ox in 0..size {
+                    let (cu, cv) = (window.0 + (ox as f64 + 0.5) * res - 0.5, window.0 + (oy as f64 + 0.5) * res - 0.5);
+                    let (want, invalid) = hole_reference(method, cu, cv);
+                    touched += usize::from(invalid);
+                    worst = worst.max((f64::from(tile.pixels[oy * size + ox]) - want).abs());
+                }
+            }
+            assert!(worst < 2e-3, "{method:?} window {w}: worst deviation from the reference {worst}");
+        }
+        assert!(touched > 500, "{method:?}: only {touched} pixels have an invalid tap");
+    }
+}
