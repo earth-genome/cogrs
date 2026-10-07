@@ -12,7 +12,7 @@
 //! * `single`          open + one z14 tile (cold)
 //! * `z12`             open + one z12 tile
 //! * `scene`           open + one low-zoom tile covering the whole scene (`BENCH_TILE=z/x/y`,
-//!                     default 8/73/97); `transparent_pct` is the share of fill pixels
+//!   default 8/73/97); `transparent_pct` is the share of fill pixels
 //! * `concurrent`      one shared reader, 64 concurrent distinct z14 tiles
 //! * `concurrent_open` 64 concurrent requests that each open the COG and extract a z14 tile
 //!
