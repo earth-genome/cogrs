@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `PrefixCachedRangeReader`: serves reads inside the first 16 KiB of a source from
+  memory. `CogReader::open` now wraps non-local readers with it, so opening a remote
+  COG costs a single header request instead of many small sequential ones
+- `RangeReader::has_prefix_cache()` (default method, returns `false`)
+
 ### Fixed
 
 - `cargo bench` now works: benchmarks ported to the `TileExtractor` API, the library

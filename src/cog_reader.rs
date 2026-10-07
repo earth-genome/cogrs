@@ -13,7 +13,7 @@
 //! - Single transform inversion per tile (not per pixel)
 //! - Global LRU tile cache for decompressed data
 
-use crate::range_reader::{create_range_reader, RangeReader};
+use crate::range_reader::{create_range_reader, PrefixCachedRangeReader, RangeReader};
 use crate::tile_cache;
 use crate::tiff_utils::AnyResult;
 use std::collections::HashMap;
@@ -424,6 +424,14 @@ impl CogReader {
     /// Returns an error if the file is not a valid TIFF/COG, required metadata tags
     /// are missing or invalid, or if reading the IFD data fails.
     pub fn from_reader_with_hint(reader: Arc<dyn RangeReader>, hint: OverviewQualityHint) -> AnyResult<Self> {
+        // Remote COGs keep header, IFDs and tag values at the start of the file;
+        // fetch that prefix once instead of issuing many small sequential reads.
+        let reader: Arc<dyn RangeReader> = if reader.is_local() || reader.has_prefix_cache() {
+            reader
+        } else {
+            Arc::new(PrefixCachedRangeReader::new(reader)?)
+        };
+
         // Read header to get IFD offset and byte order
         let header_bytes = reader.read_range(0, 8)?;
 
