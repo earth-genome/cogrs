@@ -64,6 +64,14 @@ S3 configuration: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for credentials,
 `AWS_REGION`, then `AWS_DEFAULT_REGION`; if neither is set it is detected from the bucket
 (once per bucket per process) unless a custom endpoint is configured.
 
+**BigTIFF.** COGs larger than 4 GiB are stored as BigTIFF (TIFF version 43: 8-byte offsets,
+20-byte IFD entries, `LONG8` tile offsets); `CogReader` reads them exactly like classic TIFF
+COGs, local or remote, sync or async, through the same header and tile caches. A BigTIFF's
+tile arrays are twice as large, so opening one reads about 1.4x the header bytes of the same
+COG as a classic TIFF (and, once the arrays outgrow the 16 KiB open request, up to one more
+request); the header cache makes that a one-time cost. The local-file `TiffChunkedRasterSource`
+and `LzwRasterSource` parse classic TIFF only and return an error naming BigTIFF.
+
 Opening a remote COG is one ranged request (header, IFDs, size and ETag together), and every
 COG in the same bucket or host shares one HTTP client. Pass an `OverviewQualityHint` (see
 `open_async_with_hint`) to skip sampling tiles from the coarsest overview at open, and

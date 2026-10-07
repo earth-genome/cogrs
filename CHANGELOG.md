@@ -81,6 +81,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   bytes of the remote readers), `tile_cache::{set_capacity, clear, invalidate_source,
   invalidate_identity, snapshot}` and `TileCacheStats`, `COGRS_TILE_CACHE_MB`
 - `bench_remote cache`: 64 concurrent open-per-request tiles through the header cache
+- BigTIFF (TIFF version 43) COGs: the header (8-byte offsets, byte size 8, reserved 0), IFD
+  tables with 64-bit entry counts and 20-byte entries, values of up to 8 bytes stored inline,
+  `LONG8` tile offsets and byte counts (and single `LONG8` values such as sizes), and 64-bit
+  next-IFD offsets, for local files and remote sources, the async and the synchronous open, and
+  the header cache. Compared with the classic encoding of the same COG, decoded tiles, geometry
+  and extraction are identical (tested on synthetic COGs in both `LONG` and `LONG8` array types
+  and on GDAL-made COGs with `BIGTIFF=YES`: DEFLATE, LZW, ZSTD, Float32 `PixelIsPoint`), and a
+  real public BigTIFF COG (ArcticDEM 2 m mosaic tile, LZW with the floating-point predictor) opens
+  and reads a tile identical to GDAL's
 
 ### Changed
 
@@ -128,6 +137,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   when the server sent no `Last-Modified` (it was the epoch)
 - The decoded tile cache uses `parking_lot` (no poisoning panics), counts hits, misses and
   evictions in atomics, and its capacity is configurable
+- IFD tables are validated while parsing: an entry count above 65 535 and a tag value that lies
+  outside the file are errors (they used to be read as is), and an IFD larger than the first
+  4 KiB read is read in full instead of being truncated. The synchronous chunked and LZW file
+  readers report BigTIFF files as unsupported (`Invalid TIFF version: N` for other versions)
 
 ### Removed
 
@@ -146,6 +159,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The 129th synchronous call made inside one tokio task never returned: the blocking adapter
+  (`AsyncToSync`, which backs `CogReader::read_tile`, `sample*` and the other synchronous methods
+  of remote and async-opened readers) waited on a join handle that tokio's cooperative budget
+  kept answering "pending"
 - A COG overwritten under the same name (or a local file rewritten in place) was served from
   decoded tiles of its previous contents; tiles are now keyed by version
 - The tile offset arrays of a remote COG were read without checking they belonged to the same
