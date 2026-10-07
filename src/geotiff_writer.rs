@@ -608,7 +608,7 @@ mod tests {
         };
 
         let bytes = raster.to_geotiff_bytes().unwrap();
-        assert!(bytes.len() > 0);
+        assert!(!bytes.is_empty());
         println!("5-band GeoTIFF: {} bytes", bytes.len());
     }
 
@@ -627,7 +627,7 @@ mod tests {
         };
 
         let bytes = raster.to_geotiff_bytes().unwrap();
-        assert!(bytes.len() > 0);
+        assert!(!bytes.is_empty());
         println!("2-band GeoTIFF: {} bytes", bytes.len());
     }
 
@@ -647,7 +647,7 @@ mod tests {
         };
 
         let bytes = raster.to_geotiff_bytes().unwrap();
-        assert!(bytes.len() > 0);
+        assert!(!bytes.is_empty());
         println!("16-band GeoTIFF: {} bytes", bytes.len());
 
         // Verify it can be read back
@@ -713,7 +713,7 @@ mod tests {
             raster.crs = crs;
 
             let bytes = raster.to_geotiff_bytes().unwrap();
-            assert!(bytes.len() > 0, "Failed to write GeoTIFF for {name} (EPSG:{crs})");
+            assert!(!bytes.is_empty(), "Failed to write GeoTIFF for {name} (EPSG:{crs})");
             println!("EPSG:{crs} ({name}): {} bytes", bytes.len());
         }
     }

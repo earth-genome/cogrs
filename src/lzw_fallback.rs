@@ -596,6 +596,7 @@ fn apply_horizontal_predictor_u16(
 /// This uses a two-step process per the Adobe TIFF Technote 3:
 /// 1. Input data is stored "planar" - all MSBs together, then next bytes, etc.
 /// 2. Horizontal differencing is applied within each byte plane
+///
 /// We need to reverse this: undo differencing, then reorder to interleaved.
 fn apply_floating_point_predictor(
     data: &mut [u8],

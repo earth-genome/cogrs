@@ -735,11 +735,11 @@ mod gdal_verification_tests {
 
         for (lon, lat) in test_locations {
             let result = cog.sample_lonlat(lon, lat);
-            if let Ok(r) = result {
-                if r.is_valid {
-                    assert_eq!(r.values.len(), cog.metadata.bands,
-                        "Point ({}, {}) should have {} bands", lon, lat, cog.metadata.bands);
-                }
+            if let Ok(r) = result
+                && r.is_valid
+            {
+                assert_eq!(r.values.len(), cog.metadata.bands,
+                    "Point ({}, {}) should have {} bands", lon, lat, cog.metadata.bands);
             }
         }
     }
@@ -805,8 +805,8 @@ mod gdal_verification_tests {
 
         assert_eq!(values.len(), cog.metadata.bands, "Should have all band values");
         // Verify it returns values in band order
-        for i in 0..cog.metadata.bands {
-            assert_eq!(values[i], result.get(i).unwrap());
+        for (i, value) in values.iter().enumerate() {
+            assert_eq!(*value, result.get(i).unwrap());
         }
     }
 }
