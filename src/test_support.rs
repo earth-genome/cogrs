@@ -179,7 +179,7 @@ fn encode_tile(spec: &CogSpec, level: usize, tile_idx: usize) -> Vec<u8> {
     }
 }
 
-fn ifd_entries(spec: &CogSpec, level: usize, offsets: &[u32], counts: &[u32]) -> Vec<Entry> {
+fn ifd_entries(spec: &CogSpec, level: usize, offsets: &[u32], counts: &[u32], point: bool) -> Vec<Entry> {
     let (w, h) = spec.level_dims(level);
     let bits = (spec.sample.bytes() * 8) as u16;
     let mut e = vec![
@@ -203,11 +203,17 @@ fn ifd_entries(spec: &CogSpec, level: usize, offsets: &[u32], counts: &[u32]) ->
     }
     if level == 0 {
         e.push(doubles(33550, &[spec.pixel_size.0, spec.pixel_size.1, 0.0]));
-        e.push(doubles(33922, &[0.0, 0.0, 0.0, spec.origin.0, spec.origin.1, 0.0]));
+        // PixelIsPoint: the tiepoint is the centre of pixel (0, 0); PixelIsArea: its outer corner.
+        let (tx, ty) = if point {
+            (spec.origin.0 + 0.5 * spec.pixel_size.0, spec.origin.1 - 0.5 * spec.pixel_size.1)
+        } else {
+            spec.origin
+        };
+        e.push(doubles(33922, &[0.0, 0.0, 0.0, tx, ty, 0.0]));
         let (model_type, crs_key) = if spec.epsg == 4326 { (2, 2048) } else { (1, 3072) };
         e.push(shorts(
             34735,
-            &[1, 1, 0, 3, 1024, 0, 1, model_type, 1025, 0, 1, 1, crs_key, 0, 1, spec.epsg],
+            &[1, 1, 0, 3, 1024, 0, 1, model_type, 1025, 0, 1, if point { 2 } else { 1 }, crs_key, 0, 1, spec.epsg],
         ));
         if let Some(nd) = spec.nodata {
             e.push(ascii(42113, &format!("{nd}")));
@@ -220,6 +226,12 @@ fn ifd_entries(spec: &CogSpec, level: usize, offsets: &[u32], counts: &[u32]) ->
 
 /// Encode `spec` as a little-endian classic TIFF.
 pub(crate) fn build_cog(spec: &CogSpec) -> Vec<u8> {
+    build_cog_registered(spec, false)
+}
+
+/// Like [`build_cog`], optionally with `PixelIsPoint` raster registration (`spec.origin` stays the
+/// outer corner of pixel (0, 0); the tiepoint is written as the pixel's centre).
+pub(crate) fn build_cog_registered(spec: &CogSpec, point: bool) -> Vec<u8> {
     let levels = spec.overviews + 1;
     let tiles: Vec<Vec<Vec<u8>>> = (0..levels)
         .map(|l| (0..spec.tiles_across(l) * spec.tiles_down(l)).map(|i| encode_tile(spec, l, i)).collect())
@@ -229,7 +241,7 @@ pub(crate) fn build_cog(spec: &CogSpec) -> Vec<u8> {
     let sizes: Vec<usize> = (0..levels)
         .map(|l| {
             let n = tiles[l].len();
-            encode_ifd(ifd_entries(spec, l, &vec![0; n], &vec![0; n]), 0, 0).len()
+            encode_ifd(ifd_entries(spec, l, &vec![0; n], &vec![0; n], point), 0, 0).len()
         })
         .collect();
     let mut starts = Vec::with_capacity(levels);
@@ -266,7 +278,7 @@ pub(crate) fn build_cog(spec: &CogSpec) -> Vec<u8> {
     out.extend_from_slice(&(starts[0] as u32).to_le_bytes());
     for l in 0..levels {
         let next = if l + 1 < levels { starts[l + 1] as u32 } else { 0 };
-        let ifd = encode_ifd(ifd_entries(spec, l, &offsets[l], &counts[l]), starts[l] as u32, next);
+        let ifd = encode_ifd(ifd_entries(spec, l, &offsets[l], &counts[l], point), starts[l] as u32, next);
         assert_eq!(ifd.len(), sizes[l]);
         out.extend_from_slice(&ifd);
     }

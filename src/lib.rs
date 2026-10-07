@@ -50,6 +50,8 @@ mod test_support;
 mod golden_tests;
 #[cfg(test)]
 mod extract_tests;
+#[cfg(test)]
+mod gdal_comparison_tests;
 
 // ============================================================================
 // Core COG Types

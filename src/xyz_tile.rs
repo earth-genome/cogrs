@@ -1626,7 +1626,10 @@ struct LevelParams {
     eff_tiles_across: usize,
     /// Source pixel size at this level
     scale: [f64; 3],
-    tiepoint: [f64; 6],
+    /// Outer corner (top-left) of pixel (0, 0) of the level in the source CRS. For a
+    /// `PixelIsPoint` raster the tiepoint is the centre of pixel (0, 0), which is half a
+    /// full-resolution pixel inside this corner.
+    origin: (f64, f64),
     /// Output pixel size in the output CRS
     out_res_x: f64,
     out_res_y: f64,
@@ -1659,6 +1662,14 @@ fn level_params(
     // the sizes, i.e. extent / overview size as GDAL derives it
     let scale = [base_scale[0] * scale_factor.0, base_scale[1] * scale_factor.1, base_scale[2]];
 
+    // Outer corner of pixel (0, 0) (GDAL's geotransform origin): the tiepoint pixel is at
+    // `tiepoint[0..2]`, and for PixelIsPoint rasters the tiepoint is that pixel's centre.
+    let registration_offset = if geo_transform.is_point_registered { 0.5 } else { 0.0 };
+    let origin = (
+        tiepoint[3] - (tiepoint[0] + registration_offset) * base_scale[0],
+        tiepoint[4] + (tiepoint[1] + registration_offset) * base_scale[1],
+    );
+
     // Output tile pixel resolution in the output CRS
     #[allow(clippy::cast_precision_loss)]
     let out_res_x = (extent.maxx - extent.minx) / (tile_size_x as f64);
@@ -1672,7 +1683,7 @@ fn level_params(
         eff_tile_height,
         eff_tiles_across,
         scale,
-        tiepoint,
+        origin,
         out_res_x,
         out_res_y,
     })
@@ -1690,19 +1701,26 @@ enum SourceX {
 
 /// Where every output row and column samples the source level, in source pixels of that level.
 ///
+/// Coordinates are pixel-*centre* coordinates: integer `i` is the centre of source pixel `i`, so
+/// the pixel containing an output pixel's centre is `round(c) == floor(u)` for the corner-based
+/// coordinate `u = c + 0.5`, and interpolation uses the pixels around `c`. The output pixel's
+/// centre is what is transformed (`min + (i + 0.5) * res`).
+///
 /// This is computed once, at planning time. It decides which source tiles are fetched and is then
 /// what rendering samples through, so the two cannot disagree: every output pixel whose source
 /// location lies inside the level has the tile of its nearest source pixel fetched.
 struct SourceMapping {
-    /// Source pixel row per output row; `None` if that row lies outside the level.
+    /// Source pixel row (centre coordinates) per output row; `None` if that row lies outside the
+    /// level.
     rows: Vec<Option<f64>>,
     x: SourceX,
 }
 
-/// Sample positions up to half a pixel outside the level still map onto its edge pixels.
+/// Whether a pixel-centre coordinate lies inside the level: the level spans `[-0.5, size - 0.5]`
+/// (from the outer edge of pixel 0 to the outer edge of pixel `size - 1`).
 #[allow(clippy::cast_precision_loss)]
 fn within_level(v: f64, size: usize) -> bool {
-    v >= -0.5 && v <= size as f64 + 0.5
+    v >= -0.5 && v <= size as f64 - 0.5
 }
 
 /// Nearest source pixel, clamped to the level.
@@ -1723,7 +1741,7 @@ impl SourceMapping {
         // Pre-compute inverse scale for speed
         let inv_scale_x = 1.0 / p.scale[0];
         let inv_scale_y = 1.0 / p.scale[1];
-        let tiepoint = &p.tiepoint;
+        let origin = p.origin;
 
         // Source rows for all output rows, from the transform of the tile's left edge.
         let rows: Vec<Option<f64>> = (0..height)
@@ -1731,7 +1749,8 @@ impl SourceMapping {
                 #[allow(clippy::cast_precision_loss)]
                 let merc_y = extent.maxy - (out_y as f64 + 0.5) * p.out_res_y;
                 let (_, world_y) = strategy.transform(extent.minx, merc_y).ok()?;
-                let src_pixel_y = tiepoint[1] + (tiepoint[4] - world_y) * inv_scale_y;
+                // corner-based `v`, shifted to pixel-centre coordinates
+                let src_pixel_y = (origin.1 - world_y) * inv_scale_y - 0.5;
                 within_level(src_pixel_y, p.eff_height).then_some(src_pixel_y)
             })
             .collect();
@@ -1741,13 +1760,13 @@ impl SourceMapping {
             TransformStrategy::FastMerc2Geo => {
                 let lon_base = (extent.minx + 0.5 * p.out_res_x) * 180.0 / HALF_EARTH;
                 SourceX::Linear {
-                    base: tiepoint[0] + (lon_base - tiepoint[3]) * inv_scale_x,
+                    base: (lon_base - origin.0) * inv_scale_x - 0.5,
                     delta: p.out_res_x * 180.0 / HALF_EARTH * inv_scale_x,
                 }
             }
             // For 3857: direct merc_x to pixel
             TransformStrategy::Identity => SourceX::Linear {
-                base: tiepoint[0] + (extent.minx + 0.5 * p.out_res_x - tiepoint[3]) * inv_scale_x,
+                base: (extent.minx + 0.5 * p.out_res_x - origin.0) * inv_scale_x - 0.5,
                 delta: p.out_res_x * inv_scale_x,
             },
             // Other CRS combinations: one transform per pixel (rows outside the level skipped)
@@ -1763,7 +1782,7 @@ impl SourceMapping {
                         #[allow(clippy::cast_precision_loss)]
                         let merc_x = extent.minx + (out_x as f64 + 0.5) * p.out_res_x;
                         if let Ok((world_x, _)) = strategy.transform(merc_x, merc_y) {
-                            xs[out_y * width + out_x] = tiepoint[0] + (world_x - tiepoint[3]) * inv_scale_x;
+                            xs[out_y * width + out_x] = (world_x - origin.0) * inv_scale_x - 0.5;
                         }
                     }
                 }
@@ -2042,13 +2061,8 @@ fn render_extraction(
 
         for out_x in 0..tile_size_x {
             let src_pixel_x = mapping.src_x(out_x, out_y, tile_size_x);
-            if src_pixel_x.is_nan() {
-                continue;
-            }
-
-            // Check if X is within valid range
-            #[allow(clippy::cast_precision_loss)]
-            if src_pixel_x < -0.5 || src_pixel_x > eff_width as f64 + 0.5 {
+            // Same test as planning (NaN: no source column)
+            if !within_level(src_pixel_x, eff_width) {
                 continue;
             }
 

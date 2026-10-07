@@ -178,7 +178,13 @@ fn z14_neighbourhood() -> Vec<(u32, u32, u32)> {
 }
 
 async fn extract(reader: &CogReader, (z, x, y): (u32, u32, u32)) -> TileData {
-    TileExtractor::new(reader).xyz(z, x, y).size(256).extract().await.expect("extract")
+    // BENCH_RESAMPLING=bilinear|bicubic (default nearest)
+    let method = match std::env::var("BENCH_RESAMPLING").as_deref() {
+        Ok("bilinear") => cogrs::ResamplingMethod::Bilinear,
+        Ok("bicubic") => cogrs::ResamplingMethod::Bicubic,
+        _ => cogrs::ResamplingMethod::Nearest,
+    };
+    TileExtractor::new(reader).xyz(z, x, y).size(256).resampling(method).extract().await.expect("extract")
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {

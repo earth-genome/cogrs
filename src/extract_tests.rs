@@ -473,3 +473,127 @@ async fn overview_selection_uses_the_exact_ratio() {
     assert_eq!(reader.best_overview_for_resolution((7.95 * 256.0) as usize, 1), Some(1));
     assert_eq!(reader.best_overview_for_resolution((8.0 * 256.0) as usize, 1), Some(2));
 }
+
+// --- Pixel convention: output pixel centres vs source pixels ---------------------------------
+
+const UNIQUE_SIZE: usize = 250;
+
+/// 250 x 250 raster in 3857 (10 m pixels, outer corner of pixel (0, 0) at `UNIQUE_ORIGIN`) in which
+/// every source pixel has a unique value: `row * 250 + column + 1`.
+const UNIQUE_ORIGIN: (f64, f64) = (-4000.0, 6000.0);
+
+fn unique_value_spec() -> CogSpec {
+    let mut spec = patch_spec(3857, UNIQUE_ORIGIN, 10.0, UNIQUE_SIZE, 64);
+    spec.pixel = |_, x, y| (y * UNIQUE_SIZE + x + 1) as f64;
+    spec
+}
+
+fn unique_value(col: usize, row: usize) -> f64 {
+    (row * UNIQUE_SIZE + col + 1) as f64
+}
+
+fn registered_reader(id: &str, spec: &CogSpec, point: bool) -> CogReader {
+    CogReader::from_reader_with_hint(
+        Arc::new(MemoryRangeReader::new(crate::test_support::build_cog_registered(spec, point), id.to_string())),
+        OverviewQualityHint::NoneUsable,
+    )
+    .unwrap()
+}
+
+/// Where output pixel `(ox, oy)`'s centre falls in the source raster, in source pixels measured
+/// from the raster's outer corner (pixel `i` covers `[i, i + 1)`): `(u, v)`.
+fn source_position(bounds: &BoundingBox, size: usize, ox: usize, oy: usize) -> (f64, f64) {
+    let res = (bounds.maxx - bounds.minx) / size as f64;
+    let cx = bounds.minx + (ox as f64 + 0.5) * res;
+    let cy = bounds.maxy - (oy as f64 + 0.5) * res;
+    ((cx - UNIQUE_ORIGIN.0) / 10.0, (UNIQUE_ORIGIN.1 - cy) / 10.0)
+}
+
+/// Windows with a non-integer source/output scale: one inside the raster, one straddling its
+/// top-left corner and one straddling the bottom-right corner.
+fn convention_windows() -> Vec<BoundingBox> {
+    let w = 128.0 * 6.7;
+    let at = |minx: f64, maxy: f64| BoundingBox::new(minx, maxy - w, minx + w, maxy);
+    vec![
+        at(UNIQUE_ORIGIN.0 + 400.3, UNIQUE_ORIGIN.1 - 377.9),
+        at(UNIQUE_ORIGIN.0 - 300.15, UNIQUE_ORIGIN.1 + 250.35),
+        at(UNIQUE_ORIGIN.0 + 2500.0 - 600.2, UNIQUE_ORIGIN.1 - 2500.0 + 560.6),
+    ]
+}
+
+/// Nearest resampling picks the source pixel *containing* the output pixel's centre, for both
+/// `PixelIsArea` and `PixelIsPoint` rasters: `floor(u), floor(v)`, with `u = (x - origin_x) / px`.
+#[tokio::test(start_paused = true)]
+async fn nearest_picks_the_source_pixel_containing_the_output_pixel_centre() {
+    for point in [true, false] {
+        for (w, bounds) in convention_windows().iter().enumerate() {
+            let r = registered_reader(&format!("mem://convention/near/{point}/{w}"), &unique_value_spec(), point);
+            assert_eq!(r.metadata.geo_transform.is_point_registered, point);
+            let tile = TileExtractor::new(&r).bounds(*bounds).size(128).extract().await.unwrap();
+            assert_eq!(tile.overview_used, None);
+            let (mut identical, mut total, mut inside) = (0, 0, 0);
+            for oy in 0..128 {
+                for ox in 0..128 {
+                    let (u, v) = source_position(bounds, 128, ox, oy);
+                    let got = tile.pixels[oy * 128 + ox];
+                    total += 1;
+                    let want = if (0.0..UNIQUE_SIZE as f64).contains(&u) && (0.0..UNIQUE_SIZE as f64).contains(&v) {
+                        inside += 1;
+                        f64::from(unique_value(u.floor() as usize, v.floor() as usize) as f32)
+                    } else {
+                        f64::NAN
+                    };
+                    if (got.is_nan() && want.is_nan()) || f64::from(got) == want {
+                        identical += 1;
+                    }
+                    // A point query at the output pixel's centre reads the same source pixel
+                    // (it takes floor(u), floor(v) of the same corner-based coordinates).
+                    if !want.is_nan() && (ox * 7 + oy * 3) % 11 == 0 {
+                        let res = (bounds.maxx - bounds.minx) / 128.0;
+                        let (cx, cy) = (bounds.minx + (ox as f64 + 0.5) * res, bounds.maxy - (oy as f64 + 0.5) * res);
+                        let sampled = r.sample_crs_async(3857, cx, cy).await.unwrap();
+                        assert_eq!(f64::from(sampled.values[&0]), want, "point query at ({ox},{oy})");
+                    }
+                }
+            }
+            assert!(inside > 1000, "window {w} covers only {inside} pixels");
+            assert_eq!(identical, total, "point_registered={point}, window {w}: {identical} of {total} pixels as expected");
+        }
+    }
+}
+
+/// Bilinear interpolates between pixel *centres*: around `(u - 0.5, v - 0.5)`.
+#[tokio::test(start_paused = true)]
+async fn bilinear_interpolates_between_source_pixel_centres() {
+    for point in [true, false] {
+        for (w, bounds) in convention_windows().iter().enumerate() {
+            let r = registered_reader(&format!("mem://convention/bilinear/{point}/{w}"), &unique_value_spec(), point);
+            let tile = TileExtractor::new(&r)
+                .bounds(*bounds)
+                .size(128)
+                .resampling(ResamplingMethod::Bilinear)
+                .extract()
+                .await
+                .unwrap();
+            let clamp = |i: isize| i.clamp(0, UNIQUE_SIZE as isize - 1) as usize;
+            let mut worst = 0.0f64;
+            for oy in 0..128 {
+                for ox in 0..128 {
+                    let (u, v) = source_position(bounds, 128, ox, oy);
+                    let got = tile.pixels[oy * 128 + ox];
+                    if !((0.0..UNIQUE_SIZE as f64).contains(&u) && (0.0..UNIQUE_SIZE as f64).contains(&v)) {
+                        assert!(got.is_nan(), "window {w} pixel ({ox},{oy}) outside the raster has a value");
+                        continue;
+                    }
+                    let (cu, cv) = (u - 0.5, v - 0.5);
+                    let (x0, y0) = (cu.floor(), cv.floor());
+                    let (fx, fy) = (cu - x0, cv - y0);
+                    let t = |dx: isize, dy: isize| unique_value(clamp(x0 as isize + dx), clamp(y0 as isize + dy));
+                    let want = (1.0 - fx) * (1.0 - fy) * t(0, 0) + fx * (1.0 - fy) * t(1, 0) + (1.0 - fx) * fy * t(0, 1) + fx * fy * t(1, 1);
+                    worst = worst.max((f64::from(got) - want).abs());
+                }
+            }
+            assert!(worst < 0.2, "point_registered={point}, window {w}: worst bilinear error {worst}");
+        }
+    }
+}
