@@ -25,9 +25,7 @@ jobs:
           apt-get update -o Acquire::Retries=3
           apt-get install -y --no-install-recommends -o Acquire::Retries=3 build-essential libclang-dev pkg-config git
       - uses: actions/checkout@v7
-      # Pinned: newer stable clippy adds lints (e.g. chunks_exact_to_as_chunks) that the
-      # codebase hasn't been migrated to yet.
-      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -59,9 +57,7 @@ jobs:
       - name: Fetch test fixtures
         run: scripts/fetch-test-data.sh
       - name: Run tests
-        # Single-threaded: some tests assert on wall-clock latency against a local server and
-        # flake on the 2-core runner when run in parallel.
-        run: cargo test --workspace -- --nocapture --test-threads=1 2>&1 | tee out.txt
+        run: cargo test --workspace -- --nocapture 2>&1 | tee out.txt
         shell: bash
       - name: Assert no tests were skipped
         run: "! grep -i skipping out.txt"
