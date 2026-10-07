@@ -2,32 +2,70 @@ name: CI
 
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
-    branches: ['**']
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  clippy:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install GDAL build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgdal-dev libclang-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install GDAL and fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgdal-dev gdal-bin libclang-dev pkg-config \
+            curl unzip libtiff-tools python3 python3-numpy python3-gdal
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache test fixtures
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
+            tests/data/*.tif
+            data/grayscale/gray_3857-cog.tif
+            data/viridis/output_cog.tif
+          key: fixtures-${{ hashFiles('scripts/fetch-test-data.sh') }}
+      - name: Fetch test fixtures
+        run: scripts/fetch-test-data.sh
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace -- --nocapture 2>&1 | tee out.txt
+        shell: bash
+      - name: Assert no tests were skipped
+        run: "! grep -i skipping out.txt"
+
+  doc:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install GDAL build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgdal-dev libclang-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
