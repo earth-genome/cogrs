@@ -112,6 +112,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Rendered tiles were shifted by half a source pixel for `PixelIsArea` rasters (the common
+  case): the renderer read the tiepoint-based coordinate as if integer values were pixel
+  centres (that is the `PixelIsPoint` convention), so nearest took the pixel half a pixel to
+  the south-east of the output pixel's centre and bilinear/bicubic interpolated half a pixel
+  off. Source pixels are now sampled by the output pixel's centre (nearest = the source pixel
+  containing it, interpolation between pixel centres), as `gdalwarp` does; `PixelIsPoint`
+  rasters keep their half-pixel registration, including at overviews (whose geometry now
+  derives from the pixel corner like GDAL's). Output pixels whose centre lies outside the
+  raster (up to one source pixel past the right/bottom edge before) are now fill. Same-CRS and
+  geographic-to-mercator nearest output is bit-identical to `gdalwarp -r near` (previously
+  35.9% on a textured fixture); point queries were already consistent with this convention
+- Reprojection through per-pixel transforms (UTM and other projected sources) took each output
+  pixel's source row from the tile's left edge, so rows were skewed by the meridian
+  convergence (about 4.6 source pixels across a z14 tile at 1.7 degrees from the central
+  meridian, more at low zoom). Each pixel's source row now comes from its own transform;
+  nearest output for a Sentinel-2 UTM 18N source is bit-identical to `gdalwarp -r near` on
+  z14 and z8 tiles (14.8% and 0.6% before)
 - `cargo bench` now works: benchmarks ported to the `TileExtractor` API, the library
   target sets `bench = false` so criterion flags are not passed to libtest, and the
   benchmarks use a synthetic COG generated at startup (or a file given by the
