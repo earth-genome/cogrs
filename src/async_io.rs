@@ -94,8 +94,18 @@ pub trait AsyncRangeReader: Send + Sync {
     /// Total size of the object in bytes.
     fn size(&self) -> u64;
 
-    /// Human-readable identifier (URL or path); also the tile-cache key.
+    /// Human-readable identifier (URL or path).
     fn identifier(&self) -> &str;
+
+    /// Token that changes when the object's content changes: the ETag (or size and modification
+    /// time) of a remote object, size and modification time of a local file; `None` when the
+    /// source has no notion of version (in-memory data, mocks).
+    ///
+    /// Together with [`identifier`](Self::identifier) it keys decoded tiles, so a replaced
+    /// object can never be served from tiles decoded from its predecessor.
+    fn version(&self) -> Option<&str> {
+        None
+    }
 
     /// True for fast random access (local files, memory); false for network sources.
     fn is_local(&self) -> bool {
@@ -245,6 +255,10 @@ impl AsyncRangeReader for SyncToAsync {
         self.inner.identifier()
     }
 
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
+    }
+
     fn is_local(&self) -> bool {
         self.inner.is_local()
     }
@@ -337,6 +351,10 @@ impl RangeReader for AsyncToSync {
 
     fn identifier(&self) -> &str {
         self.inner.identifier()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
     }
 
     fn is_local(&self) -> bool {

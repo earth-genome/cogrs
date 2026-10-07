@@ -42,8 +42,8 @@ pub(crate) struct FetchedTiles {
     pub tiles_read: usize,
 }
 
-/// `(source identifier, overview level, tile index)`
-type InflightKey = (String, Option<usize>, usize);
+/// `(source identity, overview level, tile index)`; the identity includes the object's version
+type InflightKey = (Arc<str>, Option<usize>, usize);
 
 /// Publishing end of a tile being fetched; followers subscribe to it.
 type InflightSender = Arc<watch::Sender<Option<TileResult>>>;
@@ -73,8 +73,8 @@ enum Claim {
     Follower(watch::Receiver<Option<TileResult>>),
 }
 
-fn claim(identifier: &str, tile: TileRef) -> Claim {
-    let key = (identifier.to_string(), tile.overview, tile.index);
+fn claim(source: &Arc<str>, tile: TileRef) -> Claim {
+    let key = (Arc::clone(source), tile.overview, tile.index);
     let mut inflight = INFLIGHT.lock();
     if let Some(tx) = inflight.get(&key) {
         return Claim::Follower(tx.subscribe());
@@ -84,10 +84,11 @@ fn claim(identifier: &str, tile: TileRef) -> Claim {
     Claim::Leader(Leader { key, tx })
 }
 
-/// Number of tiles of `identifier` currently being fetched by some caller (tests).
+/// Number of tiles of the source with this identity currently being fetched by some caller
+/// (tests).
 #[cfg(test)]
-pub(crate) fn inflight_count(identifier: &str) -> usize {
-    INFLIGHT.lock().keys().filter(|(id, _, _)| id == identifier).count()
+pub(crate) fn inflight_count(cache_id: &str) -> usize {
+    INFLIGHT.lock().keys().filter(|(id, _, _)| &**id == cache_id).count()
 }
 
 fn tile_error(index: usize, overview: Option<usize>, cause: impl std::fmt::Display) -> BoxError {
@@ -122,7 +123,7 @@ pub(crate) async fn fetch_tiles(
                 out.tiles.insert(index, reader.sparse_tile(&span));
                 continue;
             }
-            match claim(reader.identifier(), tile) {
+            match claim(reader.cache_id(), tile) {
                 Claim::Leader(leader) => {
                     // Another caller may have published and unregistered it since the first check.
                     if let Some(data) = reader.cached_tile(tile) {

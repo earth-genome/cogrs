@@ -153,6 +153,8 @@ pub struct ObjectStoreRangeReader {
     identifier: String,
     prefix: Bytes,
     etag: Option<String>,
+    /// Identity of this version of the object: its ETag, else `"{size}:{last-modified}"`.
+    version: String,
     last_modified: Option<i64>,
     options: IoOptions,
 }
@@ -273,6 +275,7 @@ impl ObjectStoreRangeReader {
         })
         .await??;
 
+        let version = meta.e_tag.clone().unwrap_or_else(|| format!("{}:{}", meta.size, meta.last_modified.timestamp()));
         Ok(Self {
             store: Arc::clone(&entry.store),
             limiter: Arc::clone(&entry.limiter),
@@ -281,6 +284,7 @@ impl ObjectStoreRangeReader {
             identifier,
             prefix,
             etag: meta.e_tag,
+            version,
             last_modified: Some(meta.last_modified.timestamp()),
             options: options.clone(),
         })
@@ -337,6 +341,10 @@ impl AsyncRangeReader for ObjectStoreRangeReader {
 
     fn identifier(&self) -> &str {
         &self.identifier
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some(&self.version)
     }
 
     fn is_local(&self) -> bool {

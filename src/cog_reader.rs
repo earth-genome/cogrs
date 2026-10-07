@@ -414,6 +414,8 @@ pub struct CogReader {
     /// Minimum usable overview index - overviews beyond this have insufficient data
     /// None means all overviews are usable, Some(n) means only overviews 0..n are usable
     pub min_usable_overview: Option<usize>,
+    /// Identity decoded tiles are cached and de-duplicated under: identifier plus version.
+    cache_id: Arc<str>,
 }
 
 impl CogReader {
@@ -571,13 +573,20 @@ impl CogReader {
         min_usable_overview: Option<usize>,
     ) -> Self {
         let sync_io: Arc<dyn RangeReader> = Arc::new(AsyncToSync::new(Arc::clone(&reader)));
-        Self { async_io: reader, sync_io, metadata, overviews, min_usable_overview }
+        let cache_id = tile_cache::source_id(reader.identifier(), reader.version());
+        Self { async_io: reader, sync_io, metadata, overviews, min_usable_overview, cache_id }
     }
 
-    /// Source identifier (path or URL); also the tile-cache key.
+    /// Source identifier (path or URL).
     #[must_use]
     pub fn identifier(&self) -> &str {
         self.async_io.identifier()
+    }
+
+    /// Identity of the source's decoded tiles: the identifier plus its version (ETag, or size and
+    /// modification time), so replacing the object changes it.
+    pub(crate) fn cache_id(&self) -> &Arc<str> {
+        &self.cache_id
     }
 
     /// The asynchronous reader tile data is fetched through.
@@ -602,12 +611,14 @@ impl CogReader {
             OverviewQualityHint::NoneUsable | OverviewQualityHint::ComputeAtRuntime => None,
             OverviewQualityHint::MinUsable(n) => Some(n),
         };
+        let cache_id = tile_cache::source_id(async_io.identifier(), async_io.version());
         Self {
             async_io,
             sync_io,
             metadata: Arc::new(metadata),
             overviews: overviews.into(),
             min_usable_overview,
+            cache_id,
         }
     }
 
@@ -846,11 +857,11 @@ impl CogReader {
 
     /// Tile from the process-wide decompressed-tile cache.
     pub(crate) fn cached_tile(&self, tile: TileRef) -> Option<Arc<Vec<f32>>> {
-        tile_cache::get(self.identifier(), tile.index, tile.overview)
+        tile_cache::get_shared(&self.cache_id, tile.index, tile.overview)
     }
 
     pub(crate) fn cache_tile(&self, tile: TileRef, data: Arc<Vec<f32>>) {
-        tile_cache::insert(self.identifier(), tile.index, tile.overview, data);
+        tile_cache::insert_shared(&self.cache_id, tile.index, tile.overview, data);
     }
 
     /// Read, decode and cache one tile on the calling thread (blocking I/O).
@@ -3707,5 +3718,43 @@ mod async_open_tests {
         let b = a.clone();
         assert!(Arc::ptr_eq(&a.metadata, &b.metadata));
         assert!(Arc::ptr_eq(&a.overviews, &b.overviews));
+    }
+
+    /// Decoded tiles are keyed by the file's version: a file rewritten in place (same path) is
+    /// never served from tiles decoded from its previous contents.
+    #[test]
+    fn rewritten_local_file_gets_fresh_tiles() {
+        use crate::geotiff_writer::GeoTiffCompression;
+        use crate::xyz_tile::{BoundingBox, ReprojectedRaster};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewrite.tif");
+        let write = |base: f32| {
+            let raster = ReprojectedRaster {
+                pixels: (0..64 * 64).map(|i| base + (i % 200) as f32).collect(),
+                bands: 1,
+                width: 64,
+                height: 64,
+                crs: 3857,
+                bounds: BoundingBox::new(0.0, 0.0, 6400.0, 6400.0),
+                resolution: (100.0, 100.0),
+                nodata: None,
+            };
+            raster.write_geotiff_compressed(&path, GeoTiffCompression::Deflate).unwrap();
+        };
+        let source = path.to_str().unwrap();
+
+        write(1.0);
+        let first = CogReader::open_with_hint(source, OverviewQualityHint::NoneUsable).unwrap();
+        let before = first.read_tile(0).unwrap();
+
+        write(1001.0);
+        // Equal sizes and a coarse file system clock could hide the rewrite: force a new mtime.
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+        let second = CogReader::open_with_hint(source, OverviewQualityHint::NoneUsable).unwrap();
+        let after = second.read_tile(0).unwrap();
+
+        assert_ne!(first.cache_id(), second.cache_id());
+        assert!((after[0] - before[0] - 1000.0).abs() < 1e-3, "{} then {}", before[0], after[0]);
     }
 }

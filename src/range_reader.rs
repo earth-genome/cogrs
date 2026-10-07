@@ -46,6 +46,12 @@ pub trait RangeReader: Send + Sync {
     /// Get a human-readable identifier for this source (for logging/errors)
     fn identifier(&self) -> &str;
 
+    /// Token that changes when the content changes (see
+    /// [`AsyncRangeReader::version`](crate::AsyncRangeReader::version)); `None` if unknown.
+    fn version(&self) -> Option<&str> {
+        None
+    }
+
     /// Check if this is a local file (fast random access) or remote (expensive reads)
     fn is_local(&self) -> bool {
         let id = self.identifier();
@@ -63,6 +69,8 @@ pub trait RangeReader: Send + Sync {
 pub struct LocalRangeReader {
     path: PathBuf,
     size: u64,
+    /// `"{size}:{modification time in ns}"` as of opening
+    version: String,
 }
 
 impl LocalRangeReader {
@@ -71,9 +79,15 @@ impl LocalRangeReader {
     pub fn new(path: impl AsRef<Path>) -> AnyResult<Self> {
         let path = path.as_ref().to_path_buf();
         let metadata = std::fs::metadata(&path)?;
+        let modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
         Ok(Self {
             path,
             size: metadata.len(),
+            version: format!("{}:{modified_ns}", metadata.len()),
         })
     }
 }
@@ -167,6 +181,10 @@ impl RangeReader for LocalRangeReader {
     fn identifier(&self) -> &str {
         self.path.to_str().unwrap_or("<invalid path>")
     }
+
+    fn version(&self) -> Option<&str> {
+        Some(&self.version)
+    }
 }
 
 /// Blocking HTTP(S) range reader for remote COG files.
@@ -204,6 +222,10 @@ impl RangeReader for HttpRangeReader {
 
     fn identifier(&self) -> &str {
         self.inner.identifier()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
     }
 
     fn is_local(&self) -> bool {

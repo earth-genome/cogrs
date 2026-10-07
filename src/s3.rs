@@ -310,6 +310,10 @@ impl AsyncRangeReader for S3RangeReaderAsync {
         self.inner.identifier()
     }
 
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
+    }
+
     fn is_local(&self) -> bool {
         false
     }
@@ -360,6 +364,10 @@ impl RangeReader for S3RangeReaderSync {
 
     fn identifier(&self) -> &str {
         self.inner.identifier()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
     }
 
     fn is_local(&self) -> bool {
