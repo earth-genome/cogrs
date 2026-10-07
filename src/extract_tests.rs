@@ -599,3 +599,109 @@ async fn bilinear_interpolates_between_source_pixel_centres() {
         }
     }
 }
+
+// --- Interpolation taps that cross a source-tile boundary ---
+
+const SEAM_SIZE: usize = 128;
+const SEAM_TILE: usize = 64;
+
+/// Smooth gradient whose interpolated values differ from every nearest sample.
+fn seam_value(x: usize, y: usize) -> f64 {
+    (x * 7 + y * 11 + 1) as f64
+}
+
+fn seam_spec() -> CogSpec {
+    let mut spec = patch_spec(3857, (0.0, SEAM_SIZE as f64 * 10.0), 10.0, SEAM_SIZE, SEAM_TILE);
+    spec.pixel = |_, x, y| seam_value(x, y);
+    spec
+}
+
+/// Mitchell-Netravali (B = C = 1/3), written out independently of the library.
+fn mitchell(x: f64) -> f64 {
+    let x = x.abs();
+    let (b, c) = (1.0 / 3.0, 1.0 / 3.0);
+    if x < 1.0 {
+        ((12.0 - 9.0 * b - 6.0 * c) * x.powi(3) + (-18.0 + 12.0 * b + 6.0 * c) * x.powi(2) + (6.0 - 2.0 * b)) / 6.0
+    } else if x < 2.0 {
+        ((-b - 6.0 * c) * x.powi(3) + (6.0 * b + 30.0 * c) * x.powi(2) + (-12.0 * b - 48.0 * c) * x + (8.0 * b + 24.0 * c)) / 6.0
+    } else {
+        0.0
+    }
+}
+
+/// Interpolated value at pixel-centre coordinates `(cu, cv)`, read from the whole source array.
+fn seam_reference(method: ResamplingMethod, cu: f64, cv: f64) -> f64 {
+    let clamp = |i: isize| i.clamp(0, SEAM_SIZE as isize - 1) as usize;
+    let (x0, y0) = (cu.floor(), cv.floor());
+    let (fx, fy) = (cu - x0, cv - y0);
+    let at = |dx: isize, dy: isize| seam_value(clamp(x0 as isize + dx), clamp(y0 as isize + dy));
+    match method {
+        ResamplingMethod::Bilinear => {
+            (1.0 - fx) * (1.0 - fy) * at(0, 0) + fx * (1.0 - fy) * at(1, 0) + (1.0 - fx) * fy * at(0, 1) + fx * fy * at(1, 1)
+        }
+        ResamplingMethod::Bicubic => {
+            let (mut sum, mut weights) = (0.0, 0.0);
+            for dx in -1..=2isize {
+                for dy in -1..=2isize {
+                    let w = mitchell(dx as f64 - fx) * mitchell(dy as f64 - fy);
+                    sum += w * at(dx, dy);
+                    weights += w;
+                }
+            }
+            sum / weights
+        }
+        ResamplingMethod::Nearest => unreachable!(),
+    }
+}
+
+/// Output windows (in source pixels) lying wholly on one side of the source tile boundary at
+/// pixel 64: the pixels next to it have taps in the neighbouring tile that no output pixel's
+/// nearest source pixel falls in.
+fn seam_windows() -> [(f64, f64); 2] {
+    [(30.0, 63.9), (64.1, 98.0)]
+}
+
+fn seam_bounds((lo, hi): (f64, f64)) -> BoundingBox {
+    // Source pixel (px, py) has world x = 10 px and y = (SEAM_SIZE - py) * 10.
+    BoundingBox::new(lo * 10.0, (SEAM_SIZE as f64 - hi) * 10.0, hi * 10.0, (SEAM_SIZE as f64 - lo) * 10.0)
+}
+
+#[tokio::test(start_paused = true)]
+async fn interpolation_reads_source_tiles_across_a_tile_boundary() {
+    let spec = seam_spec();
+    // A fresh reader per extraction: tiles cached by an earlier one would hide what it reads.
+    let fresh = |w: usize, m: &str| memory_reader(&format!("mem://seams/interp/{w}/{m}"), &spec);
+    for (w, window) in seam_windows().into_iter().enumerate() {
+        let bounds = seam_bounds(window);
+        let size = 64;
+        let r = fresh(w, "nearest");
+        let nearest = TileExtractor::new(&r).bounds(bounds).size(size).extract().await.unwrap();
+        // Nearest: exactly the tiles holding each output pixel's nearest source pixel
+        let res = (window.1 - window.0) / size as f64;
+        let mut tiles = std::collections::BTreeSet::new();
+        for oy in 0..size {
+            for ox in 0..size {
+                let (px, py) = (window.0 + (ox as f64 + 0.5) * res, window.0 + (oy as f64 + 0.5) * res);
+                tiles.insert(((px.floor() as usize) / SEAM_TILE, (py.floor() as usize) / SEAM_TILE));
+            }
+        }
+        assert_eq!(nearest.tiles_read, tiles.len(), "window {w}: Nearest must not read extra tiles");
+
+        for method in [ResamplingMethod::Bilinear, ResamplingMethod::Bicubic] {
+            let r = fresh(w, &format!("{method:?}"));
+            let tile = TileExtractor::new(&r).bounds(bounds).size(size).resampling(method).extract().await.unwrap();
+            assert!(tile.tiles_read > nearest.tiles_read, "window {w} {method:?}: no tile read across the boundary ({} vs {})", tile.tiles_read, nearest.tiles_read);
+            let mut worst = 0.0f64;
+            for oy in 0..size {
+                for ox in 0..size {
+                    // pixel-centre coordinates: corner-based position minus half a pixel
+                    let cu = window.0 + (ox as f64 + 0.5) * res - 0.5;
+                    let cv = window.0 + (oy as f64 + 0.5) * res - 0.5;
+                    let want = seam_reference(method, cu, cv);
+                    worst = worst.max((f64::from(tile.pixels[oy * size + ox]) - want).abs());
+                }
+            }
+            assert!(worst < 1e-3, "window {w} {method:?}: worst deviation from the full-array reference {worst}");
+        }
+    }
+}

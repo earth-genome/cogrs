@@ -1733,6 +1733,24 @@ fn nearest_pixel(v: f64, size: usize) -> usize {
     v.round().max(0.0).min(size as f64 - 1.0) as usize
 }
 
+/// First and last source pixel (clamped to the level) that `resampling` reads along one axis
+/// for pixel-centre coordinate `v`: the nearest pixel, the bilinear pair `floor(v)..=floor(v)+1`
+/// or the bicubic quad `floor(v)-1..=floor(v)+2`. Must match the taps in `render_extraction`.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+fn tap_span(v: f64, size: usize, resampling: ResamplingMethod) -> (usize, usize) {
+    let (lo, hi) = match resampling {
+        ResamplingMethod::Nearest => {
+            let n = nearest_pixel(v, size);
+            return (n, n);
+        }
+        ResamplingMethod::Bilinear => (0, 1),
+        ResamplingMethod::Bicubic => (-1, 2),
+    };
+    let f = v.floor() as isize;
+    let clamp = |i: isize| i.max(0).min(size as isize - 1) as usize;
+    (clamp(f + lo), clamp(f + hi))
+}
+
 /// True when the source column of an output pixel needs one coordinate transform per pixel
 /// (anything but identity and the Web Mercator to WGS84 fast path).
 fn needs_per_pixel_x(output_crs: u32, source_epsg: u32) -> bool {
@@ -1818,30 +1836,51 @@ impl SourceMapping {
         }
     }
 
-    /// Tiles of the level containing the nearest source pixel of every output pixel that samples
-    /// inside the level, as indexes below `max_tile_count`, ascending.
-    fn needed_tiles(&self, tile_size: (usize, usize), p: &LevelParams, max_tile_count: usize) -> Vec<usize> {
+    /// Tiles of the level holding every source pixel `resampling` reads for an output pixel that
+    /// samples inside the level (the nearest pixel for `Nearest`, the interpolation taps
+    /// otherwise), as indexes below `max_tile_count`, ascending.
+    fn needed_tiles(
+        &self,
+        tile_size: (usize, usize),
+        p: &LevelParams,
+        max_tile_count: usize,
+        resampling: ResamplingMethod,
+    ) -> Vec<usize> {
         let width = tile_size.0;
-        let tile_of = |nx: usize, ny: usize| (ny / p.eff_tile_height) * p.eff_tiles_across + nx / p.eff_tile_width;
         let mut needed = vec![false; max_tile_count];
+        // Tile columns/rows spanned by the taps, as `(first, last)`. Clamped taps stay contiguous,
+        // so the tiles touched are exactly this rectangle.
+        let tile_span = |x: f64, y: f64| {
+            let (x0, x1) = tap_span(x, p.eff_width, resampling);
+            let (y0, y1) = tap_span(y, p.eff_height, resampling);
+            ((x0 / p.eff_tile_width, x1 / p.eff_tile_width), (y0 / p.eff_tile_height, y1 / p.eff_tile_height))
+        };
+        let mut mark = |(cols, rows): ((usize, usize), (usize, usize))| {
+            for ty in rows.0..=rows.1 {
+                for tx in cols.0..=cols.1 {
+                    let idx = ty * p.eff_tiles_across + tx;
+                    if idx < max_tile_count {
+                        needed[idx] = true;
+                    }
+                }
+            }
+        };
 
         match &self.x {
             // Rows and columns are independent: every valid row meets every valid column.
             SourceX::Linear { .. } => {
-                let cols: Vec<usize> = (0..width)
+                let cols: Vec<f64> = (0..width)
                     .map(|out_x| self.src_x(out_x, 0, width))
                     .filter(|x| within_level(*x, p.eff_width))
-                    .map(|x| nearest_pixel(x, p.eff_width))
                     .collect();
                 let mut last = None;
                 for y in self.rows.iter().flatten() {
-                    let ny = nearest_pixel(*y, p.eff_height);
-                    for &nx in &cols {
-                        let idx = tile_of(nx, ny);
-                        if last != Some(idx) && idx < max_tile_count {
-                            needed[idx] = true;
+                    for &x in &cols {
+                        let span = tile_span(x, *y);
+                        if last != Some(span) {
+                            mark(span);
                         }
-                        last = Some(idx);
+                        last = Some(span);
                     }
                 }
             }
@@ -1852,11 +1891,11 @@ impl SourceMapping {
                     if !within_level(*x, p.eff_width) || !within_level(*y, p.eff_height) {
                         continue;
                     }
-                    let idx = tile_of(nearest_pixel(*x, p.eff_width), nearest_pixel(*y, p.eff_height));
-                    if last != Some(idx) && idx < max_tile_count {
-                        needed[idx] = true;
+                    let span = tile_span(*x, *y);
+                    if last != Some(span) {
+                        mark(span);
                     }
-                    last = Some(idx);
+                    last = Some(span);
                 }
             }
         }
@@ -1956,7 +1995,7 @@ fn plan_extraction(
     } else {
         metadata.tile_offsets.len()
     };
-    let needed_tiles = mapping.needed_tiles(tile_size, &params, max_tile_count);
+    let needed_tiles = mapping.needed_tiles(tile_size, &params, max_tile_count, resampling);
 
     Ok(ExtractionPlan {
         extent,

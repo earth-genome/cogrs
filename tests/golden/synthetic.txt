@@ -152,8 +152,8 @@ u16_odd_size_overviews/ratio0	515x385 scale=2 x=2.000000000 y=2.000000000
 u16_odd_size_overviews/ratio1	258x193 scale=4 x=3.992248062 y=3.989637306
 u16_odd_size_overviews/ratio2	129x97 scale=8 x=7.984496124 y=7.938144330
 u16_odd_size_overviews/xyz/2/1/1/nearest	128x128x1 bytes=1859 tiles=2 ovr=Some(2) nodata=None n=16384 valid=3072 digest=4a108d8c11f94e33
-u16_odd_size_overviews/xyz/2/1/1/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=3072 digest=1c7e7b473948ead4
-u16_odd_size_overviews/xyz/2/1/1/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=3072 digest=2dda99710bc43176
+u16_odd_size_overviews/xyz/2/1/1/bilinear	128x128x1 bytes=217 tiles=1 ovr=Some(2) nodata=None n=16384 valid=3072 digest=b672838e49c23f08
+u16_odd_size_overviews/xyz/2/1/1/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=3072 digest=973744e42d393f3d
 u16_odd_size_overviews/xyz/3/2/3/nearest	128x128x1 bytes=22611 tiles=20 ovr=Some(1) nodata=None n=16384 valid=12288 digest=44a8dfaf7eb286ac
 u16_odd_size_overviews/xyz/3/2/3/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=12288 digest=57dba1eb05102078
 u16_odd_size_overviews/xyz/3/2/3/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=12288 digest=37e19f5cf9e284d3
@@ -162,7 +162,7 @@ u16_odd_size_overviews/xyz/4/4/6/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) 
 u16_odd_size_overviews/xyz/4/4/6/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=16384 digest=c664a94b116173c0
 u16_odd_size_overviews/xyz/4/5/7/nearest	128x128x1 bytes=15081 tiles=9 ovr=Some(0) nodata=None n=16384 valid=8064 digest=f7956c6075b83592
 u16_odd_size_overviews/xyz/4/5/7/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8064 digest=44312a6365c130ba
-u16_odd_size_overviews/xyz/4/5/7/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8064 digest=1829836f31dd5f7a
+u16_odd_size_overviews/xyz/4/5/7/bicubic	128x128x1 bytes=715 tiles=5 ovr=Some(0) nodata=None n=16384 valid=8064 digest=540b6b07c44b817b
 u16_odd_size_overviews/xyz/5/8/12/nearest	128x128x1 bytes=50462 tiles=25 ovr=None nodata=None n=16384 valid=16384 digest=a3f1faea04d942cf
 u16_odd_size_overviews/xyz/5/8/12/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=96c184971c7731ad
 u16_odd_size_overviews/xyz/5/8/12/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=4b92f61d364bde6d
