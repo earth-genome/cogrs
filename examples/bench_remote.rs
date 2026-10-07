@@ -11,6 +11,8 @@
 //! Scenarios:
 //! * `single`          open + one z14 tile (cold)
 //! * `z12`             open + one z12 tile
+//! * `scene`           open + one low-zoom tile covering the whole scene (`BENCH_TILE=z/x/y`,
+//!                     default 8/73/97); `transparent_pct` is the share of fill pixels
 //! * `concurrent`      one shared reader, 64 concurrent distinct z14 tiles
 //! * `concurrent_open` 64 concurrent requests that each open the COG and extract a z14 tile
 //!
@@ -190,14 +192,27 @@ async fn run(scenario: &str, kind: &str) {
     let start = Instant::now();
 
     match scenario {
-        "single" | "z12" => {
+        "single" | "z12" | "scene" => {
             let reader = counted::open(&url, counters.clone()).await;
             let opened = start.elapsed();
-            let tile_id = if scenario == "single" { (14, 4717, 6229) } else { (12, 1179, 1557) };
+            let tile_id = match scenario {
+                "single" => (14, 4717, 6229),
+                "z12" => (12, 1179, 1557),
+                _ => {
+                    let spec = std::env::var("BENCH_TILE").unwrap_or_else(|_| "8/73/97".to_string());
+                    let p: Vec<u32> = spec.split('/').map(|v| v.parse().expect("BENCH_TILE=z/x/y")).collect();
+                    (p[0], p[1], p[2])
+                }
+            };
             let t0 = Instant::now();
             let tile = extract(&reader, tile_id).await;
             let tile_time = t0.elapsed();
             let s = stats(&tile);
+            if let Ok(path) = std::env::var("BENCH_DUMP") {
+                // raw interleaved u8 samples (NaN -> 0), e.g. to compare with a gdalwarp reference
+                let raw: Vec<u8> = tile.pixels.iter().map(|v| if v.is_nan() { 0 } else { v.round().clamp(0.0, 255.0) as u8 }).collect();
+                std::fs::write(path, raw).expect("dump");
+            }
             println!(
                 "{{\"scenario\":\"{scenario}\",\"kind\":\"{kind}\",\"open_ms\":{:.1},\"tile_ms\":{:.1},\"total_ms\":{:.1},\
                  \"requests\":{},\"tiles_read\":{},\"tile_bytes\":{},\"overview\":{:?},\
