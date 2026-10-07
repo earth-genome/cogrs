@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
@@ -38,6 +39,25 @@ use crate::tiff_utils::AnyResult;
 /// Sized to cover the header, the IFD chain and the out-of-line tag values of a typical COG,
 /// which are all placed at the start of the file.
 pub(crate) const PREFIX_BYTES: u64 = 16 * 1024;
+
+static IO_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static IO_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Network traffic of [`ObjectStoreRangeReader`]s since the process started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IoStats {
+    /// Range requests sent (opens included; reads served from memory and retries of one request
+    /// by the HTTP client are not counted)
+    pub requests: u64,
+    /// Bytes received in those requests' bodies
+    pub bytes: u64,
+}
+
+/// Process-wide request and byte counters of the remote readers (atomics), for server metrics.
+#[must_use]
+pub fn io_stats() -> IoStats {
+    IoStats { requests: IO_REQUESTS.load(Ordering::Relaxed), bytes: IO_BYTES.load(Ordering::Relaxed) }
+}
 
 /// A shared `object_store` client plus the in-flight request limiter for it.
 struct StoreEntry {
@@ -453,6 +473,7 @@ impl ObjectStoreRangeReader {
         let request_path = target.path.clone();
         let (meta, prefix) = spawn_io(async move {
             let _permit = permit;
+            IO_REQUESTS.fetch_add(1, Ordering::Relaxed);
             let result = store
                 .get_opts(
                     &request_path,
@@ -461,6 +482,7 @@ impl ObjectStoreRangeReader {
                 .await?;
             let meta = result.meta.clone();
             let prefix = result.bytes().await?;
+            IO_BYTES.fetch_add(prefix.len() as u64, Ordering::Relaxed);
             Ok::<_, object_store::Error>((meta, prefix))
         })
         .await??;
@@ -545,7 +567,10 @@ impl AsyncRangeReader for ObjectStoreRangeReader {
             self.precondition.apply(&mut get);
             let bytes = spawn_io(async move {
                 let _permit = permit;
-                store.get_opts(&path, get).await?.bytes().await
+                IO_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                let bytes = store.get_opts(&path, get).await?.bytes().await?;
+                IO_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                Ok::<_, object_store::Error>(bytes)
             })
             .await?
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -951,5 +976,19 @@ mod validation_tests {
     #[ignore = "needs network access"]
     async fn real_https_store_answers_412_to_a_wrong_etag() {
         check_real_object_honours_if_match(ObjectStoreRangeReader::open(HTTPS_URL).await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn io_stats_count_network_requests_and_their_bytes() {
+        let server = server(ServedObject::new(data(100_000, 7)));
+        let before = io_stats();
+        let reader = open(&server, Validation::IfMatch).await;
+        reader.read_range(0, 100).await.unwrap(); // inside the prefix: memory, not a request
+        reader.read_range(50_000, 100).await.unwrap();
+        let after = io_stats();
+        assert_eq!(server.requests().len(), 2);
+        // Other tests may be sending requests too: at least these two, with at least these bytes
+        assert!(after.requests >= before.requests + 2, "{before:?} -> {after:?}");
+        assert!(after.bytes >= before.bytes + PREFIX_BYTES + 100, "{before:?} -> {after:?}");
     }
 }

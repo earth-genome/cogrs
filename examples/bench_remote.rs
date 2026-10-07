@@ -15,6 +15,11 @@
 //!   default 8/73/97); `transparent_pct` is the share of fill pixels
 //! * `concurrent`      one shared reader, 64 concurrent distinct z14 tiles
 //! * `concurrent_open` 64 concurrent requests that each open the COG and extract a z14 tile
+//! * `cache`           the same 64 open-per-request tiles through the header cache, in the mode
+//!   `BENCH_CACHE` selects (new code only): `off` (`CogCache::disabled`), `cold` (empty caches,
+//!   default), `warm_headers` (header cached, decoded tiles dropped: isolates what the open cost)
+//!   or `warm_all` (a first identical batch ran before the timed one). Requests are counted at
+//!   the object-store layer (`cogrs::io_stats`); `rss_mb` is the process's resident set size.
 //!
 //! `BENCH_HINT=all` opens with `OverviewQualityHint::AllUsable` (no overview sampling at
 //! open); `BENCH_TRACE=1` prints each network request (new code only). The same file builds
@@ -282,8 +287,117 @@ async fn run(scenario: &str, kind: &str) {
                 counters.requests.load(Ordering::Relaxed),
             );
         }
+        #[cfg(not(baseline))]
+        "cache" => run_cache(&url, kind).await,
         other => panic!("unknown scenario {other}"),
     }
+}
+
+/// Resident set size and its peak (`VmRSS`, `VmHWM`) in MB, from `/proc/self/status`.
+#[cfg(not(baseline))]
+fn rss_mb() -> (f64, f64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<f64>().ok())
+            .map_or(0.0, |kb| kb / 1024.0)
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+/// 64 concurrent z14 requests, each opening the COG through `cache` and extracting its tile.
+#[cfg(not(baseline))]
+async fn cached_batch(url: &str, cache: &cogrs::CogCache) -> (Duration, Vec<f64>, usize, usize) {
+    let t0 = Instant::now();
+    let handles: Vec<_> = z14_neighbourhood()
+        .into_iter()
+        .map(|id| {
+            let (url, cache) = (url.to_string(), cache.clone());
+            tokio::spawn(async move {
+                let began = Instant::now();
+                let reader = CogReader::builder(&url).hint(hint()).cache(&cache).open_async().await.expect("open");
+                let tile = extract(&reader, id).await;
+                (began.elapsed(), tile)
+            })
+        })
+        .collect();
+    let mut latencies = Vec::new();
+    let (mut bytes, mut tiles_read) = (0usize, 0usize);
+    for h in handles {
+        let (d, tile) = h.await.expect("task");
+        latencies.push(ms(d));
+        bytes += tile.bytes_fetched;
+        tiles_read += tile.tiles_read;
+    }
+    latencies.sort_by(f64::total_cmp);
+    (t0.elapsed(), latencies, bytes, tiles_read)
+}
+
+/// Open 48 connections to the object's host with small concurrent reads (`BENCH_POOL=cold`
+/// skips this): a long-lived server has its HTTP connections pooled, a fresh benchmark process
+/// does not, and a new connection costs a TLS handshake that would otherwise be charged to
+/// whichever mode happens to open the most of them.
+#[cfg(not(baseline))]
+async fn warm_connection_pool(url: &str) {
+    use cogrs::{AsyncRangeReader, ObjectStoreRangeReader};
+    if std::env::var("BENCH_POOL").as_deref() == Ok("cold") {
+        return;
+    }
+    let reader = Arc::new(ObjectStoreRangeReader::open(url).await.expect("pool warm-up open"));
+    let reads: Vec<_> = (0..48u64)
+        .map(|i| {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.read_range(100_000_000 + i * 1_000_000, 4096).await.expect("pool warm-up read") })
+        })
+        .collect();
+    for read in reads {
+        read.await.expect("task");
+    }
+}
+
+#[cfg(not(baseline))]
+async fn run_cache(url: &str, kind: &str) {
+    use cogrs::{CacheConfig, CogCache};
+    let mode = std::env::var("BENCH_CACHE").unwrap_or_else(|_| "cold".to_string());
+    warm_connection_pool(url).await;
+    let cache = if mode == "off" { CogCache::disabled() } else { CogCache::new(CacheConfig::default()) };
+    match mode.as_str() {
+        "off" | "cold" => {}
+        "warm_headers" => {
+            CogReader::builder(url).hint(hint()).cache(&cache).open_async().await.expect("prime");
+            cogrs::tile_cache::clear();
+        }
+        "warm_all" => {
+            cached_batch(url, &cache).await;
+        }
+        other => panic!("BENCH_CACHE={other}: expected off, cold, warm_headers or warm_all"),
+    }
+    let (rss_before, _) = rss_mb();
+    let io_before = cogrs::io_stats();
+    let (wall, latencies, bytes, tiles_read) = cached_batch(url, &cache).await;
+    let io = cogrs::io_stats();
+    let stats = cache.stats();
+    let (rss_after, rss_peak) = rss_mb();
+    println!(
+        "{{\"scenario\":\"cache\",\"mode\":\"{mode}\",\"hint\":\"{}\",\"kind\":\"{kind}\",\"wall_ms\":{:.1},\"rps\":{:.1},\
+         \"p50_ms\":{:.1},\"p95_ms\":{:.1},\"max_ms\":{:.1},\"requests\":{},\"net_bytes\":{},\"tiles_read\":{tiles_read},\
+         \"tile_bytes\":{bytes},\"header_hits\":{},\"header_misses\":{},\"coalesced_opens\":{},\"header_entries\":{},\
+         \"rss_mb_before\":{rss_before:.1},\"rss_mb\":{rss_after:.1},\"rss_peak_mb\":{rss_peak:.1}}}",
+        if matches!(hint(), OverviewQualityHint::AllUsable) { "all" } else { "compute" },
+        ms(wall),
+        latencies.len() as f64 / wall.as_secs_f64(),
+        percentile(&latencies, 0.5),
+        percentile(&latencies, 0.95),
+        latencies.last().copied().unwrap_or(0.0),
+        io.requests - io_before.requests,
+        io.bytes - io_before.bytes,
+        stats.headers.hits,
+        stats.headers.misses,
+        stats.headers.coalesced_opens,
+        stats.headers.entries,
+    );
 }
 
 fn main() {

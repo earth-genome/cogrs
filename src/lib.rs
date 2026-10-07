@@ -152,7 +152,10 @@ pub use async_io::{
     fetch_ranges,
     is_source_changed,
 };
-pub use remote::{ObjectStoreRangeReader, SourceNotFound, Validation, create_async_range_reader, create_async_range_reader_with};
+pub use remote::{
+    IoStats, ObjectStoreRangeReader, SourceNotFound, Validation, create_async_range_reader, create_async_range_reader_with,
+    io_stats,
+};
 
 // ============================================================================
 // S3 Support
