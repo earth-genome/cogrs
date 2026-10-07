@@ -36,6 +36,11 @@ pub mod tile_cache;
 pub mod xyz_tile;
 pub mod webp;
 
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod golden_tests;
+
 // ============================================================================
 // Core COG Types
 // ============================================================================
