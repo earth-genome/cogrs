@@ -250,15 +250,46 @@ impl AsyncRangeReader for SyncToAsync {
     }
 }
 
-/// Runtime that drives async readers on behalf of synchronous callers.
+/// The crate's private I/O runtime.
+///
+/// All network requests run here (via [`spawn_io`]) and so do the futures of synchronous callers
+/// (via [`block_on_io`]). HTTP connections are driven by tasks of the runtime that opened them, so
+/// keeping every request on one runtime that lives for the whole process lets one HTTP client
+/// per bucket or host be shared by callers on any number of runtimes, including short-lived ones.
 static IO_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    // Network work is light (TLS, framing); a few threads saturate any link.
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(workers)
         .thread_name("cogrs-io")
         .enable_all()
         .build()
         .expect("failed to start the cogrs I/O runtime")
 });
+
+/// Aborts the task when dropped, so cancelling the caller cancels the request.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+/// Run `fut` on the private I/O runtime and await its result from any runtime.
+///
+/// Dropping the returned future aborts the spawned task.
+pub(crate) async fn spawn_io<T: Send + 'static>(fut: impl Future<Output = T> + Send + 'static) -> AnyResult<T> {
+    AbortOnDrop(IO_RUNTIME.spawn(fut)).await.map_err(|e| format!("I/O task failed: {e}").into())
+}
 
 /// Run `fut` to completion on the private I/O runtime, blocking the calling thread.
 ///
@@ -439,7 +470,8 @@ mod io_tests {
             }
         }
         let r = Clamping(MemoryRangeReader::new(data(100), "mem://short".into()));
-        let err = fetch_ranges(&r, &[90..120], &IoOptions::default()).await.unwrap_err();
+        let range = 90..120;
+        let err = fetch_ranges(&r, std::slice::from_ref(&range), &IoOptions::default()).await.unwrap_err();
         assert!(err.to_string().contains("short read"), "{err}");
     }
 

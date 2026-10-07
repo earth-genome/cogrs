@@ -9,7 +9,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use tracing::{debug, warn};
 
-use crate::async_io::IoOptions;
+use crate::async_io::{spawn_io, IoOptions};
 use crate::cog_reader::{CogReader, OverviewQualityHint};
 use crate::remote::{s3_object_store, ObjectStoreRangeReader};
 use crate::s3::S3Config;
@@ -179,9 +179,12 @@ impl S3CogSource {
         };
         let store = s3_object_store(&config, &options.io).await?;
 
-        // List objects in the bucket
+        // List objects in the bucket (on the I/O runtime like every other request on this client)
         let prefix = options.prefix.as_deref().map(ObjectPath::from);
-        let mut items: Vec<_> = store.list(prefix.as_ref()).try_collect().await?;
+        let mut items: Vec<_> = spawn_io(async move {
+            store.list(prefix.as_ref()).try_collect::<Vec<_>>().await
+        })
+        .await??;
 
         // Sort by key for deterministic ordering
         items.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));

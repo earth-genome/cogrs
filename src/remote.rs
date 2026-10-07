@@ -9,10 +9,14 @@
 //! a COG keeps its header and IFDs) and, through `Content-Range`, the total size, ETag and
 //! modification time. That also works with presigned URLs, which are only valid for `GET`.
 //! The prefix stays attached to the reader and serves any later read that lies inside it.
+//!
+//! Every request is spawned on the crate's private I/O runtime and awaited from the caller's
+//! runtime. The shared client's pooled connections are therefore driven by tasks that outlive
+//! any caller runtime (so runtimes can come and go, e.g. one per test), and dropping a read
+//! future aborts the request.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
@@ -24,7 +28,7 @@ use object_store::{ClientOptions, GetOptions, GetRange, ObjectStore, RetryConfig
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
-use crate::async_io::{AsyncRangeReader, IoOptions, SyncToAsync};
+use crate::async_io::{spawn_io, AsyncRangeReader, IoOptions, SyncToAsync};
 use crate::range_reader::LocalRangeReader;
 use crate::s3::{resolve_region, S3Config};
 use crate::tiff_utils::AnyResult;
@@ -65,6 +69,11 @@ fn fingerprint(value: &str) -> u64 {
 }
 
 /// Look up `key` in the registry or build and register a store with `build`.
+///
+/// Every request a store makes is spawned on the crate's private I/O runtime
+/// ([`spawn_io`](crate::async_io::spawn_io)), so the store's pooled connections are driven by
+/// tasks that outlive any caller runtime. That is what makes one client per bucket or host safe
+/// to share process-wide even when callers run on several, possibly short-lived, runtimes.
 fn shared_store(
     key: &str,
     options: &IoOptions,
@@ -82,11 +91,10 @@ fn shared_store(
     Ok(entry)
 }
 
-/// Number of distinct stores (connection pools) currently registered. For tests/diagnostics.
-#[doc(hidden)]
-#[must_use]
-pub fn registered_store_count() -> usize {
-    STORES.lock().len()
+/// Number of registered stores whose key starts with `prefix` (tests).
+#[cfg(test)]
+fn registered_stores_with_prefix(prefix: &str) -> usize {
+    STORES.lock().keys().filter(|k| k.starts_with(prefix)).count()
 }
 
 /// The shared store (client + request limiter) for the bucket named by `config`, created on first
@@ -248,17 +256,22 @@ impl ObjectStoreRangeReader {
         identifier: String,
         options: &IoOptions,
     ) -> AnyResult<Self> {
-        let permit = entry.limiter.acquire().await?;
-        let result = entry
-            .store
-            .get_opts(
-                &path,
-                GetOptions { range: Some(GetRange::Bounded(0..PREFIX_BYTES)), ..GetOptions::default() },
-            )
-            .await?;
-        let meta = result.meta.clone();
-        let prefix = result.bytes().await?;
-        drop(permit);
+        let permit = Arc::clone(&entry.limiter).acquire_owned().await?;
+        let store = Arc::clone(&entry.store);
+        let request_path = path.clone();
+        let (meta, prefix) = spawn_io(async move {
+            let _permit = permit;
+            let result = store
+                .get_opts(
+                    &request_path,
+                    GetOptions { range: Some(GetRange::Bounded(0..PREFIX_BYTES)), ..GetOptions::default() },
+                )
+                .await?;
+            let meta = result.meta.clone();
+            let prefix = result.bytes().await?;
+            Ok::<_, object_store::Error>((meta, prefix))
+        })
+        .await??;
 
         Ok(Self {
             store: Arc::clone(&entry.store),
@@ -305,13 +318,15 @@ impl AsyncRangeReader for ObjectStoreRangeReader {
                 // Both bounds are within the prefix, which fits in memory.
                 return Ok(self.prefix.slice(offset as usize..end as usize));
             }
-            let _permit = self.limiter.acquire().await?;
-            let range: Range<u64> = offset..end;
-            let bytes = self
-                .store
-                .get_range(&self.path, range)
-                .await
-                .map_err(|e| format!("Reading {offset}+{len} of {}: {e}", self.identifier))?;
+            let permit = Arc::clone(&self.limiter).acquire_owned().await?;
+            let store = Arc::clone(&self.store);
+            let path = self.path.clone();
+            let bytes = spawn_io(async move {
+                let _permit = permit;
+                store.get_range(&path, offset..end).await
+            })
+            .await?
+            .map_err(|e| format!("Reading {offset}+{len} of {}: {e}", self.identifier))?;
             Ok(bytes)
         })
     }
@@ -384,17 +399,19 @@ mod tests {
         let far = plain.read_range(200_000_000, 4096).await.unwrap();
         assert_eq!(far.len(), 4096);
 
-        let stores_before = registered_store_count();
+        let host_prefix = "http|https://ei-imagery-sentinel2-prd.s3.us-west-2.amazonaws.com";
+        let stores_before = registered_stores_with_prefix(host_prefix);
+        assert_eq!(stores_before, 1, "the plain HTTPS open registered one store for the host");
         let with_query = ObjectStoreRangeReader::open(&format!("{HTTPS_URL}?x=1")).await.unwrap();
         assert_eq!(with_query.size(), plain.size());
         assert_eq!(with_query.identifier(), HTTPS_URL, "query is not part of the identifier");
         assert_eq!(with_query.read_range(200_000_000, 4096).await.unwrap(), far);
-        assert_eq!(registered_store_count(), stores_before, "query-string URLs get a private client");
+        assert_eq!(registered_stores_with_prefix(host_prefix), stores_before, "query-string URLs get a private client");
 
         // A second open of the same host reuses the registered store.
         let again = ObjectStoreRangeReader::open(HTTPS_URL).await.unwrap();
         assert_eq!(again.read_range(200_000_000, 4096).await.unwrap(), far);
-        assert_eq!(registered_store_count(), stores_before);
+        assert_eq!(registered_stores_with_prefix(host_prefix), stores_before);
 
         // Merged multi-range fetch over HTTPS.
         let ranges = [200_000_000..200_000_100, 200_000_100..200_000_300, 250_000_000..250_000_064];
@@ -482,5 +499,58 @@ mod local_server_tests {
         assert!(r.read_range(990, 20).await.is_err());
         assert_eq!(r.read_range(990, 10).await.unwrap().len(), 10);
         assert_eq!(r.read_range(5, 0).await.unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod runtime_independence_tests {
+    use super::*;
+    use crate::test_support::serve_bytes;
+    use std::time::Duration;
+
+    fn new_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// One client is shared by callers on any number of runtimes. Requests are driven by the
+    /// crate's own I/O runtime, so a caller's runtime shutting down must not break requests that
+    /// other runtimes have in flight on the same pooled connections.
+    #[test]
+    fn a_shared_client_survives_caller_runtimes_shutting_down() {
+        let (base, _log) = serve_bytes(vec![3u8; 200_000], Duration::from_millis(2));
+        let url = format!("{base}/stress.bin");
+
+        let steady_url = url.clone();
+        let steady = std::thread::spawn(move || {
+            new_runtime().block_on(async {
+                let reader = ObjectStoreRangeReader::open(&steady_url).await.unwrap();
+                for i in 0..300u64 {
+                    let bytes = reader.read_range(20_000 + i * 10, 100).await.unwrap();
+                    assert_eq!(bytes.len(), 100);
+                }
+            });
+        });
+
+        for _ in 0..30 {
+            let rt = new_runtime();
+            rt.block_on(async {
+                let reader = ObjectStoreRangeReader::open(&url).await.unwrap();
+                assert_eq!(reader.read_range(50_000, 1000).await.unwrap().len(), 1000);
+            });
+            drop(rt);
+        }
+        steady.join().unwrap();
+    }
+
+    /// Dropping a request future cancels the request (the task on the I/O runtime is aborted).
+    #[test]
+    fn cancelling_a_read_is_safe_and_leaves_the_reader_usable() {
+        let (base, _log) = serve_bytes(vec![5u8; 200_000], Duration::from_millis(50));
+        new_runtime().block_on(async {
+            let reader = ObjectStoreRangeReader::open(&format!("{base}/cancel.bin")).await.unwrap();
+            let slow = tokio::time::timeout(Duration::from_millis(5), reader.read_range(100_000, 1000)).await;
+            assert!(slow.is_err(), "expected the read to be cancelled");
+            assert_eq!(reader.read_range(100_000, 1000).await.unwrap().len(), 1000);
+        });
     }
 }

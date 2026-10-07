@@ -447,7 +447,10 @@ pub(crate) fn serve_bytes(data: Vec<u8>, delay: Duration) -> (String, std::sync:
                         body.len(),
                         data.len()
                     );
-                    if stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body)).is_err() {
+                    // One write: separate header and body writes stall ~40 ms on Nagle/delayed ACK.
+                    let mut response = head.into_bytes();
+                    response.extend_from_slice(body);
+                    if stream.write_all(&response).is_err() {
                         return;
                     }
                 }
