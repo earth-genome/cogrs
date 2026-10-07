@@ -30,7 +30,6 @@
 //! }
 //! ```
 
-use std::collections::HashSet;
 use std::f64::consts::PI;
 use proj4rs::proj::Proj;
 use proj4rs::transform::transform;
@@ -1604,17 +1603,18 @@ fn compute_output_resolution(
 /// Which source tiles an output tile needs, and how to render it from them.
 ///
 /// Plain data (no coordinate transformer), so it can be held across `.await` points and moved
-/// into a blocking task; the transformer is rebuilt for rendering.
+/// into a blocking task. The per-pixel source coordinates computed while planning are kept
+/// and reused by the render step.
 struct ExtractionPlan {
     extent: BoundingBox,
-    output_crs: u32,
-    source_epsg: u32,
     tile_size: (usize, usize),
     resampling: ResamplingMethod,
     selected_bands: Option<Vec<usize>>,
     overview_idx: Option<usize>,
     /// Source tile indexes within the level selected by `overview_idx`, ascending.
     needed_tiles: Vec<usize>,
+    /// Where each output pixel samples the source level.
+    mapping: SourceMapping,
 }
 
 /// Geometry of the COG level (full resolution or one overview) used for an extraction.
@@ -1680,6 +1680,159 @@ fn level_params(
     })
 }
 
+/// Source column of every output pixel.
+enum SourceX {
+    /// Linear in the output column (source CRS equals the output CRS, or Web Mercator to WGS84):
+    /// `base + out_x * delta`.
+    Linear { base: f64, delta: f64 },
+    /// One transformed value per output pixel (row-major); `NaN` where the transform failed or
+    /// the row is outside the level.
+    PerPixel(Vec<f64>),
+}
+
+/// Where every output row and column samples the source level, in source pixels of that level.
+///
+/// This is computed once, at planning time. It decides which source tiles are fetched and is then
+/// what rendering samples through, so the two cannot disagree: every output pixel whose source
+/// location lies inside the level has the tile of its nearest source pixel fetched.
+struct SourceMapping {
+    /// Source pixel row per output row; `None` if that row lies outside the level.
+    rows: Vec<Option<f64>>,
+    x: SourceX,
+}
+
+/// Sample positions up to half a pixel outside the level still map onto its edge pixels.
+#[allow(clippy::cast_precision_loss)]
+fn within_level(v: f64, size: usize) -> bool {
+    !v.is_nan() && !(v < -0.5 || v > size as f64 + 0.5)
+}
+
+/// Nearest source pixel, clamped to the level.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn nearest_pixel(v: f64, size: usize) -> usize {
+    v.round().max(0.0).min(size as f64 - 1.0) as usize
+}
+
+/// True when the source column of an output pixel needs one coordinate transform per pixel
+/// (anything but identity and the Web Mercator to WGS84 fast path).
+fn needs_per_pixel_x(output_crs: u32, source_epsg: u32) -> bool {
+    output_crs != source_epsg && !(output_crs == EPSG_WEB_MERCATOR && source_epsg == EPSG_WGS84)
+}
+
+impl SourceMapping {
+    fn new(strategy: &TransformStrategy, extent: &BoundingBox, tile_size: (usize, usize), p: &LevelParams) -> Self {
+        let (width, height) = tile_size;
+        // Pre-compute inverse scale for speed
+        let inv_scale_x = 1.0 / p.scale[0];
+        let inv_scale_y = 1.0 / p.scale[1];
+        let tiepoint = &p.tiepoint;
+
+        // Source rows for all output rows, from the transform of the tile's left edge.
+        let rows: Vec<Option<f64>> = (0..height)
+            .map(|out_y| {
+                #[allow(clippy::cast_precision_loss)]
+                let merc_y = extent.maxy - (out_y as f64 + 0.5) * p.out_res_y;
+                let (_, world_y) = strategy.transform(extent.minx, merc_y).ok()?;
+                let src_pixel_y = tiepoint[1] + (tiepoint[4] - world_y) * inv_scale_y;
+                within_level(src_pixel_y, p.eff_height).then_some(src_pixel_y)
+            })
+            .collect();
+
+        let x = match strategy {
+            // For 4326: lon = merc_x * 180 / HALF_EARTH, then convert to pixels
+            TransformStrategy::FastMerc2Geo => {
+                let lon_base = (extent.minx + 0.5 * p.out_res_x) * 180.0 / HALF_EARTH;
+                SourceX::Linear {
+                    base: tiepoint[0] + (lon_base - tiepoint[3]) * inv_scale_x,
+                    delta: p.out_res_x * 180.0 / HALF_EARTH * inv_scale_x,
+                }
+            }
+            // For 3857: direct merc_x to pixel
+            TransformStrategy::Identity => SourceX::Linear {
+                base: tiepoint[0] + (extent.minx + 0.5 * p.out_res_x - tiepoint[3]) * inv_scale_x,
+                delta: p.out_res_x * inv_scale_x,
+            },
+            // Other CRS combinations: one transform per pixel (rows outside the level skipped)
+            TransformStrategy::Proj4rs(_) => {
+                let mut xs = vec![f64::NAN; width * height];
+                for (out_y, row) in rows.iter().enumerate() {
+                    if row.is_none() {
+                        continue;
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    let merc_y = extent.maxy - (out_y as f64 + 0.5) * p.out_res_y;
+                    for out_x in 0..width {
+                        #[allow(clippy::cast_precision_loss)]
+                        let merc_x = extent.minx + (out_x as f64 + 0.5) * p.out_res_x;
+                        if let Ok((world_x, _)) = strategy.transform(merc_x, merc_y) {
+                            xs[out_y * width + out_x] = tiepoint[0] + (world_x - tiepoint[3]) * inv_scale_x;
+                        }
+                    }
+                }
+                SourceX::PerPixel(xs)
+            }
+        };
+        Self { rows, x }
+    }
+
+    /// Source column of output pixel `(out_x, out_y)`; `NaN` if it has none.
+    #[allow(clippy::cast_precision_loss)]
+    fn src_x(&self, out_x: usize, out_y: usize, width: usize) -> f64 {
+        match &self.x {
+            SourceX::Linear { base, delta } => base + (out_x as f64) * delta,
+            SourceX::PerPixel(xs) => xs[out_y * width + out_x],
+        }
+    }
+
+    /// Tiles of the level containing the nearest source pixel of every output pixel that samples
+    /// inside the level, as indexes below `max_tile_count`, ascending.
+    fn needed_tiles(&self, tile_size: (usize, usize), p: &LevelParams, max_tile_count: usize) -> Vec<usize> {
+        let width = tile_size.0;
+        let tile_of = |nx: usize, ny: usize| (ny / p.eff_tile_height) * p.eff_tiles_across + nx / p.eff_tile_width;
+        let mut needed = vec![false; max_tile_count];
+
+        match &self.x {
+            // Rows and columns are independent: every valid row meets every valid column.
+            SourceX::Linear { .. } => {
+                let cols: Vec<usize> = (0..width)
+                    .map(|out_x| self.src_x(out_x, 0, width))
+                    .filter(|x| within_level(*x, p.eff_width))
+                    .map(|x| nearest_pixel(x, p.eff_width))
+                    .collect();
+                let mut last = None;
+                for y in self.rows.iter().flatten() {
+                    let ny = nearest_pixel(*y, p.eff_height);
+                    for &nx in &cols {
+                        let idx = tile_of(nx, ny);
+                        if last != Some(idx) && idx < max_tile_count {
+                            needed[idx] = true;
+                        }
+                        last = Some(idx);
+                    }
+                }
+            }
+            SourceX::PerPixel(xs) => {
+                let mut last = None;
+                for (out_y, row) in self.rows.iter().enumerate() {
+                    let Some(y) = row else { continue };
+                    let ny = nearest_pixel(*y, p.eff_height);
+                    for x in &xs[out_y * width..(out_y + 1) * width] {
+                        if !within_level(*x, p.eff_width) {
+                            continue;
+                        }
+                        let idx = tile_of(nearest_pixel(*x, p.eff_width), ny);
+                        if last != Some(idx) && idx < max_tile_count {
+                            needed[idx] = true;
+                        }
+                        last = Some(idx);
+                    }
+                }
+            }
+        }
+        needed.iter().enumerate().filter_map(|(idx, &n)| n.then_some(idx)).collect()
+    }
+}
+
 /// Extract a tile in `output_crs` (optionally only `bands`) from a COG in any source CRS.
 ///
 /// Network I/O is awaited (concurrently, coalesced, de-duplicated across callers); decoding and
@@ -1692,7 +1845,16 @@ pub(crate) async fn extract_tile_async(
     resampling: ResamplingMethod,
     bands: Option<Vec<usize>>,
 ) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
-    let plan = plan_extraction(reader, extent, output_crs, tile_size, resampling, bands)?;
+    let source_epsg = reader.metadata.crs_code.and_then(|c| u32::try_from(c).ok()).unwrap_or(EPSG_WEB_MERCATOR);
+    let plan = if needs_per_pixel_x(output_crs, source_epsg) {
+        // One coordinate transform per output pixel: keep that off the async workers.
+        let reader = reader.clone();
+        tokio::task::spawn_blocking(move || plan_extraction(&reader, extent, output_crs, tile_size, resampling, bands))
+            .await
+            .map_err(|e| format!("Task join error: {e}"))??
+    } else {
+        plan_extraction(reader, extent, output_crs, tile_size, resampling, bands)?
+    };
     let fetched = if plan.needed_tiles.is_empty() {
         crate::tile_fetch::FetchedTiles::default()
     } else {
@@ -1713,7 +1875,6 @@ fn plan_extraction(
     resampling: ResamplingMethod,
     bands: Option<Vec<usize>>,
 ) -> Result<ExtractionPlan, Box<dyn std::error::Error + Send + Sync>> {
-    let (tile_size_x, tile_size_y) = tile_size;
     let metadata = &reader.metadata;
     let geo_transform = &metadata.geo_transform;
 
@@ -1756,112 +1917,24 @@ fn plan_extraction(
     // Find the best overview level
     let overview_idx = reader.best_overview_for_resolution(extent_src_width, extent_src_height);
 
-    let LevelParams { eff_width, eff_height, eff_tile_width, eff_tile_height, eff_tiles_across, scale, tiepoint, out_res_x, out_res_y } =
-        level_params(reader, &extent, tile_size, overview_idx)?;
+    let params = level_params(reader, &extent, tile_size, overview_idx)?;
+    let mapping = SourceMapping::new(&strategy, &extent, tile_size, &params);
 
-    // Pre-compute which source tiles we need by checking corners and edges
-    let mut needed_tiles: HashSet<usize> = HashSet::new();
-
-    // Helper closure to compute tile index at overview level
-    let tile_index_at_level = |px: usize, py: usize| -> Option<usize> {
-        if px >= eff_width || py >= eff_height {
-            return None;
-        }
-        let tile_col = px / eff_tile_width;
-        let tile_row = py / eff_tile_height;
-        Some(tile_row * eff_tiles_across + tile_col)
-    };
-
-    // Track min/max columns and rows to compute the full tile range
-    let mut min_col: Option<usize> = None;
-    let mut max_col: Option<usize> = None;
-    let mut min_row: Option<usize> = None;
-    let mut max_row: Option<usize> = None;
-
-    // Sample corners and edges to find needed tiles (much faster than checking every pixel)
-    let sample_points = [
-        (0, 0), (tile_size_x - 1, 0), (0, tile_size_y - 1), (tile_size_x - 1, tile_size_y - 1),
-        (tile_size_x / 2, 0), (tile_size_x / 2, tile_size_y - 1),
-        (0, tile_size_y / 2), (tile_size_x - 1, tile_size_y / 2),
-        (tile_size_x / 2, tile_size_y / 2),
-    ];
-
-    for &(out_x, out_y) in &sample_points {
-        #[allow(clippy::cast_precision_loss)]
-        let merc_x = extent.minx + (out_x as f64 + 0.5) * out_res_x;
-        #[allow(clippy::cast_precision_loss)]
-        let merc_y = extent.maxy - (out_y as f64 + 0.5) * out_res_y;
-
-        // Transform from Web Mercator to source CRS
-        let (world_x, world_y) = strategy.transform(merc_x, merc_y)?;
-
-        let src_pixel_x = tiepoint[0] + (world_x - tiepoint[3]) / scale[0];
-        let src_pixel_y = tiepoint[1] + (tiepoint[4] - world_y) / scale[1];
-
-        // Clamp to valid range for tile detection (handles ±180° boundary)
-        #[allow(clippy::cast_precision_loss)]
-        let clamped_x = src_pixel_x.clamp(0.0, eff_width as f64 - 1.0);
-        #[allow(clippy::cast_precision_loss)]
-        let clamped_y = src_pixel_y.clamp(0.0, eff_height as f64 - 1.0);
-
-        // Accept source pixels within 1 pixel of valid range (for tile detection)
-        // Use < (eff_width + 1) not <= eff_width because at exact boundaries like +180°
-        // src_pixel_x may equal exactly eff_width (e.g., 2620.0 for 2620-pixel overview)
-        #[allow(clippy::cast_precision_loss)]
-        let width_check = src_pixel_x >= -1.0 && src_pixel_x < (eff_width + 1) as f64;
-        #[allow(clippy::cast_precision_loss)]
-        let height_check = src_pixel_y >= -1.0 && src_pixel_y < (eff_height + 1) as f64;
-
-        if width_check && height_check {
-            // Track the tile col/row from actual pixel coordinates
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let tile_col = (clamped_x as usize) / eff_tile_width;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let tile_row = (clamped_y as usize) / eff_tile_height;
-
-            min_col = Some(min_col.map_or(tile_col, |m| m.min(tile_col)));
-            max_col = Some(max_col.map_or(tile_col, |m| m.max(tile_col)));
-            min_row = Some(min_row.map_or(tile_row, |m| m.min(tile_row)));
-            max_row = Some(max_row.map_or(tile_row, |m| m.max(tile_row)));
-
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            if let Some(idx) = tile_index_at_level(clamped_x as usize, clamped_y as usize) {
-                needed_tiles.insert(idx);
-            }
-        }
-    }
-
-    // Fill in all tiles in the col/row bounding box
     let max_tile_count = if let Some(idx) = overview_idx {
         reader.overviews[idx].tile_offsets.len()
     } else {
         metadata.tile_offsets.len()
     };
-
-    if let (Some(min_c), Some(max_c), Some(min_r), Some(max_r)) = (min_col, max_col, min_row, max_row) {
-        // Read all tiles in the col/row range
-        for row in min_r..=max_r {
-            for col in min_c..=max_c {
-                let idx = row * eff_tiles_across + col;
-                if idx < max_tile_count {
-                    needed_tiles.insert(idx);
-                }
-            }
-        }
-    }
-
-    let mut needed_tiles: Vec<usize> = needed_tiles.into_iter().collect();
-    needed_tiles.sort_unstable();
+    let needed_tiles = mapping.needed_tiles(tile_size, &params, max_tile_count);
 
     Ok(ExtractionPlan {
         extent,
-        output_crs,
-        source_epsg,
         tile_size,
         resampling,
         selected_bands: bands,
         overview_idx,
         needed_tiles,
+        mapping,
     })
 }
 
@@ -1880,8 +1953,7 @@ fn render_extraction(
     // Value for output pixels with no source data: the COG's nodata if declared, else NaN.
     let fill = fill_value(metadata.nodata);
     let nodata_f32 = nodata_as_f32(metadata.nodata);
-    let strategy = TransformStrategy::new(plan.output_crs, plan.source_epsg)?;
-    let LevelParams { eff_width, eff_height, eff_tile_width, eff_tile_height, eff_tiles_across, scale, tiepoint, out_res_x, out_res_y } =
+    let LevelParams { eff_width, eff_height, eff_tile_width, eff_tile_height, eff_tiles_across, .. } =
         level_params(reader, extent_3857, plan.tile_size, overview_idx)?;
 
     // Pre-compute bit shifts for fast division if tile sizes are powers of 2
@@ -1926,9 +1998,7 @@ fn render_extraction(
     let num_output_bands = output_bands.len();
     let mut pixel_data = vec![fill; tile_size_x * tile_size_y * num_output_bands];
 
-    // Pre-compute inverse scale for speed
-    let inv_scale_x = 1.0 / scale[0];
-    let inv_scale_y = 1.0 / scale[1];
+    let mapping = &plan.mapping;
 
     // Helper to sample a pixel from the cached tile data
     // band is the SOURCE band index (not output band index)
@@ -1954,52 +2024,15 @@ fn render_extraction(
         tile_data.get(pixel_idx).copied()
     };
 
-    // Pre-compute source X pixel formula coefficients
-    // For FastMerc2Geo and Identity, X transform is linear: src_px = base + col * delta
-    let (src_px_base, src_px_delta, use_precomputed_x) = match &strategy {
-        TransformStrategy::FastMerc2Geo => {
-            // For 4326: lon = merc_x * 180 / HALF_EARTH, then convert to pixels
-            let lon_base = (extent_3857.minx + 0.5 * out_res_x) * 180.0 / HALF_EARTH;
-            let base = tiepoint[0] + (lon_base - tiepoint[3]) * inv_scale_x;
-            let lon_delta = out_res_x * 180.0 / HALF_EARTH;
-            let delta = lon_delta * inv_scale_x;
-            (base, delta, true)
-        }
-        TransformStrategy::Identity => {
-            // For 3857: direct merc_x to pixel
-            let merc_x_base = extent_3857.minx + 0.5 * out_res_x;
-            let base = tiepoint[0] + (merc_x_base - tiepoint[3]) * inv_scale_x;
-            let delta = out_res_x * inv_scale_x;
-            (base, delta, true)
-        }
-        TransformStrategy::Proj4rs(_) => (0.0, 0.0, false), // Fall back to per-pixel transform
-    };
-
-    // Pre-compute source Y coordinates for all rows
-    // This avoids repeated transform calls in the inner loop
-    // Store (src_pixel_y, merc_y) - merc_y needed for fallback transform case
-    let src_pixel_y_coords: Vec<Option<(f64, f64)>> = (0..tile_size_y)
-        .map(|out_y| {
-            #[allow(clippy::cast_precision_loss)]
-            let merc_y = extent_3857.maxy - (out_y as f64 + 0.5) * out_res_y;
-            let (_, world_y) = strategy.transform(extent_3857.minx, merc_y).ok()?;
-            let src_pixel_y = tiepoint[1] + (tiepoint[4] - world_y) * inv_scale_y;
-            // Return None for out-of-bounds Y
-            #[allow(clippy::cast_precision_loss)]
-            if src_pixel_y < -0.5 || src_pixel_y > eff_height as f64 + 0.5 {
-                None
-            } else {
-                Some((src_pixel_y, merc_y))
-            }
-        })
-        .collect();
+    // Source row/column of every output pixel come from the plan (the same coordinates that
+    // decided which source tiles were fetched).
 
     // Sample each output pixel
     // Note: We use range loop because out_y is needed for out_idx calculation, not just indexing
     #[allow(clippy::needless_range_loop)]
     for out_y in 0..tile_size_y {
         // Use pre-computed Y coordinate
-        let Some((src_pixel_y, merc_y)) = src_pixel_y_coords[out_y] else {
+        let Some(src_pixel_y) = mapping.rows[out_y] else {
             continue; // Row is out of bounds
         };
 
@@ -2010,19 +2043,10 @@ fn render_extraction(
         let y0_floor = src_pixel_y.floor() as isize;
 
         for out_x in 0..tile_size_x {
-            // Use pre-computed linear formula for X (FastMerc2Geo and Identity)
-            #[allow(clippy::cast_precision_loss)]
-            let src_pixel_x = if use_precomputed_x {
-                src_px_base + (out_x as f64) * src_px_delta
-            } else {
-                // Fall back to per-pixel transform for other CRS (Proj4rs)
-                #[allow(clippy::cast_precision_loss)]
-                let merc_x = extent_3857.minx + (out_x as f64 + 0.5) * out_res_x;
-                let Ok((world_x, _)) = strategy.transform(merc_x, merc_y) else {
-                    continue;
-                };
-                tiepoint[0] + (world_x - tiepoint[3]) * inv_scale_x
-            };
+            let src_pixel_x = mapping.src_x(out_x, out_y, tile_size_x);
+            if src_pixel_x.is_nan() {
+                continue;
+            }
 
             // Check if X is within valid range
             #[allow(clippy::cast_precision_loss)]

@@ -257,3 +257,149 @@ async fn concurrent_opens_share_the_overview_quality_sampling() {
         mock.calls()
     );
 }
+
+// --- Source tile planning: every output pixel that samples inside the raster gets its tile ---
+
+/// COG whose top-left corner is at `origin`, `size` source pixels square, in `epsg`.
+fn patch_spec(epsg: u16, origin: (f64, f64), pixel_size: f64, size: usize, tile: usize) -> CogSpec {
+    CogSpec {
+        width: size,
+        height: size,
+        tile,
+        bands: 1,
+        sample: Sample::U16,
+        deflate: true,
+        predictor: false,
+        epsg,
+        origin,
+        pixel_size: (pixel_size, pixel_size),
+        nodata: None,
+        overviews: 0,
+        sparse: vec![],
+        corrupt: vec![],
+        // never 0 or NaN, so "valid" is unambiguous
+        pixel: |_, x, y| ((x * 31 + y * 17) % 4000) as f64 + 1.0,
+    }
+}
+
+fn memory_reader(id: &str, spec: &CogSpec) -> CogReader {
+    CogReader::from_reader_with_hint(
+        Arc::new(MemoryRangeReader::new(build_cog(spec), id.to_string())),
+        OverviewQualityHint::NoneUsable,
+    )
+    .unwrap()
+}
+
+/// Check one extraction against the geometry: pixels whose centre lies at least `margin` output
+/// pixels inside `covered` (minx, miny, maxx, maxy in the output CRS) must be valid, pixels at
+/// least `margin` outside must be fill. Returns the number of valid pixels.
+fn assert_coverage(tile: &TileData, bounds: &BoundingBox, covered: (f64, f64, f64, f64), margin: f64) -> usize {
+    let (w, h) = (tile.width, tile.height);
+    let (rx, ry) = ((bounds.maxx - bounds.minx) / w as f64, (bounds.maxy - bounds.miny) / h as f64);
+    let mut valid = 0;
+    let mut checked_inside = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let (cx, cy) = (bounds.minx + (x as f64 + 0.5) * rx, bounds.maxy - (y as f64 + 0.5) * ry);
+            let (mx, my) = (margin * rx, margin * ry);
+            let inside = cx > covered.0 + mx && cx < covered.2 - mx && cy > covered.1 + my && cy < covered.3 - my;
+            let outside = cx < covered.0 - mx || cx > covered.2 + mx || cy < covered.1 - my || cy > covered.3 + my;
+            let v = tile.pixels[y * w + x];
+            if !v.is_nan() {
+                valid += 1;
+            }
+            if inside {
+                checked_inside += 1;
+                assert!(!v.is_nan(), "pixel ({x},{y}) samples inside the raster but is fill");
+            } else if outside {
+                assert!(v.is_nan(), "pixel ({x},{y}) samples outside the raster but has a value");
+            }
+        }
+    }
+    assert!(checked_inside > 0, "test geometry covers no pixels");
+    valid
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_small_interior_patch_of_the_output_tile_is_fully_rendered() {
+    // The raster covers the middle 25% x 25% of output tile 3/2/3: none of the old sample points
+    // except the centre fell inside it, so only one source tile used to be fetched.
+    let b = BoundingBox::from_xyz(3, 2, 3);
+    let w = b.maxx - b.minx;
+    let px = 0.25 * w / 512.0;
+    let spec = patch_spec(3857, (b.minx + 0.375 * w, b.maxy - 0.375 * w), px, 512, 64);
+    let covered = (b.minx + 0.375 * w, b.maxy - 0.625 * w, b.minx + 0.625 * w, b.maxy - 0.375 * w);
+    for (name, method) in
+        [("nearest", ResamplingMethod::Nearest), ("bilinear", ResamplingMethod::Bilinear), ("bicubic", ResamplingMethod::Bicubic)]
+    {
+        let r = memory_reader(&format!("mem://plan/interior/{name}"), &spec);
+        let tile = TileExtractor::new(&r).xyz(3, 2, 3).size(128).resampling(method).extract().await.unwrap();
+        let valid = assert_coverage(&tile, &b, covered, 1.5);
+        assert!(valid >= 28 * 28, "{name}: only {valid} valid pixels");
+        assert!(tile.tiles_read > 4, "{name}: only {} source tiles were fetched", tile.tiles_read);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_raster_straddling_a_corner_of_the_output_tile_is_fully_rendered() {
+    // The raster's bottom-right 40% x 40% overlaps the output tile's top-left corner; the raster
+    // itself extends beyond the tile on both sides.
+    let b = BoundingBox::from_xyz(3, 2, 3);
+    let w = b.maxx - b.minx;
+    let px = 0.7 * w / 512.0;
+    let origin = (b.minx - 0.3 * w, b.maxy + 0.3 * w);
+    let covered = (origin.0, origin.1 - 0.7 * w, origin.0 + 0.7 * w, origin.1);
+    let spec = patch_spec(3857, origin, px, 512, 64);
+    let r = memory_reader("mem://plan/corner", &spec);
+    let tile = TileExtractor::new(&r).xyz(3, 2, 3).size(128).extract().await.unwrap();
+    let valid = assert_coverage(&tile, &b, covered, 1.5);
+    assert!(valid >= 48 * 48, "only {valid} valid pixels");
+}
+
+#[tokio::test(start_paused = true)]
+async fn reprojected_patches_are_fully_rendered() {
+    use crate::geometry::projection::project_point;
+    // UTM 10N raster inside z10 tile 163/395, sampled through a per-pixel proj4rs transform.
+    let b = BoundingBox::from_xyz(10, 163, 395);
+    let spec = patch_spec(32610, (545_000.0, 4_195_000.0), 30.0, 400, 64);
+    let r = memory_reader("mem://plan/utm", &spec);
+    let tile = TileExtractor::new(&r).xyz(10, 163, 395).size(128).extract().await.unwrap();
+
+    // Compare each output pixel's source location with the raster extent in source pixels.
+    let (w, h) = (tile.width, tile.height);
+    let (rx, ry) = ((b.maxx - b.minx) / w as f64, (b.maxy - b.miny) / h as f64);
+    let (mut valid, mut inside_checked) = (0, 0);
+    for y in 0..h {
+        for x in 0..w {
+            let (cx, cy) = (b.minx + (x as f64 + 0.5) * rx, b.maxy - (y as f64 + 0.5) * ry);
+            let (ux, uy) = project_point(3857, 32610, cx, cy).unwrap();
+            let (sx, sy) = ((ux - 545_000.0) / 30.0, (4_195_000.0 - uy) / 30.0);
+            let v = tile.pixels[y * w + x];
+            valid += usize::from(!v.is_nan());
+            // The renderer takes a row's source y from the tile's left edge, which is off by a few
+            // source pixels across a UTM tile; stay clear of the raster edge by more than that.
+            if sx > 12.0 && sx < 388.0 && sy > 12.0 && sy < 388.0 {
+                inside_checked += 1;
+                assert!(!v.is_nan(), "pixel ({x},{y}) at source ({sx:.1},{sy:.1}) is fill");
+            }
+        }
+    }
+    assert!(inside_checked > 1000, "test geometry covers too little ({inside_checked})");
+    assert!(valid >= inside_checked);
+}
+
+/// Fully covered output tiles fetch exactly the source tiles they touch (no over-fetch): an
+/// output tile that is one quarter of the raster needs one quarter of its tiles.
+#[tokio::test(start_paused = true)]
+async fn fully_covered_tiles_do_not_over_fetch() {
+    let spec = spec(); // 8 x 8 source tiles, covers 3/2/3
+    let r = memory_reader("mem://plan/no-overfetch", &spec);
+    // z4 child (4,6) is the top-left quadrant: 4 x 4 source tiles (plus at most the one beyond).
+    let tile = TileExtractor::new(&r).xyz(4, 4, 6).size(128).extract().await.unwrap();
+    assert!((16..=25).contains(&tile.tiles_read), "read {} tiles", tile.tiles_read);
+    assert!(tile.pixels.iter().all(|v| !v.is_nan()));
+    // The whole raster at full resolution touches each of its 64 tiles once.
+    let whole = TileExtractor::new(&r).xyz(3, 2, 3).size(512).extract().await.unwrap();
+    assert!(whole.tiles_read + tile.tiles_read >= 64);
+    assert!(whole.pixels.iter().all(|v| !v.is_nan()));
+}

@@ -4,9 +4,9 @@ copernicus_dem/overview1	900x900 tile=1024x1024 across=1 down=1 scale=4 offsets=
 copernicus_dem/overview2	450x450 tile=1024x1024 across=1 down=1 scale=8 offsets=e7823b23a24c4c3c counts=7d51a8892cfae64d
 copernicus_dem/min_usable	Some(2)
 copernicus_dem/hint	MinUsable(2)
-copernicus_dem/xyz/6/10/24/nearest	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=0 digest=bdb32056e16c2325
-copernicus_dem/xyz/6/10/24/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=0 digest=bdb32056e16c2325
-copernicus_dem/xyz/6/10/24/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=0 digest=bdb32056e16c2325
+copernicus_dem/xyz/6/10/24/nearest	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=667 digest=78c9e8d9b8241129
+copernicus_dem/xyz/6/10/24/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=667 digest=199897929a1e225e
+copernicus_dem/xyz/6/10/24/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=667 digest=0169e0e63a368575
 copernicus_dem/xyz/8/40/98/nearest	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=1980 digest=55ace23af8e196b8
 copernicus_dem/xyz/8/40/98/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=1980 digest=59d11141e7c03c17
 copernicus_dem/xyz/8/40/98/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=1980 digest=4cb502d03adf56da
@@ -25,7 +25,7 @@ copernicus_dem/xyz/12/655/1582/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata
 copernicus_dem/xyz/12/656/1583/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=4770b79a87da329b
 copernicus_dem/xyz/12/656/1583/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=881d8e8b1eb1bf98
 copernicus_dem/xyz/12/656/1583/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=0eb7bf3081b0b68d
-copernicus_dem/xyz/6/10/24/96x64	96x64x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=6144 valid=0 digest=162be988b71de325
+copernicus_dem/xyz/6/10/24/96x64	96x64x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=6144 valid=238 digest=d6211e41351ea38f
 copernicus_dem/shifted/10/163/395/nearest	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=8448 digest=ca955e9eb28ec044
 copernicus_dem/shifted/10/163/395/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=8448 digest=ed4646df2e8b38ab
 copernicus_dem/shifted/10/163/395/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=8448 digest=345c7b43dee9fee0
