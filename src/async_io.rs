@@ -351,9 +351,15 @@ pub(crate) async fn spawn_io<T: Send + 'static>(fut: impl Future<Output = T> + S
 /// The future is *spawned* on the runtime (it never runs on the caller's thread), and the
 /// caller waits on the join handle with a plain executor that needs no tokio context. That is
 /// safe from any thread; on an async worker it blocks that worker but cannot deadlock.
+///
+/// When called from inside a tokio task the join handle is polled under that task's cooperative
+/// budget (128 operations per scheduling turn). A blocking caller never yields back to the
+/// scheduler, so once the budget ran out the handle kept answering "pending" and the 129th
+/// blocking call within one turn never returned. [`unconstrained`](tokio::task::unconstrained)
+/// takes the handle out of the budget.
 pub(crate) fn block_on_io<T: Send + 'static>(fut: impl Future<Output = T> + Send + 'static) -> AnyResult<T> {
     let handle = IO_RUNTIME.spawn(fut);
-    futures::executor::block_on(handle).map_err(|e| format!("I/O task failed: {e}").into())
+    futures::executor::block_on(tokio::task::unconstrained(handle)).map_err(|e| format!("I/O task failed: {e}").into())
 }
 
 /// Adapter exposing an [`AsyncRangeReader`] through the synchronous [`RangeReader`] trait.
@@ -589,6 +595,25 @@ mod io_tests {
         });
         let v = r.read_range(0, 8).unwrap();
         assert_eq!(v, data(10_000)[0..8].to_vec());
+        tx.send(()).unwrap();
+        watchdog.join().unwrap();
+    }
+
+    /// Blocking calls made from inside one tokio task share that task's cooperative budget (128
+    /// operations); the 129th used to wait forever on a join handle that kept saying "pending".
+    #[tokio::test(flavor = "current_thread")]
+    async fn hundreds_of_blocking_calls_in_one_task_complete() {
+        let r = AsyncToSync::new(Arc::new(MockReader::new(data(10_000), "mock://budget", Duration::ZERO)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if rx.recv_timeout(Duration::from_secs(20)).is_err() {
+                eprintln!("hundreds_of_blocking_calls_in_one_task_complete hung");
+                std::process::abort();
+            }
+        });
+        for i in 0..300usize {
+            assert_eq!(r.read_range(i as u64, 4).unwrap(), data(10_000)[i..i + 4].to_vec());
+        }
         tx.send(()).unwrap();
         watchdog.join().unwrap();
     }
