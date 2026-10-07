@@ -2,6 +2,7 @@
 /data
 /ignore
 *.md
+!tests/data/README.md
 *.tif
 *.tiff
 *.png
