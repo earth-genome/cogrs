@@ -121,6 +121,25 @@ fn bigtiff_parses_like_classic_in_both_array_types() {
     }
 }
 
+/// BitsPerSample and SampleFormat hold one value per band: three of them are out of line in a
+/// classic TIFF and inline in a BigTIFF. Both must give the data type and the pixels.
+#[test]
+fn multi_band_wide_samples_keep_their_data_type() {
+    for (sample, data_type) in [(Sample::U16, crate::CogDataType::UInt16), (Sample::F32, crate::CogDataType::Float32)] {
+        let spec = spec(64, 64, 64, 3, sample);
+        for (layout, bytes) in [("classic", build_cog(&spec)), ("big", build_bigtiff_cog(&spec, true))] {
+            let what = format!("{data_type:?} {layout}");
+            let reader = open_sync(bytes, &format!("mem://bigtiff/multi-band/{what}"));
+            assert_eq!(reader.metadata.data_type, data_type, "{what}");
+            let (tile, _) = reader.read_tile_sync(TileRef { overview: None, index: 0 }).unwrap();
+            for (i, &v) in tile.iter().enumerate() {
+                let (b, x, y) = (i % 3, i / 3 % 64, i / 3 / 64);
+                assert_eq!(f64::from(v), (spec.pixel)(b, x, y), "{what}: band {b} pixel ({x}, {y})");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn bigtiff_parses_like_classic_on_the_async_path() {
     for (name, spec) in cases() {

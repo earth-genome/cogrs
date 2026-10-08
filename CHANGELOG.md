@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Faster tile decoding: undoing the TIFF predictor and converting samples to `f32` now run as
+  vectorized loops, using SSE2 on x86_64 for the single-band byte running sum and the
+  4-byte floating-point un-shuffle, and scalar loops everywhere else. Decoding a tile end to end,
+  with I/O and Deflate included, is about 2x faster for Float32 predictor 3 (the Copernicus DEM
+  fixture), 1.6x for RGB u8 predictor 2, and 6x for single-band u8 predictor 2. Output is
+  bit-identical
+
+### Fixed
+
+- Big-endian TIFFs with predictor 2 and 16/32/64-bit samples, or with predictor 3, decoded to
+  wrong values. They now match GDAL bit for bit
+- Multi-band TIFFs with samples wider than 8 bits were decoded as the wrong data type:
+  BitsPerSample and SampleFormat tags with one value per band were ignored, so the reader fell
+  back to 8-bit unsigned integers (a 3-band UInt16 or Float32 file read as UInt8). Both tags
+  are now read in full; bands with different values are reported as unsupported
+- `lzw_fallback`: predictor 2 on multi-band 16-bit data accumulated across bands instead of
+  within each band, and predictor 3 restarted the differencing at every byte plane. It now
+  uses the same predictor code as `CogReader`
+
 ## [0.1.0] - 2026-10-07
 
 ### Added

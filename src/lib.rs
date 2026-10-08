@@ -33,6 +33,7 @@ pub mod header_cache;
 pub mod lzw_fallback;
 pub mod point_query;
 mod point_query_async;
+mod predictor;
 pub mod range_reader;
 pub mod raster;
 pub mod s3;

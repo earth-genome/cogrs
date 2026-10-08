@@ -1035,7 +1035,7 @@ impl CogReader {
     /// Decompress, un-predict and convert a tile's compressed bytes to `f32` samples (CPU only).
     pub(crate) fn decode_tile(&self, span: &TileSpan, compressed: &[u8]) -> AnyResult<Vec<f32>> {
         let meta = &*self.metadata;
-        let decompressed = decompress_tile(
+        let mut samples = decompress_tile(
             compressed,
             meta.compression,
             span.width,
@@ -1043,14 +1043,15 @@ impl CogReader {
             meta.bands,
             meta.data_type.bytes_per_sample(),
         )?;
-        let unpredicted = apply_predictor(
-            &decompressed,
+        crate::predictor::undo_predictor(
+            &mut samples,
             meta.predictor,
             span.width,
             meta.bands,
             meta.data_type.bytes_per_sample(),
+            meta.little_endian,
         )?;
-        Ok(convert_to_f32(&unpredicted, meta.data_type, meta.little_endian))
+        Ok(convert_to_f32(&samples, meta.data_type, meta.little_endian))
     }
 
     /// Tile from the process-wide decompressed-tile cache.
@@ -1710,11 +1711,10 @@ fn parse_ifd(
     let height = get_tag_value(tags, TAG_IMAGE_LENGTH, little_endian)
         .ok_or("Missing ImageLength tag")? as usize;
 
+    // BitsPerSample and SampleFormat hold one value per band
+    let bits_per_sample = read_per_sample_tag(tags, TAG_BITS_PER_SAMPLE, "BitsPerSample", fetched, little_endian)?.unwrap_or(8);
+    let sample_format = read_per_sample_tag(tags, TAG_SAMPLE_FORMAT, "SampleFormat", fetched, little_endian)?.unwrap_or(1);
     // Safe casts: these tag values are small constants (<100), well within u16/usize range
-    #[allow(clippy::cast_possible_truncation)]
-    let bits_per_sample = get_tag_value(tags, TAG_BITS_PER_SAMPLE, little_endian).unwrap_or(8) as u16;
-    #[allow(clippy::cast_possible_truncation)]
-    let sample_format = get_tag_value(tags, TAG_SAMPLE_FORMAT, little_endian).unwrap_or(1) as u16;
     #[allow(clippy::cast_possible_truncation)]
     let bands = get_tag_value(tags, TAG_SAMPLES_PER_PIXEL, little_endian).unwrap_or(1) as usize;
     #[allow(clippy::cast_possible_truncation)]
@@ -1864,6 +1864,28 @@ fn get_tag_value(tags: &HashMap<u16, IfdEntry>, tag: u16, little_endian: bool) -
     }
 }
 
+/// A tag with one value per band (BitsPerSample, SampleFormat): the value, which must be the
+/// same for every band; `None` if the tag is absent or empty.
+fn read_per_sample_tag(
+    tags: &HashMap<u16, IfdEntry>,
+    tag: u16,
+    name: &str,
+    fetched: &TagValues,
+    little_endian: bool,
+) -> AnyResult<Option<u16>> {
+    if !tags.contains_key(&tag) {
+        return Ok(None);
+    }
+    let values = read_tag_array_u64(tags, tag, fetched, little_endian, 0)?;
+    let Some(&first) = values.first() else {
+        return Ok(None);
+    };
+    if values.iter().any(|&v| v != first) {
+        return Err(format!("{name} differs between bands ({values:?}), which is not supported").into());
+    }
+    Ok(Some(u16::try_from(first).map_err(|_| format!("Invalid {name}: {first}"))?))
+}
+
 /// The out-of-line tag values of all IFDs, fetched together and keyed by file offset.
 struct TagValues {
     file_size: u64,
@@ -1926,6 +1948,8 @@ fn collect_value_ranges(tags: &HashMap<u16, IfdEntry>, full_resolution: bool, fi
     push(offsets, &array_type_size, 0);
     push(counts, &array_type_size, 0);
     if full_resolution {
+        push(TAG_BITS_PER_SAMPLE, &array_type_size, 0);
+        push(TAG_SAMPLE_FORMAT, &array_type_size, 0);
         let doubles = |t: u16| (t == 12).then_some(8);
         push(TAG_MODEL_PIXEL_SCALE, &doubles, 3);
         push(TAG_MODEL_TIEPOINT, &doubles, 6);
@@ -2263,369 +2287,40 @@ fn decompress_tile(
     }
 }
 
-/// Reverses TIFF predictor encoding to recover original sample values.
-///
-/// TIFF predictors are a pre-compression step that improves compression ratios by
-/// storing differences between adjacent samples rather than absolute values. This
-/// function reverses (decodes) that transformation after decompression.
-///
-/// # TIFF Predictor Types
-///
-/// - **Predictor 1 (None)**: No prediction, data is stored as-is.
-/// - **Predictor 2 (Horizontal Differencing)**: Each sample stores the difference
-///   from the previous sample in the same row. Decoding requires cumulative addition.
-/// - **Predictor 3 (Floating Point)**: Specialized for IEEE floating-point data;
-///   differences are computed per byte position across samples.
-///
-/// # Critical Implementation Detail: Sample-Level vs Byte-Level Accumulation
-///
-/// For predictor 2 with multi-byte samples (16-bit, 32-bit, 64-bit), the differencing
-/// operates on **whole samples as integers**, not on individual bytes. This is a subtle
-/// but critical distinction:
-///
-/// ## The Problem (Incorrect Byte-Level Approach)
-///
-/// A naive implementation might accumulate bytes independently:
-/// ```text
-/// // WRONG: Byte-level accumulation for 16-bit data
-/// for i in 1..data.len() {
-///     data[i] = data[i].wrapping_add(data[i - 1]);  // Treats each byte separately
-/// }
-/// ```
-///
-/// This produces incorrect results because carries between the low and high bytes
-/// of a sample are not propagated correctly. The visual symptom is **horizontal
-/// stripe artifacts** in rendered images, where every other row appears corrupted.
-///
-/// ## The Solution (Correct Sample-Level Approach)
-///
-/// The correct approach interprets bytes as complete samples, performs integer
-/// addition with proper carry propagation, then writes back:
-/// ```text
-/// // CORRECT: Sample-level accumulation for 16-bit data
-/// for i in 1..num_samples {
-///     let prev = u16::from_le_bytes([data[prev_offset], data[prev_offset + 1]]);
-///     let curr = u16::from_le_bytes([data[curr_offset], data[curr_offset + 1]]);
-///     let sum = curr.wrapping_add(prev);  // Proper 16-bit addition with carry
-///     data[curr_offset..].copy_from_slice(&sum.to_le_bytes());
-/// }
-/// ```
-///
-/// # Row Independence
-///
-/// Each row is processed independently—the first sample of a new row does NOT
-/// accumulate from the last sample of the previous row. This is per the TIFF
-/// specification and prevents error propagation across rows.
-///
-/// # Arguments
-///
-/// * `data` - Decompressed tile data with predictor encoding still applied
-/// * `predictor` - TIFF predictor tag value (1=none, 2=horizontal, 3=floating point)
-/// * `tile_width` - Width of the tile in pixels
-/// * `bands` - Number of bands (samples per pixel)
-/// * `bytes_per_sample` - Size of each sample in bytes (1, 2, 4, or 8)
-///
-/// # Returns
-///
-/// The decoded data with original sample values restored.
-///
-/// # References
-///
-/// - TIFF 6.0 Specification, Section 14: Differencing Predictor
-/// - Adobe TIFF Technote 3: Floating-Point Predictor
-fn apply_predictor(
-    data: &[u8],
-    predictor: u16,
-    tile_width: usize,
-    bands: usize,
-    bytes_per_sample: usize,
-) -> AnyResult<Vec<u8>> {
-    match predictor {
-        // Predictor 1: No prediction applied, return data unchanged
-        1 => Ok(data.to_vec()),
-
-        // Predictor 2: Horizontal differencing
-        // Samples are stored as: sample[i] = original[i] - original[i-1]
-        // We reverse this by cumulative addition: original[i] = sample[i] + original[i-1]
-        2 => {
-            let mut result = data.to_vec();
-            let row_bytes = tile_width * bands * bytes_per_sample;
-            let samples_per_row = tile_width * bands;
-
-            // Process each row independently (rows don't accumulate across boundaries)
-            for row in result.chunks_mut(row_bytes) {
-                match bytes_per_sample {
-                    1 => {
-                        // 8-bit samples: accumulate per-band (component) with stride
-                        // For pixel-interleaved RGB: R0 G0 B0 R1 G1 B1 ...
-                        // Each band must accumulate independently:
-                        // R1 = R0 + diff_R1, G1 = G0 + diff_G1, B1 = B0 + diff_B1
-                        for i in bands..row.len() {
-                            row[i] = row[i].wrapping_add(row[i - bands]);
-                        }
-                    }
-                    2 => {
-                        // 16-bit samples: must accumulate as u16 to handle carries
-                        // between low and high bytes correctly. Accumulate per-band.
-                        for i in bands..samples_per_row {
-                            let prev_offset = (i - bands) * 2;
-                            let curr_offset = i * 2;
-                            let prev = u16::from_le_bytes([row[prev_offset], row[prev_offset + 1]]);
-                            let curr = u16::from_le_bytes([row[curr_offset], row[curr_offset + 1]]);
-                            let sum = curr.wrapping_add(prev);
-                            row[curr_offset..curr_offset + 2].copy_from_slice(&sum.to_le_bytes());
-                        }
-                    }
-                    4 => {
-                        // 32-bit samples (includes Float32): accumulate as u32
-                        // The bit pattern is treated as an integer for differencing,
-                        // regardless of whether it represents float or int data. Accumulate per-band.
-                        for i in bands..samples_per_row {
-                            let prev_offset = (i - bands) * 4;
-                            let curr_offset = i * 4;
-                            let prev = u32::from_le_bytes([
-                                row[prev_offset], row[prev_offset + 1],
-                                row[prev_offset + 2], row[prev_offset + 3],
-                            ]);
-                            let curr = u32::from_le_bytes([
-                                row[curr_offset], row[curr_offset + 1],
-                                row[curr_offset + 2], row[curr_offset + 3],
-                            ]);
-                            let sum = curr.wrapping_add(prev);
-                            row[curr_offset..curr_offset + 4].copy_from_slice(&sum.to_le_bytes());
-                        }
-                    }
-                    8 => {
-                        // 64-bit samples (includes Float64): accumulate as u64
-                        // This case is critical for scientific raster data which often
-                        // uses Float64 for precision (e.g., climate/agricultural models). Accumulate per-band.
-                        for i in bands..samples_per_row {
-                            let prev_offset = (i - bands) * 8;
-                            let curr_offset = i * 8;
-                            let prev = u64::from_le_bytes([
-                                row[prev_offset], row[prev_offset + 1],
-                                row[prev_offset + 2], row[prev_offset + 3],
-                                row[prev_offset + 4], row[prev_offset + 5],
-                                row[prev_offset + 6], row[prev_offset + 7],
-                            ]);
-                            let curr = u64::from_le_bytes([
-                                row[curr_offset], row[curr_offset + 1],
-                                row[curr_offset + 2], row[curr_offset + 3],
-                                row[curr_offset + 4], row[curr_offset + 5],
-                                row[curr_offset + 6], row[curr_offset + 7],
-                            ]);
-                            let sum = curr.wrapping_add(prev);
-                            row[curr_offset..curr_offset + 8].copy_from_slice(&sum.to_le_bytes());
-                        }
-                    }
-                    _ => {
-                        // Fallback for non-standard sample sizes
-                        // Uses byte-level accumulation with stride, which may not be
-                        // fully correct for all cases but handles uncommon formats
-                        for i in bytes_per_sample..row.len() {
-                            row[i] = row[i].wrapping_add(row[i - bytes_per_sample]);
-                        }
-                    }
-                }
-            }
-
-            Ok(result)
-        }
-
-        // Predictor 3: Floating-point horizontal differencing (Adobe TIFF Technote 3)
-        //
-        // IMPORTANT: The predictor is applied ROW BY ROW, not to the entire tile at once!
-        // Each row is processed independently with its own byte-shuffle layout.
-        //
-        // For each row:
-        // 1. Bytes are grouped by position within the float (byte-shuffled):
-        //    [f0b0,f1b0,...,fnb0, f0b1,f1b1,...,fnb1, ...]
-        // 2. Horizontal differencing is applied with stride = samples_per_pixel (bands)
-        // 3. Floats are reassembled by taking bytes from each section
-        //
-        // The tiff crate does this in fix_endianness_and_predict() called per-row.
-        3 => {
-            let samples = bands;  // samples_per_pixel, stride for differencing
-            let row_bytes = tile_width * bands * bytes_per_sample;
-            let floats_per_row = tile_width * bands;
-            let tile_height = data.len() / row_bytes;
-
-            let mut output = vec![0u8; data.len()];
-
-            for row_idx in 0..tile_height {
-                let row_start = row_idx * row_bytes;
-                let row_end = row_start + row_bytes;
-
-                // Copy row to work buffer
-                let mut row_data: Vec<u8> = data[row_start..row_end].to_vec();
-
-                // Step 1: Reverse horizontal differencing within this row
-                for i in samples..row_data.len() {
-                    row_data[i] = row_data[i].wrapping_add(row_data[i - samples]);
-                }
-
-                // Step 2: Reassemble floats from quadrant layout within this row
-                // Row is divided into bytes_per_sample sections, each of floats_per_row bytes
-                let output_row_start = row_idx * floats_per_row * bytes_per_sample;
-
-                match bytes_per_sample {
-                    4 => {
-                        for i in 0..floats_per_row {
-                            let b0 = row_data[i];
-                            let b1 = row_data[floats_per_row + i];
-                            let b2 = row_data[floats_per_row * 2 + i];
-                            let b3 = row_data[floats_per_row * 3 + i];
-                            let val = u32::from_be_bytes([b0, b1, b2, b3]);
-                            let out_offset = output_row_start + i * 4;
-                            output[out_offset..out_offset + 4].copy_from_slice(&val.to_ne_bytes());
-                        }
-                    }
-                    8 => {
-                        for i in 0..floats_per_row {
-                            let b0 = row_data[i];
-                            let b1 = row_data[floats_per_row + i];
-                            let b2 = row_data[floats_per_row * 2 + i];
-                            let b3 = row_data[floats_per_row * 3 + i];
-                            let b4 = row_data[floats_per_row * 4 + i];
-                            let b5 = row_data[floats_per_row * 5 + i];
-                            let b6 = row_data[floats_per_row * 6 + i];
-                            let b7 = row_data[floats_per_row * 7 + i];
-                            let val = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
-                            let out_offset = output_row_start + i * 8;
-                            output[out_offset..out_offset + 8].copy_from_slice(&val.to_ne_bytes());
-                        }
-                    }
-                    2 => {
-                        for i in 0..floats_per_row {
-                            let b0 = row_data[i];
-                            let b1 = row_data[floats_per_row + i];
-                            let val = u16::from_be_bytes([b0, b1]);
-                            let out_offset = output_row_start + i * 2;
-                            output[out_offset..out_offset + 2].copy_from_slice(&val.to_ne_bytes());
-                        }
-                    }
-                    _ => {
-                        return Err(format!(
-                            "Predictor 3 not supported for {}-byte samples",
-                            bytes_per_sample
-                        ).into());
-                    }
-                }
-            }
-
-            Ok(output)
-        }
-
-        _ => Err(format!("Unsupported predictor: {predictor}").into()),
-    }
-}
-
+/// Samples of `data_type` in the given byte order, as `f32`.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // 32/64-bit integers and f64 round to f32
 fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> Vec<f32> {
-    let bytes_per_sample = data_type.bytes_per_sample();
-    let sample_count = data.len() / bytes_per_sample;
-    let mut result = Vec::with_capacity(sample_count);
-
-    for i in 0..sample_count {
-        let offset = i * bytes_per_sample;
-        let bytes = &data[offset..offset + bytes_per_sample];
-
-        let value = match data_type {
-            CogDataType::UInt8 => f32::from(bytes[0]),
-            CogDataType::Int8 => {
-                // Safe cast: reinterpreting u8 bit pattern as i8
-                #[allow(clippy::cast_possible_wrap)]
-                f32::from(bytes[0] as i8)
-            }
-            CogDataType::UInt16 => {
-                if little_endian {
-                    f32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
-                } else {
-                    f32::from(u16::from_be_bytes([bytes[0], bytes[1]]))
-                }
-            }
-            CogDataType::Int16 => {
-                if little_endian {
-                    f32::from(i16::from_le_bytes([bytes[0], bytes[1]]))
-                } else {
-                    f32::from(i16::from_be_bytes([bytes[0], bytes[1]]))
-                }
-            }
-            CogDataType::UInt32 => {
-                // Precision loss acceptable: converting 32-bit int to f32 (mantissa 23 bits)
-                #[allow(clippy::cast_precision_loss)]
-                if little_endian {
-                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32
-                } else {
-                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32
-                }
-            }
-            CogDataType::Int32 => {
-                // Precision loss acceptable: converting 32-bit int to f32 (mantissa 23 bits)
-                #[allow(clippy::cast_precision_loss)]
-                if little_endian {
-                    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32
-                } else {
-                    i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32
-                }
-            }
-            CogDataType::Float32 => {
-                if little_endian {
-                    f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                } else {
-                    f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                }
-            }
-            CogDataType::UInt64 => {
-                // Precision loss acceptable: converting 64-bit int to f32 (mantissa 23 bits)
-                #[allow(clippy::cast_precision_loss)]
-                if little_endian {
-                    u64::from_le_bytes([
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5], bytes[6], bytes[7],
-                    ]) as f32
-                } else {
-                    u64::from_be_bytes([
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5], bytes[6], bytes[7],
-                    ]) as f32
-                }
-            }
-            CogDataType::Int64 => {
-                // Precision loss acceptable: converting 64-bit int to f32 (mantissa 23 bits)
-                #[allow(clippy::cast_precision_loss)]
-                if little_endian {
-                    i64::from_le_bytes([
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5], bytes[6], bytes[7],
-                    ]) as f32
-                } else {
-                    i64::from_be_bytes([
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5], bytes[6], bytes[7],
-                    ]) as f32
-                }
-            }
-            CogDataType::Float64 => {
-                // Precision loss acceptable: converting f64 to f32
-                #[allow(clippy::cast_possible_truncation)]
-                if little_endian {
-                    f64::from_le_bytes([
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5], bytes[6], bytes[7],
-                    ]) as f32
-                } else {
-                    f64::from_be_bytes([
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5], bytes[6], bytes[7],
-                    ]) as f32
-                }
+    // One loop per type and byte order, so that each is a plain loop the compiler vectorizes
+    fn each<const N: usize>(data: &[u8], to_f32: impl Fn([u8; N]) -> f32) -> Vec<f32> {
+        data.as_chunks::<N>().0.iter().map(|&bytes| to_f32(bytes)).collect()
+    }
+    macro_rules! decode {
+        ($t:ty, $v:ident => $to_f32:expr) => {
+            if little_endian {
+                each(data, |bytes| {
+                    let $v = <$t>::from_le_bytes(bytes);
+                    $to_f32
+                })
+            } else {
+                each(data, |bytes| {
+                    let $v = <$t>::from_be_bytes(bytes);
+                    $to_f32
+                })
             }
         };
-
-        result.push(value);
     }
-
-    result
+    match data_type {
+        CogDataType::UInt8 => decode!(u8, v => f32::from(v)),
+        CogDataType::Int8 => decode!(i8, v => f32::from(v)),
+        CogDataType::UInt16 => decode!(u16, v => f32::from(v)),
+        CogDataType::Int16 => decode!(i16, v => f32::from(v)),
+        CogDataType::UInt32 => decode!(u32, v => v as f32),
+        CogDataType::Int32 => decode!(i32, v => v as f32),
+        CogDataType::UInt64 => decode!(u64, v => v as f32),
+        CogDataType::Int64 => decode!(i64, v => v as f32),
+        CogDataType::Float32 => decode!(f32, v => v),
+        CogDataType::Float64 => decode!(f64, v => v as f32),
+    }
 }
 
 #[cfg(test)]
@@ -2889,7 +2584,7 @@ mod tests {
         // Sample 1: 0x0100 + 0x0001 = 0x0101 (257)
         // Sample 2: 0x0101 + 0x0001 = 0x0102 (258)
         // Sample 3: 0x0102 + 0x0001 = 0x0103 (259)
-        let result = apply_predictor(&input, 2, 4, 1, 2).unwrap();
+        let result = undo_predictor_le(&input, 2, 4, 1, 2).unwrap();
 
         // Verify as 16-bit values
         let s0 = u16::from_le_bytes([result[0], result[1]]);
@@ -2923,7 +2618,7 @@ mod tests {
             0x01, 0x00, 0x00, 0x00,  // +1
         ];
 
-        let result = apply_predictor(&input, 2, 4, 1, 4).unwrap();
+        let result = undo_predictor_le(&input, 2, 4, 1, 4).unwrap();
 
         let s0 = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
         let s1 = u32::from_le_bytes([result[4], result[5], result[6], result[7]]);
@@ -2955,7 +2650,7 @@ mod tests {
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // +1
         ];
 
-        let result = apply_predictor(&input, 2, 3, 1, 8).unwrap();
+        let result = undo_predictor_le(&input, 2, 3, 1, 8).unwrap();
 
         // Convert to u64 and verify sample-level accumulation
         let s0 = u64::from_le_bytes([
@@ -2995,7 +2690,7 @@ mod tests {
             0x01, 0x00,  // +1 should wrap to 0
         ];
 
-        let result = apply_predictor(&input, 2, 2, 1, 2).unwrap();
+        let result = undo_predictor_le(&input, 2, 2, 1, 2).unwrap();
 
         let s0 = u16::from_le_bytes([result[0], result[1]]);
         let s1 = u16::from_le_bytes([result[2], result[3]]);
@@ -3026,7 +2721,7 @@ mod tests {
             0xC8, 0x00, 0x02, 0x00, 0x02, 0x00,
         ];
 
-        let result = apply_predictor(&input, 2, 3, 1, 2).unwrap();
+        let result = undo_predictor_le(&input, 2, 3, 1, 2).unwrap();
 
         // Row 1
         let r1s0 = u16::from_le_bytes([result[0], result[1]]);
@@ -3062,7 +2757,7 @@ mod tests {
         // Layout: [pixel0_band0, pixel0_band1, pixel1_band0, pixel1_band1]
         let input: Vec<u8> = vec![10, 20, 1, 2];
 
-        let result = apply_predictor(&input, 2, 2, 2, 1).unwrap();
+        let result = undo_predictor_le(&input, 2, 2, 2, 1).unwrap();
 
         // Per-component accumulation: each band accumulates independently
         // Band 0: result[0] = 10, result[2] = 10 + 1 = 11
@@ -3089,7 +2784,7 @@ mod tests {
             2, 0,    // pixel 1 band 1 = +2
         ];
 
-        let result = apply_predictor(&input, 2, 2, 2, 2).unwrap();
+        let result = undo_predictor_le(&input, 2, 2, 2, 2).unwrap();
 
         // Per-component accumulation: each band accumulates independently
         // Band 0: s[0] = 100, s[2] = 100 + 1 = 101
@@ -3467,6 +3162,14 @@ fn test_best_overview_selection() {
     }
 }
 
+/// [`crate::predictor::undo_predictor`] on a copy of little-endian `data`.
+#[cfg(test)]
+fn undo_predictor_le(data: &[u8], predictor: u16, tile_width: usize, bands: usize, bytes_per_sample: usize) -> AnyResult<Vec<u8>> {
+    let mut data = data.to_vec();
+    crate::predictor::undo_predictor(&mut data, predictor, tile_width, bands, bytes_per_sample, true)?;
+    Ok(data)
+}
+
 /// TEST: Horizontal differencing predictor (predictor=2) for multi-byte samples
 ///
 /// This tests the fix for TIFF predictor=2 which requires sample-level accumulation
@@ -3481,7 +3184,7 @@ fn test_predictor2_multibyte_samples() {
     // Input: [100, 0, 5, 0, 10, 0] represents [100, 5, 10] as u16 (little-endian)
     // After predictor=2: [100, 105, 115]
     let input_16: Vec<u8> = vec![100, 0, 5, 0, 10, 0]; // 3 u16 samples: 100, 5, 10
-    let result_16 = apply_predictor(&input_16, 2, 3, 1, 2).expect("predictor failed");
+    let result_16 = undo_predictor_le(&input_16, 2, 3, 1, 2).expect("predictor failed");
 
     // Verify: first sample unchanged, others accumulated
     let s0 = u16::from_le_bytes([result_16[0], result_16[1]]);
@@ -3499,7 +3202,7 @@ fn test_predictor2_multibyte_samples() {
     input_32.extend_from_slice(&50u32.to_le_bytes());
     input_32.extend_from_slice(&100u32.to_le_bytes());
 
-    let result_32 = apply_predictor(&input_32, 2, 3, 1, 4).expect("predictor failed");
+    let result_32 = undo_predictor_le(&input_32, 2, 3, 1, 4).expect("predictor failed");
 
     let s0_32 = u32::from_le_bytes([result_32[0], result_32[1], result_32[2], result_32[3]]);
     let s1_32 = u32::from_le_bytes([result_32[4], result_32[5], result_32[6], result_32[7]]);
@@ -3515,7 +3218,7 @@ fn test_predictor2_multibyte_samples() {
     input_64.extend_from_slice(&500u64.to_le_bytes());
     input_64.extend_from_slice(&1000u64.to_le_bytes());
 
-    let result_64 = apply_predictor(&input_64, 2, 3, 1, 8).expect("predictor failed");
+    let result_64 = undo_predictor_le(&input_64, 2, 3, 1, 8).expect("predictor failed");
 
     let s0_64 = u64::from_le_bytes(result_64[0..8].try_into().unwrap());
     let s1_64 = u64::from_le_bytes(result_64[8..16].try_into().unwrap());
@@ -3537,7 +3240,7 @@ fn test_predictor2_wrapping_behavior() {
     input.extend_from_slice(&65535u16.to_le_bytes()); // First sample: max u16
     input.extend_from_slice(&1u16.to_le_bytes());     // Delta: +1 (wraps to 0)
 
-    let result = apply_predictor(&input, 2, 2, 1, 2).expect("predictor failed");
+    let result = undo_predictor_le(&input, 2, 2, 1, 2).expect("predictor failed");
 
     let s0 = u16::from_le_bytes([result[0], result[1]]);
     let s1 = u16::from_le_bytes([result[2], result[3]]);
@@ -3550,7 +3253,7 @@ fn test_predictor2_wrapping_behavior() {
     input_32.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
     input_32.extend_from_slice(&2u32.to_le_bytes());
 
-    let result_32 = apply_predictor(&input_32, 2, 2, 1, 4).expect("predictor failed");
+    let result_32 = undo_predictor_le(&input_32, 2, 2, 1, 4).expect("predictor failed");
     let s1_32 = u32::from_le_bytes([result_32[4], result_32[5], result_32[6], result_32[7]]);
     assert_eq!(s1_32, 1, "u32 should wrap: 0xFFFFFFFF + 2 = 1");
 }
@@ -3571,7 +3274,7 @@ fn test_predictor2_multirow() {
     input.extend_from_slice(&5u16.to_le_bytes());
     input.extend_from_slice(&15u16.to_le_bytes());
 
-    let result = apply_predictor(&input, 2, 3, 1, 2).expect("predictor failed");
+    let result = undo_predictor_le(&input, 2, 3, 1, 2).expect("predictor failed");
 
     // Row 1 verification
     let r1_s0 = u16::from_le_bytes([result[0], result[1]]);

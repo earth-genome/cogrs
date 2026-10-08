@@ -30,6 +30,7 @@ pub struct LzwRasterSource {
     samples_per_pixel: usize,
     predictor: u32,
     bytes_per_sample: usize,
+    little_endian: bool,
     is_tiled: bool,
     model_pixel_scale: Option<[f64; 3]>,
     model_tiepoint: Option<[f64; 6]>,
@@ -309,6 +310,7 @@ impl LzwRasterSource {
             samples_per_pixel,
             predictor,
             bytes_per_sample,
+            little_endian: header.little_endian,
             is_tiled,
             model_pixel_scale,
             model_tiepoint,
@@ -393,6 +395,7 @@ impl LzwRasterSource {
             self.samples_per_pixel,
             self.predictor,
             self.bytes_per_sample,
+            self.little_endian,
             tile_index,
         )
     }
@@ -430,6 +433,7 @@ impl LzwRasterSource {
                 samples_per_pixel: self.samples_per_pixel,
                 predictor: self.predictor,
                 bytes_per_sample: self.bytes_per_sample,
+                little_endian: self.little_endian,
             };
 
             for neighbor in neighbors {
@@ -448,6 +452,7 @@ impl LzwRasterSource {
                         cfg.samples_per_pixel,
                         cfg.predictor,
                         cfg.bytes_per_sample,
+                        cfg.little_endian,
                         neighbor,
                     ) {
                         tile_cache::insert_by_path(&cfg.path, neighbor, tile);
@@ -529,135 +534,6 @@ fn try_lzw_decompress(compressed: &[u8], expected_bytes: usize) -> AnyResult<(Ve
     }
 }
 
-fn apply_horizontal_predictor_u8(
-    data: &mut [u8],
-    tile_width: usize,
-    tile_length: usize,
-    samples_per_pixel: usize,
-) {
-    if samples_per_pixel == 0 || tile_width == 0 {
-        return;
-    }
-
-    let stride = tile_width * samples_per_pixel;
-
-    for row in 0..tile_length {
-        let row_start = row * stride;
-        for col in 1..tile_width {
-            let current_base = row_start + col * samples_per_pixel;
-            let previous_base = current_base - samples_per_pixel;
-
-            for sample in 0..samples_per_pixel {
-                let idx = current_base + sample;
-                let prev_idx = previous_base + sample;
-                if idx < data.len() && prev_idx < data.len() {
-                    data[idx] = data[idx].wrapping_add(data[prev_idx]);
-                }
-            }
-        }
-    }
-}
-
-/// Apply horizontal predictor for 16-bit samples.
-/// Each sample is a u16, and accumulation must happen at the sample level.
-fn apply_horizontal_predictor_u16(
-    data: &mut [u8],
-    tile_width: usize,
-    tile_length: usize,
-    samples_per_pixel: usize,
-) {
-    if samples_per_pixel == 0 || tile_width == 0 {
-        return;
-    }
-
-    let samples_per_row = tile_width * samples_per_pixel;
-    let bytes_per_row = samples_per_row * 2;
-
-    for row in 0..tile_length {
-        let row_start = row * bytes_per_row;
-        // Start from sample 1 (sample 0 is the base)
-        for sample_idx in 1..samples_per_row {
-            let curr_offset = row_start + sample_idx * 2;
-            let prev_offset = row_start + (sample_idx - 1) * 2;
-
-            if curr_offset + 1 < data.len() && prev_offset + 1 < data.len() {
-                let prev = u16::from_le_bytes([data[prev_offset], data[prev_offset + 1]]);
-                let curr = u16::from_le_bytes([data[curr_offset], data[curr_offset + 1]]);
-                let sum = curr.wrapping_add(prev);
-                let bytes = sum.to_le_bytes();
-                data[curr_offset] = bytes[0];
-                data[curr_offset + 1] = bytes[1];
-            }
-        }
-    }
-}
-
-/// Apply floating-point predictor (predictor=3).
-/// This uses a two-step process per the Adobe TIFF Technote 3:
-/// 1. Input data is stored "planar" - all MSBs together, then next bytes, etc.
-/// 2. Horizontal differencing is applied within each byte plane
-///
-/// We need to reverse this: undo differencing, then reorder to interleaved.
-fn apply_floating_point_predictor(
-    data: &mut [u8],
-    tile_width: usize,
-    tile_length: usize,
-    samples_per_pixel: usize,
-    bytes_per_sample: usize,
-) {
-    if samples_per_pixel == 0 || tile_width == 0 || bytes_per_sample == 0 {
-        return;
-    }
-
-    let samples_per_row = tile_width * samples_per_pixel;
-    let bytes_per_row = samples_per_row * bytes_per_sample;
-
-    // Step 1: Reverse horizontal differencing on each byte plane
-    for row in 0..tile_length {
-        let row_start = row * bytes_per_row;
-        if row_start + bytes_per_row > data.len() {
-            break;
-        }
-
-        for byte_plane in 0..bytes_per_sample {
-            let plane_start = row_start + byte_plane * samples_per_row;
-            for i in 1..samples_per_row {
-                let idx = plane_start + i;
-                let prev_idx = plane_start + i - 1;
-                if idx < data.len() && prev_idx < data.len() {
-                    data[idx] = data[idx].wrapping_add(data[prev_idx]);
-                }
-            }
-        }
-    }
-
-    // Step 2: Reorder from planar to interleaved
-    // Planar: [B0_s0, B0_s1, ..., B1_s0, B1_s1, ..., B2_s0, ...]
-    // Interleaved: [B0_s0, B1_s0, B2_s0, B3_s0, B0_s1, B1_s1, ...]
-    let mut output = vec![0u8; data.len()];
-    for row in 0..tile_length {
-        let row_start = row * bytes_per_row;
-        if row_start + bytes_per_row > data.len() {
-            break;
-        }
-
-        for sample_idx in 0..samples_per_row {
-            for byte_pos in 0..bytes_per_sample {
-                // Source: planar layout
-                let src_idx = row_start + byte_pos * samples_per_row + sample_idx;
-                // Dest: interleaved layout (big-endian byte order for floats)
-                let dst_idx = row_start + sample_idx * bytes_per_sample + (bytes_per_sample - 1 - byte_pos);
-                if src_idx < data.len() && dst_idx < output.len() {
-                    output[dst_idx] = data[src_idx];
-                }
-            }
-        }
-    }
-
-    // Copy back to original buffer
-    data.copy_from_slice(&output);
-}
-
 #[derive(Clone)]
 struct LzwPrefetchConfig {
     path: PathBuf,
@@ -668,6 +544,7 @@ struct LzwPrefetchConfig {
     samples_per_pixel: usize,
     predictor: u32,
     bytes_per_sample: usize,
+    little_endian: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -680,6 +557,7 @@ fn decompress_lzw_tile(
     samples_per_pixel: usize,
     predictor: u32,
     bytes_per_sample: usize,
+    little_endian: bool,
     tile_index: usize,
 ) -> AnyResult<Arc<Vec<f32>>> {
     if tile_index >= offsets.len() {
@@ -703,35 +581,14 @@ fn decompress_lzw_tile(
     let (mut decompressed, actual_bytes) =
         try_lzw_decompress(&compressed_data, expected_tile_bytes)?;
 
-    match predictor {
-        2 => {
-            match bytes_per_sample {
-                1 => apply_horizontal_predictor_u8(
-                    &mut decompressed,
-                    tile_width,
-                    tile_length,
-                    samples_per_pixel,
-                ),
-                2 => apply_horizontal_predictor_u16(
-                    &mut decompressed,
-                    tile_width,
-                    tile_length,
-                    samples_per_pixel,
-                ),
-                _ => {} // Should not happen due to earlier validation
-            }
-        }
-        3 => {
-            apply_floating_point_predictor(
-                &mut decompressed,
-                tile_width,
-                tile_length,
-                samples_per_pixel,
-                bytes_per_sample,
-            );
-        }
-        _ => {} // predictor=1 means no prediction
-    }
+    crate::predictor::undo_predictor(
+        &mut decompressed,
+        u16::try_from(predictor)?,
+        tile_width,
+        samples_per_pixel,
+        bytes_per_sample,
+        little_endian,
+    )?;
 
     let num_samples = tile_width * tile_length * samples_per_pixel;
     let mut values = vec![f32::NAN; num_samples];
@@ -748,7 +605,8 @@ fn decompress_lzw_tile(
             for (idx, value_out) in values.iter_mut().enumerate().take(valid_samples) {
                 let offset = idx * 2;
                 if offset + 1 < decompressed.len() {
-                    let value = u16::from_le_bytes([decompressed[offset], decompressed[offset + 1]]);
+                    let bytes = [decompressed[offset], decompressed[offset + 1]];
+                    let value = if little_endian { u16::from_le_bytes(bytes) } else { u16::from_be_bytes(bytes) };
                     *value_out = f32::from(value);
                 }
             }
