@@ -58,11 +58,14 @@ let reader = CogReader::open_async("s3://bucket/path/to/file.tif").await?;
 # }
 ```
 
-S3 configuration: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for credentials,
-`AWS_SKIP_SIGNATURE=true` for anonymous access to public buckets, `AWS_ENDPOINT_URL` /
-`AWS_ALLOW_HTTP` for MinIO and other S3-compatible stores. The region is taken from
-`AWS_REGION`, then `AWS_DEFAULT_REGION`; if neither is set it is detected from the bucket
-(once per bucket per process) unless a custom endpoint is configured.
+S3 configuration: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (plus `AWS_SESSION_TOKEN` for
+temporary credentials), `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` (EKS IRSA),
+`AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` (EKS Pod Identity)
+or `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` (ECS) for credentials, falling back to the EC2
+instance metadata service; `AWS_SKIP_SIGNATURE=true` for anonymous access to public buckets,
+`AWS_ENDPOINT_URL` / `AWS_ALLOW_HTTP` for MinIO and other S3-compatible stores. The region is
+taken from `AWS_REGION`, then `AWS_DEFAULT_REGION`; if neither is set it is detected from the
+bucket (once per bucket per process) unless a custom endpoint is configured.
 
 **BigTIFF.** COGs larger than 4 GiB are stored as BigTIFF (TIFF version 43: 8-byte offsets,
 20-byte IFD entries, `LONG8` tile offsets); `CogReader` reads them exactly like classic TIFF

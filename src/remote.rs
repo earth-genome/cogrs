@@ -133,7 +133,9 @@ async fn s3_store_entry(config: &S3Config, options: &IoOptions) -> AnyResult<Arc
         options,
     );
     shared_store(&key, options, || {
-        let mut builder = AmazonS3Builder::new()
+        // `from_env` picks up every credential source object_store knows (session tokens, IRSA,
+        // EKS Pod Identity / ECS container credentials); the explicit `S3Config` below still wins.
+        let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(&config.bucket)
             .with_client_options(client_options(options, config.allow_http))
             .with_retry(retry_config(options));
@@ -149,12 +151,7 @@ async fn s3_store_entry(config: &S3Config, options: &IoOptions) -> AnyResult<Arc
         if let Some(secret_key) = &config.secret_access_key {
             builder = builder.with_secret_access_key(secret_key);
         }
-        if config.allow_http {
-            builder = builder.with_allow_http(true);
-        }
-        if config.skip_signature {
-            builder = builder.with_skip_signature(true);
-        }
+        builder = builder.with_allow_http(config.allow_http).with_skip_signature(config.skip_signature);
         Ok(Arc::new(builder.build()?) as Arc<dyn ObjectStore>)
     })
 }

@@ -9,7 +9,12 @@
 //! # Configuration
 //!
 //! The reader can be configured via environment variables:
-//! - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - AWS credentials
+//! - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN` for temporary
+//!   credentials) - static AWS credentials
+//! - `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` - web identity credentials (EKS IRSA)
+//! - `AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` (EKS Pod
+//!   Identity) or `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` (ECS task roles) - container credentials
+//! - Without any of the above, credentials come from the EC2 instance metadata service
 //! - `AWS_SKIP_SIGNATURE` - Set to "true" for anonymous access to public buckets
 //! - `AWS_REGION`, then `AWS_DEFAULT_REGION` - AWS region. If neither is set (and no custom
 //!   endpoint is configured) the bucket's region is detected with an unauthenticated
