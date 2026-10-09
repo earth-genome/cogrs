@@ -6,8 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `TileExtractor::transform_error` / `Reprojector::transform_error` and `DEFAULT_TRANSFORM_ERROR`
+  (0.01 source pixels): like `gdalwarp -et`, how far the approximate coordinate transform may
+  stray from the exact one; `0.0` transforms every output pixel exactly
+
 ### Changed
 
+- Reprojection from a source CRS other than the output CRS or WGS84 (UTM and other projected
+  sources) transforms a 16 px grid of output pixels exactly and interpolates between its nodes,
+  splitting any grid cell that would err by more than `transform_error` (default 0.01 source
+  pixels) at its centre, instead of transforming every output pixel: a 256x256 nearest tile
+  from UTM takes 1.8 ms instead of 19.6 ms. Nearest-neighbour output differs from the exact
+  transform only for pixels within 0.01 px of a rounding boundary (99.99% identical on the
+  rotated-grid comparison with `gdalwarp -et 0`); bilinear output moves by at most 0.01 px times
+  the local gradient. Pass `transform_error(0.0)` for the previous exact behaviour
+- Resampling is 2-10x faster, with bit-identical output: fetched source tiles are indexed by a
+  dense table instead of a hash map; with a 3857 or 4326 source the nearest-neighbour path
+  precomputes the source column and row of every output column and row and copies runs of
+  samples, bilinear/cubic precompute the taps and weights per output column and row and
+  interpolate straight from the tile when the footprint lies in one tile, the downsampling
+  kernel runs separably (one horizontal pass per source row), and planning marks the needed
+  tiles from the column and row sets rather than per output pixel. Warm 256x256 tiles of the
+  Float32 DEM fixture: nearest 0.23 ms (was 2.35), bilinear 2.7 ms (was 7.0), cubic 3.6 ms
+  (was 14.1); the RGB u8 fixture: 0.41 / 2.6 / 7.1 ms (were 3.7 / 9.2 / 18.9)
+- Batch point queries (`sample_points_*` and their `_async` counterparts) group points by source
+  tile and fetch each tile once (one coalesced request set per 64 tiles on the async path)
+  instead of one read per point; `proj4rs` projection objects are parsed once per EPSG code and
+  shared process-wide (`CoordTransformer::new` and `project_point` no longer parse PROJ strings
+  per call)
+- `CogReader::read_tile`, `read_overview_tile`, `read_tile_with_bytes`,
+  `read_overview_tile_with_bytes`, `read_tile_async` and `read_overview_tile_async` now return
+  `Arc<Vec<f32>>` (or `(Arc<Vec<f32>>, usize)`) instead of cloning the cached tile
+- `flate2` uses the `zlib-rs` backend (pure Rust). Compressed byte streams written by this
+  crate can differ; decoded pixels are unchanged
+- Tile decode for 32-bit sample types inflates and undoes the predictor in the output
+  `Vec<f32>` (no second full-size buffer); other widths reuse a thread-local scratch `Vec<u8>`
+- `LocalRangeReader` keeps the file open and reads with `read_exact_at` on Unix
+- Sparse (zero-length) tiles share one all-NaN `Arc<Vec<f32>>` per tile geometry on the reader
 - Faster tile decoding: undoing the TIFF predictor and converting samples to `f32` now run as
   vectorized loops, using SSE2 on x86_64 for the single-band byte running sum and the
   4-byte floating-point un-shuffle, and scalar loops everywhere else. Decoding a tile end to end,

@@ -1,3 +1,8 @@
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+
+use parking_lot::RwLock;
+
 /// Project a point from one CRS to another using pure Rust (proj4rs + crs-definitions).
 ///
 /// This function handles coordinate transformations between any EPSG codes supported
@@ -84,36 +89,68 @@ pub fn is_geographic_crs(epsg: i32) -> bool {
     }
 }
 
+/// Parsed `proj4rs` definition for one EPSG code, plus whether that CRS is geographic.
+///
+/// `proj4rs::proj::Proj` is `Send + Sync` (plain data + fn pointers; nadgrid refs are `'static`).
+/// [`crate::CoordTransformer::new`] can take `cached_proj(epsg)?.proj.clone()` and
+/// `is_geographic` instead of rebuilding `Proj` per transformer.
+pub(crate) struct ProjDef {
+    pub proj: proj4rs::proj::Proj,
+    pub is_geographic: bool,
+}
+
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<proj4rs::proj::Proj>();
+};
+
+static PROJ_CACHE: LazyLock<RwLock<HashMap<i32, Arc<ProjDef>>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Process-wide cache of [`ProjDef`] keyed by EPSG code.
+///
+/// Building a `proj4rs::Proj` parses the PROJ string on every call; point queries and
+/// [`project_point`] hit the same codes repeatedly. Misses are inserted once; errors are not cached.
+///
+/// # Errors
+/// Returns an error if the EPSG code is missing from crs-definitions or the PROJ string is invalid.
+pub(crate) fn cached_proj(epsg: i32) -> Result<Arc<ProjDef>, String> {
+    if let Some(hit) = PROJ_CACHE.read().get(&epsg) {
+        return Ok(Arc::clone(hit));
+    }
+    let built = Arc::new(build_proj_def(epsg)?);
+    let mut cache = PROJ_CACHE.write();
+    Ok(Arc::clone(cache.entry(epsg).or_insert(built)))
+}
+
+fn build_proj_def(epsg: i32) -> Result<ProjDef, String> {
+    use proj4rs::proj::Proj;
+
+    let proj_str = get_proj_string(epsg)
+        .ok_or_else(|| format!("EPSG:{epsg} not supported (not in the crs-definitions database)"))?;
+    let proj = Proj::from_proj_string(proj_str)
+        .map_err(|e| format!("Invalid projection EPSG:{epsg}: {e:?}"))?;
+    Ok(ProjDef { proj, is_geographic: is_geographic_crs(epsg) })
+}
+
 /// Project using proj4rs with EPSG codes from crs-definitions
 fn project_with_proj4rs(source_epsg: i32, target_epsg: i32, x: f64, y: f64) -> Result<(f64, f64), String> {
-    use proj4rs::proj::Proj;
     use proj4rs::transform::transform;
 
-    let source_str = get_proj_string(source_epsg)
-        .ok_or_else(|| format!("EPSG:{source_epsg} is not in the crs-definitions database"))?;
-    let target_str = get_proj_string(target_epsg)
-        .ok_or_else(|| format!("EPSG:{target_epsg} is not in the crs-definitions database"))?;
-
-    let source_proj = Proj::from_proj_string(source_str)
-        .map_err(|e| format!("Invalid source projection EPSG:{source_epsg}: {e:?}"))?;
-    let target_proj = Proj::from_proj_string(target_str)
-        .map_err(|e| format!("Invalid target projection EPSG:{target_epsg}: {e:?}"))?;
+    let source = cached_proj(source_epsg)?;
+    let target = cached_proj(target_epsg)?;
 
     // proj4rs uses radians for geographic coordinates
-    let source_is_geographic = is_geographic_crs(source_epsg);
-    let (x_in, y_in) = if source_is_geographic {
+    let (x_in, y_in) = if source.is_geographic {
         (x.to_radians(), y.to_radians())
     } else {
         (x, y)
     };
 
     let mut point = (x_in, y_in, 0.0);
-    transform(&source_proj, &target_proj, &mut point)
+    transform(&source.proj, &target.proj, &mut point)
         .map_err(|e| format!("Transform from EPSG:{source_epsg} to EPSG:{target_epsg} failed: {e:?}"))?;
 
-    // Convert back from radians if target is geographic
-    let target_is_geographic = is_geographic_crs(target_epsg);
-    let (out_x, out_y) = if target_is_geographic {
+    let (out_x, out_y) = if target.is_geographic {
         (point.0.to_degrees(), point.1.to_degrees())
     } else {
         (point.0, point.1)

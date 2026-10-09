@@ -24,6 +24,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::cog_reader::{CogReader, TileRef};
 use crate::geometry::projection::project_point;
@@ -220,19 +221,70 @@ impl PointQuery for CogReader {
     }
 
     fn sample_points_crs(&self, crs: i32, points: &[(f64, f64)]) -> AnyResult<Vec<PointQueryResult>> {
-        let mut results = Vec::with_capacity(points.len());
-
-        for &(x, y) in points {
-            results.push(self.sample_crs(crs, x, y)?);
-        }
-
-        Ok(results)
+        self.with_revalidation_sync(|reader| {
+            let (located, unique) = reader.locate_batch(crs, points)?;
+            let mut tiles = HashMap::with_capacity(unique.len());
+            for index in unique {
+                let (tile, _) = reader.read_tile_sync(TileRef { overview: None, index })?;
+                tiles.insert(index, tile);
+            }
+            reader.resolve_batch(crs, located, &tiles)
+        })
     }
 }
+
+/// Pixel and full-resolution tile index of a point, or `None` outside the raster.
+pub(crate) type LocatedSample = Option<((usize, usize), usize)>;
 
 /// Pixel lookup shared by the synchronous [`PointQuery`] implementation and the `*_async`
 /// methods (`sample_*_async` in `point_query_async.rs`): only the tile read differs.
 impl CogReader {
+    /// Pixel and full-resolution tile index for `(x, y)` in `crs`, or `None` if the point is
+    /// outside the raster (same cases as [`Self::empty_point_result`]).
+    pub(crate) fn locate_sample(&self, crs: i32, x: f64, y: f64) -> AnyResult<LocatedSample> {
+        let Some(pixel) = self.locate_pixel(crs, x, y)? else {
+            return Ok(None);
+        };
+        Ok(self.metadata.tile_index_for_pixel(pixel.0, pixel.1).map(|tile_index| (pixel, tile_index)))
+    }
+
+    /// Where each of `points` samples ([`Self::locate_sample`]) and the sorted, de-duplicated
+    /// full-resolution tile indexes they need, so a batch fetches every tile once.
+    pub(crate) fn locate_batch(&self, crs: i32, points: &[(f64, f64)]) -> AnyResult<(Vec<LocatedSample>, Vec<usize>)> {
+        let mut located = Vec::with_capacity(points.len());
+        let mut unique = Vec::new();
+        for &(x, y) in points {
+            let sample = self.locate_sample(crs, x, y)?;
+            if let Some((_, tile_index)) = sample {
+                unique.push(tile_index);
+            }
+            located.push(sample);
+        }
+        unique.sort_unstable();
+        unique.dedup();
+        Ok((located, unique))
+    }
+
+    /// Results for a located batch from its fetched `tiles`, in input order. Out-of-raster points
+    /// stay [`Self::empty_point_result`].
+    pub(crate) fn resolve_batch(
+        &self,
+        crs: i32,
+        located: Vec<LocatedSample>,
+        tiles: &HashMap<usize, Arc<Vec<f32>>>,
+    ) -> AnyResult<Vec<PointQueryResult>> {
+        located
+            .into_iter()
+            .map(|sample| match sample {
+                None => Ok(self.empty_point_result(crs)),
+                Some((pixel, tile_index)) => {
+                    let tile = tiles.get(&tile_index).ok_or("tile missing from batch fetch")?;
+                    Ok(self.point_result(crs, pixel, tile, tile_index))
+                }
+            })
+            .collect()
+    }
+
     /// Source pixel `(x, y)` containing the coordinate `(x, y)` given in `crs`, or `None` if it
     /// lies outside the raster (or the raster has no usable geotransform).
     pub(crate) fn locate_pixel(&self, crs: i32, x: f64, y: f64) -> AnyResult<Option<(usize, usize)>> {

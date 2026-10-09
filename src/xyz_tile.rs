@@ -31,11 +31,10 @@
 //! ```
 
 use std::f64::consts::PI;
-use proj4rs::proj::Proj;
 use proj4rs::transform::transform;
 
 use crate::cog_reader::CogReader;
-use crate::geometry::projection::{get_proj_string, is_geographic_crs};
+use crate::geometry::projection::{cached_proj, is_geographic_crs, ProjDef};
 use crate::tiff_utils::AnyResult;
 
 // Well-known EPSG codes for coordinate reference systems
@@ -354,16 +353,13 @@ impl TransformStrategy {
 /// }
 /// ```
 pub struct CoordTransformer {
-    source_proj: Proj,
-    target_proj: Proj,
+    /// Parsed projections, shared process-wide (see [`cached_proj`]).
+    source: std::sync::Arc<ProjDef>,
+    target: std::sync::Arc<ProjDef>,
     /// EPSG code of the source CRS
     source_epsg: i32,
     /// EPSG code of the target CRS
     target_epsg: i32,
-    /// True if source uses degrees (needs radian conversion)
-    source_is_geographic: bool,
-    /// True if target uses degrees (needs radian conversion)
-    target_is_geographic: bool,
 }
 
 impl std::fmt::Debug for CoordTransformer {
@@ -371,8 +367,8 @@ impl std::fmt::Debug for CoordTransformer {
         f.debug_struct("CoordTransformer")
             .field("source_epsg", &self.source_epsg)
             .field("target_epsg", &self.target_epsg)
-            .field("source_is_geographic", &self.source_is_geographic)
-            .field("target_is_geographic", &self.target_is_geographic)
+            .field("source_is_geographic", &self.source.is_geographic)
+            .field("target_is_geographic", &self.target.is_geographic)
             .finish_non_exhaustive()
     }
 }
@@ -400,24 +396,7 @@ impl CoordTransformer {
     /// }
     /// ```
     pub fn new(source_epsg: i32, target_epsg: i32) -> Result<Self, String> {
-        let source_str = get_proj_string(source_epsg)
-            .ok_or_else(|| format!("EPSG:{source_epsg} not supported"))?;
-        let target_str = get_proj_string(target_epsg)
-            .ok_or_else(|| format!("EPSG:{target_epsg} not supported"))?;
-
-        let source_proj = Proj::from_proj_string(source_str)
-            .map_err(|e| format!("Invalid source projection EPSG:{source_epsg}: {e:?}"))?;
-        let target_proj = Proj::from_proj_string(target_str)
-            .map_err(|e| format!("Invalid target projection EPSG:{target_epsg}: {e:?}"))?;
-
-        Ok(Self {
-            source_proj,
-            target_proj,
-            source_epsg,
-            target_epsg,
-            source_is_geographic: is_geographic_crs(source_epsg),
-            target_is_geographic: is_geographic_crs(target_epsg),
-        })
+        Ok(Self { source: cached_proj(source_epsg)?, target: cached_proj(target_epsg)?, source_epsg, target_epsg })
     }
 
     /// Create a transformer from EPSG:3857 (Web Mercator) to another CRS.
@@ -507,14 +486,14 @@ impl CoordTransformer {
     #[inline]
     #[must_use]
     pub fn source_is_geographic(&self) -> bool {
-        self.source_is_geographic
+        self.source.is_geographic
     }
 
     /// Check if target CRS is geographic (uses degrees).
     #[inline]
     #[must_use]
     pub fn target_is_geographic(&self) -> bool {
-        self.target_is_geographic
+        self.target.is_geographic
     }
 
     /// Transform coordinates from source CRS to target CRS.
@@ -525,26 +504,29 @@ impl CoordTransformer {
     /// Returns an error if the coordinate transformation fails.
     #[inline]
     pub fn transform(&self, x: f64, y: f64) -> Result<(f64, f64), String> {
+        self.transform_raw(x, y).map_err(|e| format!("Transform failed: {e:?}"))
+    }
+
+    /// [`Self::transform`] with proj4rs's own error: the planner calls this per grid node and
+    /// discards failures (points outside the projection's domain), so it must not allocate.
+    #[inline]
+    fn transform_raw(&self, x: f64, y: f64) -> Result<(f64, f64), proj4rs::errors::Error> {
         // Convert to radians if source is geographic
-        let (in_x, in_y) = if self.source_is_geographic {
+        let (in_x, in_y) = if self.source.is_geographic {
             (x.to_radians(), y.to_radians())
         } else {
             (x, y)
         };
 
         let mut point = (in_x, in_y, 0.0);
-
-        transform(&self.source_proj, &self.target_proj, &mut point)
-            .map_err(|e| format!("Transform failed: {e:?}"))?;
+        transform(&self.source.proj, &self.target.proj, &mut point)?;
 
         // Convert from radians to degrees if target is geographic
-        let (out_x, out_y) = if self.target_is_geographic {
+        Ok(if self.target.is_geographic {
             (point.0.to_degrees(), point.1.to_degrees())
         } else {
             (point.0, point.1)
-        };
-
-        Ok((out_x, out_y))
+        })
     }
 
     /// Transform a batch of coordinates for efficiency.
@@ -600,6 +582,8 @@ pub struct TileExtractor<'a> {
     resampling: ResamplingMethod,
     /// Selected bands (None = all bands)
     selected_bands: Option<Vec<usize>>,
+    /// Accepted error of the approximate projection transform, in source pixels (0 = exact).
+    transform_error: f64,
 }
 
 impl std::fmt::Debug for TileExtractor<'_> {
@@ -625,6 +609,7 @@ impl<'a> TileExtractor<'a> {
             output_size: (256, 256),
             resampling: ResamplingMethod::default(),
             selected_bands: None,
+            transform_error: DEFAULT_TRANSFORM_ERROR,
         }
     }
 
@@ -769,6 +754,18 @@ impl<'a> TileExtractor<'a> {
         self
     }
 
+    /// Accepted error, in source pixels, of the approximate coordinate transform used when the
+    /// source CRS is neither the output CRS nor WGS84 under Web Mercator (default
+    /// [`DEFAULT_TRANSFORM_ERROR`], the same idea as `gdalwarp -et`). The transform is evaluated
+    /// on a grid and interpolated between its nodes, splitting cells that would err by more than
+    /// this; `0.0` transforms every output pixel exactly (`gdalwarp -et 0`), which costs about a
+    /// microsecond per pixel.
+    #[must_use]
+    pub fn transform_error(mut self, source_pixels: f64) -> Self {
+        self.transform_error = source_pixels.max(0.0);
+        self
+    }
+
     /// Extract the tile asynchronously with the configured parameters.
     ///
     /// Network reads are awaited without holding a thread (concurrent, coalesced requests for
@@ -779,11 +776,11 @@ impl<'a> TileExtractor<'a> {
     /// Returns an error if bounds were not set, or if tile extraction fails.
     pub async fn extract(self) -> AnyResult<TileData> {
         let bounds = self.bounds.ok_or("Bounds not set: use .xyz() or .bounds()")?;
-        let Self { reader, output_crs, output_size, resampling, selected_bands, .. } = self;
+        let Self { reader, output_crs, output_size, resampling, selected_bands, transform_error, .. } = self;
         // If the object was replaced since the reader was opened, extract again from a fresh open.
         reader
             .with_revalidation(|reader| {
-                Box::pin(extract_tile_async(reader, bounds, output_crs, output_size, resampling, selected_bands.clone()))
+                Box::pin(extract_tile_async(reader, bounds, output_crs, output_size, resampling, selected_bands.clone(), transform_error))
             })
             .await
     }
@@ -936,6 +933,8 @@ pub struct Reprojector<'a> {
     resampling: ResamplingMethod,
     /// Selected bands (None = all bands)
     selected_bands: Option<Vec<usize>>,
+    /// Accepted error of the approximate projection transform, in source pixels (0 = exact).
+    transform_error: f64,
 }
 
 impl std::fmt::Debug for Reprojector<'_> {
@@ -963,6 +962,7 @@ impl<'a> Reprojector<'a> {
             output_size: None,
             resampling: ResamplingMethod::default(),
             selected_bands: None,
+            transform_error: DEFAULT_TRANSFORM_ERROR,
         }
     }
 
@@ -1037,6 +1037,14 @@ impl<'a> Reprojector<'a> {
         self
     }
 
+    /// Accepted error of the approximate coordinate transform in source pixels; see
+    /// [`TileExtractor::transform_error`].
+    #[must_use]
+    pub fn transform_error(mut self, source_pixels: f64) -> Self {
+        self.transform_error = source_pixels.max(0.0);
+        self
+    }
+
     /// Extract the reprojected raster asynchronously.
     ///
     /// # Errors
@@ -1054,6 +1062,7 @@ impl<'a> Reprojector<'a> {
             self.output_size,
             self.resampling,
             self.selected_bands.as_deref(),
+            self.transform_error,
         )
         .await
     }
@@ -1118,6 +1127,7 @@ impl<'a> Reprojector<'a> {
             output_size: self.output_size,
             resampling: self.resampling,
             selected_bands: self.selected_bands,
+            transform_error: self.transform_error,
             chunk_size,
         }
     }
@@ -1201,6 +1211,7 @@ pub struct RasterChunk<'a> {
     resampling: ResamplingMethod,
     /// Selected bands
     selected_bands: Option<Vec<usize>>,
+    transform_error: f64,
 }
 
 impl<'a> RasterChunk<'a> {
@@ -1214,6 +1225,7 @@ impl<'a> RasterChunk<'a> {
             Some(self.dimensions),
             self.resampling,
             self.selected_bands.as_deref(),
+            self.transform_error,
         )
         .await
     }
@@ -1231,6 +1243,7 @@ pub struct StreamingReprojector<'a> {
     output_size: Option<(usize, usize)>,
     resampling: ResamplingMethod,
     selected_bands: Option<Vec<usize>>,
+    transform_error: f64,
     chunk_size: usize,
 }
 
@@ -1330,6 +1343,7 @@ impl<'a> StreamingReprojector<'a> {
                 target_crs,
                 resampling: self.resampling,
                 selected_bands: self.selected_bands.clone(),
+                transform_error: self.transform_error,
             })
         })
     }
@@ -1519,6 +1533,7 @@ impl<'a> StreamingReprojector<'a> {
 
 /// Reproject the raster into `target_crs` (bounds/size/resolution as given or derived). If the
 /// object was replaced since the reader was opened, everything is derived again from a fresh open.
+#[allow(clippy::too_many_arguments)]
 async fn reproject(
     reader: &CogReader,
     target_crs: u32,
@@ -1527,6 +1542,7 @@ async fn reproject(
     output_size: Option<(usize, usize)>,
     resampling: ResamplingMethod,
     selected_bands: Option<&[usize]>,
+    transform_error: f64,
 ) -> Result<ReprojectedRaster, Box<dyn std::error::Error + Send + Sync>> {
     // The retried future must own what it uses: the band list is copied for each attempt.
     let bands = selected_bands.map(<[usize]>::to_vec);
@@ -1542,6 +1558,7 @@ async fn reproject(
                     output_size,
                     resampling,
                     bands.as_deref(),
+                    transform_error,
                 )
                 .await
             })
@@ -1549,6 +1566,7 @@ async fn reproject(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reproject_once(
     reader: &CogReader,
     target_crs: u32,
@@ -1557,6 +1575,7 @@ async fn reproject_once(
     output_size: Option<(usize, usize)>,
     resampling: ResamplingMethod,
     selected_bands: Option<&[usize]>,
+    transform_error: f64,
 ) -> Result<ReprojectedRaster, Box<dyn std::error::Error + Send + Sync>> {
     let metadata = &reader.metadata;
 
@@ -1632,6 +1651,7 @@ async fn reproject_once(
         (width, height),
         resampling,
         Some(bands),
+        transform_error,
     )
     .await?;
 
@@ -1925,8 +1945,147 @@ fn span_ratio(values: &[f64], n: usize) -> f64 {
     if n < 2 || max < min { 1.0 } else { (max - min) / (n - 1) as f64 }
 }
 
+/// Output pixels between the nodes of the transform grid (see [`ApproxTransform`]).
+const APPROX_TRANSFORM_CELL: usize = 16;
+/// Default [`TileExtractor::transform_error`]: the largest accepted difference, in source pixels,
+/// between the interpolated and the exact source position at the centre of a transform grid
+/// cell. `gdalwarp` accepts 0.125 (`-et`); this is tighter so that nearest-neighbour picks the
+/// same source pixel as the exact transform except within 0.01 px of a rounding boundary.
+pub const DEFAULT_TRANSFORM_ERROR: f64 = 0.01;
+
+/// Source position of every output pixel from a projection transform evaluated on a grid.
+///
+/// Like GDAL's approximate transformer: `exact` runs at the nodes of a grid of
+/// [`APPROX_TRANSFORM_CELL`] output pixels, the pixels of a cell are interpolated bilinearly
+/// between its corners, and a cell whose centre interpolates more than `max_error` source pixels
+/// away from the exact position is split in four
+/// (down to exact evaluation of every pixel). A cell with a corner the projection rejects is
+/// evaluated exactly too, so a tile at the edge of a projection's domain keeps its exact `NaN`s.
+/// A 256 px tile of a smooth transform costs 17 x 17 node transforms instead of 65 536.
+struct ApproxTransform<'a, F: Fn(f64, f64) -> Option<(f64, f64)>> {
+    exact: &'a F,
+    max_error: f64,
+    width: usize,
+    xs: &'a mut [f64],
+    ys: &'a mut [f64],
+}
+
+impl<F: Fn(f64, f64) -> Option<(f64, f64)>> ApproxTransform<'_, F> {
+    /// Fill every pixel of the `width` x `height` output; `max_error <= 0` transforms each one
+    /// exactly.
+    #[allow(clippy::cast_precision_loss)]
+    fn fill(&mut self, height: usize) {
+        let (width, cell) = (self.width, APPROX_TRANSFORM_CELL);
+        if width == 0 || height == 0 {
+            return;
+        }
+        // Exact mode, or an output one pixel wide or high (no cells to interpolate across)
+        if self.max_error <= 0.0 || width == 1 || height == 1 {
+            return self.exact_cell(0, width - 1, 0, height - 1);
+        }
+        // Grid node pixel indexes along each axis: every `cell` pixels, plus the last pixel
+        let nodes = |n: usize| -> Vec<usize> {
+            let mut v: Vec<usize> = (0..n).step_by(cell).collect();
+            if v.last() != Some(&(n - 1)) {
+                v.push(n - 1);
+            }
+            v
+        };
+        let (xn, yn) = (nodes(width), nodes(height));
+        let at: Vec<Option<(f64, f64)>> =
+            yn.iter().flat_map(|&y| xn.iter().map(move |&x| (x, y))).map(|(x, y)| (self.exact)(x as f64, y as f64)).collect();
+        for j in 0..yn.len() - 1 {
+            for i in 0..xn.len() - 1 {
+                let corner = |di: usize, dj: usize| at[(j + dj) * xn.len() + i + di];
+                self.cell([xn[i], xn[i + 1]], [yn[j], yn[j + 1]], [corner(0, 0), corner(1, 0), corner(0, 1), corner(1, 1)]);
+            }
+        }
+    }
+
+    fn write(&mut self, x: usize, y: usize, v: Option<(f64, f64)>) {
+        if let Some((sx, sy)) = v {
+            self.xs[y * self.width + x] = sx;
+            self.ys[y * self.width + x] = sy;
+        }
+    }
+
+    /// Fill the pixels `x0..=x1` by `y0..=y1` from the exact source positions `c` of the corners
+    /// (`(x0, y0)`, `(x1, y0)`, `(x0, y1)`, `(x1, y1)`), interpolating where that is accurate.
+    #[allow(clippy::cast_precision_loss)]
+    fn cell(&mut self, [x0, x1]: [usize; 2], [y0, y1]: [usize; 2], c: [Option<(f64, f64)>; 4]) {
+        let (Some(c00), Some(c10), Some(c01), Some(c11)) = (c[0], c[1], c[2], c[3]) else {
+            return self.exact_cell(x0, x1, y0, y1);
+        };
+        if x1 - x0 <= 1 && y1 - y0 <= 1 {
+            self.write(x0, y0, c[0]);
+            self.write(x1, y0, c[1]);
+            self.write(x0, y1, c[2]);
+            self.write(x1, y1, c[3]);
+            return;
+        }
+        let (w, h) = ((x1 - x0) as f64, (y1 - y0) as f64);
+        let lerp = |x: usize, y: usize| {
+            let (tx, ty) = ((x - x0) as f64 / w, (y - y0) as f64 / h);
+            let top = (c00.0 + tx * (c10.0 - c00.0), c00.1 + tx * (c10.1 - c00.1));
+            let bottom = (c01.0 + tx * (c11.0 - c01.0), c01.1 + tx * (c11.1 - c01.1));
+            (top.0 + ty * (bottom.0 - top.0), top.1 + ty * (bottom.1 - top.1))
+        };
+        let (mx, my) = ((x0 + x1) / 2, (y0 + y1) / 2);
+        let centre = (self.exact)(mx as f64, my as f64);
+        let accurate = centre.is_some_and(|(ex, ey)| {
+            let (ix, iy) = lerp(mx, my);
+            (ex - ix).abs() <= self.max_error && (ey - iy).abs() <= self.max_error
+        });
+        if accurate {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let v = lerp(x, y);
+                    self.xs[y * self.width + x] = v.0;
+                    self.ys[y * self.width + x] = v.1;
+                }
+            }
+            return;
+        }
+        // Split in four at the centre (in two along an axis already one pixel wide), reusing
+        // the corners and the centre; the edge midpoints are new nodes.
+        let node = |s: &Self, x: usize, y: usize| (s.exact)(x as f64, y as f64);
+        let (xs, ys): (Vec<usize>, Vec<usize>) = (
+            if x1 - x0 <= 1 { vec![x0, x1] } else { vec![x0, mx, x1] },
+            if y1 - y0 <= 1 { vec![y0, y1] } else { vec![y0, my, y1] },
+        );
+        let value = |s: &Self, x: usize, y: usize| match (x == x0 || x == x1, y == y0 || y == y1) {
+            (true, true) => c[usize::from(x == x1) + 2 * usize::from(y == y1)],
+            (false, false) => centre,
+            _ => node(s, x, y),
+        };
+        let mut corners = Vec::with_capacity(9);
+        for &y in &ys {
+            for &x in &xs {
+                corners.push(value(self, x, y));
+            }
+        }
+        for j in 0..ys.len() - 1 {
+            for i in 0..xs.len() - 1 {
+                let corner = |di: usize, dj: usize| corners[(j + dj) * xs.len() + i + di];
+                self.cell([xs[i], xs[i + 1]], [ys[j], ys[j + 1]], [corner(0, 0), corner(1, 0), corner(0, 1), corner(1, 1)]);
+            }
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn exact_cell(&mut self, x0: usize, x1: usize, y0: usize, y1: usize) {
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let v = (self.exact)(x as f64, y as f64);
+                self.write(x, y, v);
+            }
+        }
+    }
+}
+
 impl SourceMapping {
-    fn new(strategy: &TransformStrategy, extent: &BoundingBox, tile_size: (usize, usize), p: &LevelParams) -> Self {
+    /// `transform_error`: see [`TileExtractor::transform_error`].
+    fn new(strategy: &TransformStrategy, extent: &BoundingBox, tile_size: (usize, usize), p: &LevelParams, transform_error: f64) -> Self {
         let (width, height) = tile_size;
         // Pre-compute inverse scale for speed
         let inv_scale_x = 1.0 / p.scale[0];
@@ -1943,8 +2102,12 @@ impl SourceMapping {
             // corner-based `v`, shifted to pixel-centre coordinates
             Some((origin.1 - world_y) * inv_scale_y - 0.5)
         };
-        let rows: Vec<Option<f64>> =
-            (0..height).map(|out_y| row_coord(out_y).filter(|&v| within_level(v, p.eff_height))).collect();
+        // Per-pixel transforms (`Proj4rs`) never read `rows`: their rows come from `ys`.
+        let rows: Vec<Option<f64>> = if matches!(strategy, TransformStrategy::Proj4rs(_)) {
+            Vec::new()
+        } else {
+            (0..height).map(|out_y| row_coord(out_y).filter(|&v| within_level(v, p.eff_height))).collect()
+        };
 
         let mut per_pixel_ys = None;
         let x = match strategy {
@@ -1961,24 +2124,21 @@ impl SourceMapping {
                 base: (extent.minx + 0.5 * p.out_res_x - origin.0) * inv_scale_x - 0.5,
                 delta: p.out_res_x * inv_scale_x,
             },
-            // Other CRS combinations: one transform per pixel. The transformed point gives both
-            // coordinates; the source row of a pixel depends on its column here (meridian
-            // convergence skews rows by several source pixels across a tile).
-            TransformStrategy::Proj4rs(_) => {
+            // Other CRS combinations: the transformed point gives both coordinates, and the
+            // source row of a pixel depends on its column here (meridian convergence skews rows by
+            // several source pixels across a tile). The transform is evaluated on a grid and
+            // interpolated between the nodes where that is accurate enough (see
+            // [`ApproxTransform`]), not once per pixel.
+            TransformStrategy::Proj4rs(t) => {
+                let exact = |out_x: f64, out_y: f64| -> Option<(f64, f64)> {
+                    let merc_x = extent.minx + (out_x + 0.5) * p.out_res_x;
+                    let merc_y = extent.maxy - (out_y + 0.5) * p.out_res_y;
+                    let (world_x, world_y) = t.transform_raw(merc_x, merc_y).ok()?;
+                    Some(((world_x - origin.0) * inv_scale_x - 0.5, (origin.1 - world_y) * inv_scale_y - 0.5))
+                };
                 let mut xs = vec![f64::NAN; width * height];
                 let mut ys = vec![f64::NAN; width * height];
-                for out_y in 0..height {
-                    #[allow(clippy::cast_precision_loss)]
-                    let merc_y = extent.maxy - (out_y as f64 + 0.5) * p.out_res_y;
-                    for out_x in 0..width {
-                        #[allow(clippy::cast_precision_loss)]
-                        let merc_x = extent.minx + (out_x as f64 + 0.5) * p.out_res_x;
-                        if let Ok((world_x, world_y)) = strategy.transform(merc_x, merc_y) {
-                            xs[out_y * width + out_x] = (world_x - origin.0) * inv_scale_x - 0.5;
-                            ys[out_y * width + out_x] = (origin.1 - world_y) * inv_scale_y - 0.5;
-                        }
-                    }
-                }
+                ApproxTransform { exact: &exact, max_error: transform_error, width, xs: &mut xs, ys: &mut ys }.fill(height);
                 per_pixel_ys = Some(ys);
                 SourceX::PerPixel(xs)
             }
@@ -2049,35 +2209,76 @@ impl SourceMapping {
         };
 
         match &self.x {
-            // Rows and columns are independent: every valid row meets every valid column.
+            // Rows and columns are independent: the needed set is the product of the tile
+            // columns any valid output column touches and the tile rows any valid output row
+            // touches (same union as pairing every valid (x, y), without 65k `tap_span` calls).
             SourceX::Linear { .. } => {
-                let cols: Vec<f64> = (0..width)
-                    .map(|out_x| self.src_x(out_x, 0, width))
-                    .filter(|x| within_level(*x, p.eff_width))
-                    .collect();
-                let mut last = None;
-                for y in self.rows.iter().flatten() {
-                    for &x in &cols {
-                        let span = tile_span(x, *y);
-                        if last != Some(span) {
-                            mark(span);
+                let n_tx = p.eff_tiles_across.max(1);
+                let n_ty = max_tile_count.div_ceil(n_tx);
+                let mut col_hit = vec![false; n_tx];
+                let mut row_hit = vec![false; n_ty];
+                for out_x in 0..width {
+                    let x = self.src_x(out_x, 0, width);
+                    if !within_level(x, p.eff_width) {
+                        continue;
+                    }
+                    let (x0, x1) = tap_span(x, p.eff_width, resampling, kernel.map(|k| k.x));
+                    for tx in x0 / p.eff_tile_width..=x1 / p.eff_tile_width {
+                        if let Some(hit) = col_hit.get_mut(tx) {
+                            *hit = true;
                         }
-                        last = Some(span);
+                    }
+                }
+                for y in self.rows.iter().flatten() {
+                    let (y0, y1) = tap_span(*y, p.eff_height, resampling, kernel.map(|k| k.y));
+                    for ty in y0 / p.eff_tile_height..=y1 / p.eff_tile_height {
+                        if let Some(hit) = row_hit.get_mut(ty) {
+                            *hit = true;
+                        }
+                    }
+                }
+                for (ty, _) in row_hit.iter().enumerate().filter(|(_, h)| **h) {
+                    for (tx, _) in col_hit.iter().enumerate().filter(|(_, h)| **h) {
+                        mark(((tx, tx), (ty, ty)));
                     }
                 }
             }
             SourceX::PerPixel(xs) => {
                 let ys = self.ys.as_deref().expect("per-pixel columns come with per-pixel rows");
-                let mut last = None;
+                // Taps along an axis lie within `reach` of the coordinate (nearest: the rounded
+                // pixel; fixed footprints: 1 or 2; scaled kernels: their radius), so while a pixel
+                // stays `reach` inside the tile rectangle marked last, its taps are in marked
+                // tiles and the span need not be recomputed (two divisions per axis).
+                let reach = |axis: Option<AxisKernel>, support: f64| match (resampling, axis) {
+                    (ResamplingMethod::Nearest, _) => 0.5,
+                    #[allow(clippy::cast_precision_loss)]
+                    (_, Some(axis)) => axis.radius as f64,
+                    _ => support,
+                };
+                let support = if resampling == ResamplingMethod::Bilinear { 1.0 } else { 2.0 };
+                let (reach_x, reach_y) = (reach(kernel.map(|k| k.x), support), reach(kernel.map(|k| k.y), support));
+                let (tw, th) = (p.eff_tile_width as f64, p.eff_tile_height as f64);
+                // Source coordinates safely inside the marked rectangle: `(x_lo, x_hi, y_lo, y_hi)`
+                let mut safe = (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
                 for (x, y) in xs.iter().zip(ys) {
                     if !within_level(*x, p.eff_width) || !within_level(*y, p.eff_height) {
                         continue;
                     }
-                    let span = tile_span(*x, *y);
-                    if last != Some(span) {
-                        mark(span);
+                    if *x >= safe.0 && *x <= safe.1 && *y >= safe.2 && *y <= safe.3 {
+                        continue;
                     }
-                    last = Some(span);
+                    let span = tile_span(*x, *y);
+                    mark(span);
+                    let ((c0, c1), (r0, r1)) = span;
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        safe = (
+                            c0 as f64 * tw + reach_x,
+                            (c1 + 1) as f64 * tw - 1.0 - reach_x,
+                            r0 as f64 * th + reach_y,
+                            (r1 + 1) as f64 * th - 1.0 - reach_y,
+                        );
+                    }
                 }
             }
         }
@@ -2096,16 +2297,17 @@ pub(crate) async fn extract_tile_async(
     tile_size: (usize, usize),
     resampling: ResamplingMethod,
     bands: Option<Vec<usize>>,
+    transform_error: f64,
 ) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
     let source_epsg = reader.metadata.crs_code.and_then(|c| u32::try_from(c).ok()).unwrap_or(EPSG_WEB_MERCATOR);
     let plan = if needs_per_pixel_x(output_crs, source_epsg) {
         // One coordinate transform per output pixel: keep that off the async workers.
         let reader = reader.clone();
-        tokio::task::spawn_blocking(move || plan_extraction(&reader, extent, output_crs, tile_size, resampling, bands))
+        tokio::task::spawn_blocking(move || plan_extraction(&reader, extent, output_crs, tile_size, resampling, bands, transform_error))
             .await
             .map_err(|e| format!("Task join error: {e}"))??
     } else {
-        plan_extraction(reader, extent, output_crs, tile_size, resampling, bands)?
+        plan_extraction(reader, extent, output_crs, tile_size, resampling, bands, transform_error)?
     };
     let fetched = if plan.needed_tiles.is_empty() {
         crate::tile_fetch::FetchedTiles::default()
@@ -2126,6 +2328,7 @@ fn plan_extraction(
     tile_size: (usize, usize),
     resampling: ResamplingMethod,
     bands: Option<Vec<usize>>,
+    transform_error: f64,
 ) -> Result<ExtractionPlan, Box<dyn std::error::Error + Send + Sync>> {
     let metadata = &reader.metadata;
     let geo_transform = &metadata.geo_transform;
@@ -2170,7 +2373,7 @@ fn plan_extraction(
     let overview_idx = reader.best_overview_for_resolution(extent_src_width, extent_src_height);
 
     let params = level_params(reader, &extent, tile_size, overview_idx)?;
-    let mapping = SourceMapping::new(&strategy, &extent, tile_size, &params);
+    let mapping = SourceMapping::new(&strategy, &extent, tile_size, &params, transform_error);
 
     let max_tile_count = if let Some(idx) = overview_idx {
         reader.overviews[idx].tile_offsets.len()
@@ -2192,6 +2395,123 @@ fn plan_extraction(
     })
 }
 
+/// Geometry of source tiles inside a level, for locating a pixel in the dense tile grid.
+struct TileLayout {
+    tile_w: usize,
+    tile_h: usize,
+    tiles_across: usize,
+    source_bands: usize,
+    tw_shift: Option<usize>,
+    th_shift: Option<usize>,
+    tw_mask: usize,
+    th_mask: usize,
+}
+
+impl TileLayout {
+    #[inline]
+    fn locate<'a>(&self, grid: &[Option<&'a [f32]>], px: usize, py: usize) -> Option<(&'a [f32], usize)> {
+        let (tile_col, local_x) = if let Some(shift) = self.tw_shift {
+            (px >> shift, px & self.tw_mask)
+        } else {
+            (px / self.tile_w, px % self.tile_w)
+        };
+        let (tile_row, local_y) = if let Some(shift) = self.th_shift {
+            (py >> shift, py & self.th_mask)
+        } else {
+            (py / self.tile_h, py % self.tile_h)
+        };
+        let tile = *grid.get(tile_row * self.tiles_across + tile_col)?;
+        Some((tile?, (local_y * self.tile_w + local_x) * self.source_bands))
+    }
+
+    #[inline]
+    fn sample(&self, grid: &[Option<&[f32]>], px: usize, py: usize, source_band: usize) -> Option<f32> {
+        let (tile, base) = self.locate(grid, px, py)?;
+        tile.get(base + source_band).copied()
+    }
+
+    #[inline]
+    fn split_x(&self, px: usize) -> (usize, usize) {
+        if let Some(shift) = self.tw_shift {
+            (px >> shift, px & self.tw_mask)
+        } else {
+            (px / self.tile_w, px % self.tile_w)
+        }
+    }
+
+    #[inline]
+    fn split_y(&self, py: usize) -> (usize, usize) {
+        if let Some(shift) = self.th_shift {
+            (py >> shift, py & self.th_mask)
+        } else {
+            (py / self.tile_h, py % self.tile_h)
+        }
+    }
+}
+
+/// Dense index of fetched tiles: `grid[tile_idx]` is the interleaved samples, or `None` if that
+/// tile of the level was not fetched (sparse / outside the needed set).
+fn dense_tile_grid(fetched: &ahash::AHashMap<usize, std::sync::Arc<Vec<f32>>>, tiles_across: usize, tile_h: usize, height: usize) -> Vec<Option<&[f32]>> {
+    let tiles_down = height.div_ceil(tile_h.max(1)).max(1);
+    let n = tiles_across.saturating_mul(tiles_down).max(fetched.keys().copied().max().map_or(0, |m| m + 1));
+    let mut grid = vec![None; n];
+    for (&idx, data) in fetched {
+        if let Some(slot) = grid.get_mut(idx) {
+            *slot = Some(data.as_slice());
+        }
+    }
+    grid
+}
+
+/// A tap's column/row: edge pixels are replicated outside the level, except for `Cubic`, where
+/// GDAL treats a 4x4 window that leaves the level as unusable.
+#[inline]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+fn axis_tap(resampling: ResamplingMethod, i: isize, size: usize) -> Option<usize> {
+    if resampling == ResamplingMethod::Cubic {
+        (0..size as isize).contains(&i).then_some(i as usize)
+    } else {
+        Some(i.max(0).min(size as isize - 1) as usize)
+    }
+}
+
+/// Fixed-footprint taps and fractional offset along one axis of an output pixel.
+#[derive(Clone, Copy)]
+struct AxisFootprint {
+    frac: f64,
+    nearest: usize,
+    taps: [(Option<usize>, f64); 4],
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::needless_range_loop)]
+fn axis_footprint(v: f64, size: usize, resampling: ResamplingMethod, weight: fn(f64) -> f64) -> AxisFootprint {
+    let nearest = if size == 0 {
+        0
+    } else {
+        // Same expressions as the previous per-pixel path: y used `round` then f64 clamp; x used
+        // `round` to `isize` then clamp. They agree for in-level coordinates; keep the isize form
+        // (what the column used) for both here — `nearest_pixel` is that y form and matches after
+        // `within_level`.
+        let n = v.round() as isize;
+        n.max(0).min(size as isize - 1) as usize
+    };
+    let origin = v.floor() as isize;
+    let frac = v - origin as f64;
+    let (first, count) = if resampling == ResamplingMethod::Bilinear { (0, 2) } else { (-1, 4) };
+    let mut taps = [(None, 0.0f64); 4];
+    for k in 0..count {
+        let i = first + k as isize;
+        let d = i as f64;
+        let w = match (resampling, k) {
+            (ResamplingMethod::Bilinear, 0) => 1.0 - frac,
+            (ResamplingMethod::Bilinear, _) => frac,
+            _ => weight(d - frac),
+        };
+        taps[k] = (axis_tap(resampling, origin + i, size), w);
+    }
+    AxisFootprint { frac, nearest, taps }
+}
+
 /// Phase 3: resample the fetched source tiles into the output tile.
 #[allow(clippy::too_many_lines)]
 fn render_extraction(
@@ -2210,8 +2530,6 @@ fn render_extraction(
     let LevelParams { eff_width, eff_height, eff_tile_width, eff_tile_height, eff_tiles_across, .. } =
         level_params(reader, extent_3857, plan.tile_size, overview_idx)?;
 
-    // Pre-compute bit shifts for fast division if tile sizes are powers of 2
-    // This avoids expensive div/mod in the inner loop
     let tile_width_shift = if eff_tile_width.is_power_of_two() {
         Some(eff_tile_width.trailing_zeros() as usize)
     } else {
@@ -2222,8 +2540,16 @@ fn render_extraction(
     } else {
         None
     };
-    let tile_width_mask = eff_tile_width - 1;
-    let tile_height_mask = eff_tile_height - 1;
+    let layout = TileLayout {
+        tile_w: eff_tile_width,
+        tile_h: eff_tile_height,
+        tiles_across: eff_tiles_across,
+        source_bands: metadata.bands,
+        tw_shift: tile_width_shift,
+        th_shift: tile_height_shift,
+        tw_mask: eff_tile_width.saturating_sub(1),
+        th_mask: eff_tile_height.saturating_sub(1),
+    };
 
     // Output entirely outside the COG: a tile of fill (nodata, or NaN if none declared)
     if plan.needed_tiles.is_empty() {
@@ -2246,45 +2572,16 @@ fn render_extraction(
     let crate::tile_fetch::FetchedTiles { tiles: tile_data_cache, bytes_fetched: total_bytes_fetched, tiles_read: tiles_actually_read } =
         fetched;
 
-    // Determine output bands: selected or all
     let source_bands = metadata.bands;
     let output_bands: Vec<usize> = selected_bands.map_or_else(|| (0..source_bands).collect(), <[usize]>::to_vec);
     let num_output_bands = output_bands.len();
     let mut pixel_data = vec![fill; tile_size_x * tile_size_y * num_output_bands];
 
     let mapping = &plan.mapping;
-    // Per output band of the current pixel: the fixed-footprint interpolation found an invalid tap
-    let mut pending = vec![false; num_output_bands];
+    let grid = dense_tile_grid(&tile_data_cache, eff_tiles_across, eff_tile_height, eff_height);
 
-    // Helper to locate a pixel in the cached tile data: its tile and the offset of its first band
-    // Uses bit shifts for power-of-2 tile sizes (common case: 256, 512)
-    let locate = |px: usize, py: usize| -> Option<(&[f32], usize)> {
-        // Fast path: use bit shifts for power-of-2 tile sizes
-        let (tile_col, local_x) = if let Some(shift) = tile_width_shift {
-            (px >> shift, px & tile_width_mask)
-        } else {
-            (px / eff_tile_width, px % eff_tile_width)
-        };
-
-        let (tile_row, local_y) = if let Some(shift) = tile_height_shift {
-            (py >> shift, py & tile_height_mask)
-        } else {
-            (py / eff_tile_height, py % eff_tile_height)
-        };
-
-        let tile_idx = tile_row * eff_tiles_across + tile_col;
-        let tile_data = tile_data_cache.get(&tile_idx)?;
-        Some((tile_data.as_slice(), (local_y * eff_tile_width + local_x) * source_bands))
-    };
-    // Helper to sample a pixel; band is the SOURCE band index (not output band index)
-    let sample_pixel = |px: usize, py: usize, source_band: usize| -> Option<f32> {
-        let (tile, base) = locate(px, py)?;
-        tile.get(base + source_band).copied()
-    };
-
-    // Downsampling with bilinear/bicubic: the scaled kernel reads whole source footprints
     let mut scaled = plan.kernel.map(|kernel| ScaledSampler {
-        tiles: &tile_data_cache,
+        grid: &grid,
         resampling,
         kernel,
         size: (eff_width, eff_height),
@@ -2304,153 +2601,43 @@ fn render_extraction(
         centre_invalid: false,
     });
 
-    // Source row/column of every output pixel come from the plan (the same coordinates that
-    // decided which source tiles were fetched).
-
-    // Sample each output pixel
-    // Note: We use range loop because out_y is needed for out_idx calculation, not just indexing
-    #[allow(clippy::needless_range_loop)]
-    for out_y in 0..tile_size_y {
-        for out_x in 0..tile_size_x {
-            let src_pixel_x = mapping.src_x(out_x, out_y, tile_size_x);
-            // Same test as planning (NaN: no source column)
-            if !within_level(src_pixel_x, eff_width) {
-                continue;
-            }
-
-            // Source row of this pixel (per pixel for skewed transforms, else per row)
-            let src_pixel_y = mapping.src_y(out_x, out_y, tile_size_x);
-            if !within_level(src_pixel_y, eff_height) {
-                continue;
-            }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-            let src_pixel_y_nearest = src_pixel_y.round().max(0.0).min(eff_height as f64 - 1.0) as usize;
-            #[allow(clippy::cast_possible_truncation)]
-            let y0_floor = src_pixel_y.floor() as isize;
-
-            let out_idx = (out_y * tile_size_x + out_x) * num_output_bands;
-
+    match &mapping.x {
+        SourceX::Linear { .. } => {
             if let Some(sampler) = scaled.as_mut() {
-                sampler.sample(src_pixel_x, src_pixel_y, &mut pixel_data[out_idx..out_idx + num_output_bands]);
-                continue;
-            }
-
-            // Nearest source pixel column (also what a nodata kernel centre passes through)
-            #[allow(clippy::cast_possible_truncation)]
-            let src_px_int = src_pixel_x.round() as isize;
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-            let src_px_clamped = src_px_int.max(0).min(eff_width as isize - 1) as usize;
-
-            // Sample each band using the configured resampling method
-            match resampling {
-                ResamplingMethod::Nearest => {
-                    for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
-                        if let Some(value) = sample_pixel(src_px_clamped, src_pixel_y_nearest, source_band) {
-                            pixel_data[out_idx + out_band_idx] = value;
-                        }
-                    }
-                }
-                ResamplingMethod::Bilinear | ResamplingMethod::Bicubic | ResamplingMethod::Cubic => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let x0 = src_pixel_x.floor() as isize;
-                    #[allow(clippy::cast_precision_loss)]
-                    let (fx, fy) = (src_pixel_x - x0 as f64, src_pixel_y - y0_floor as f64);
-
-                    // A tap's column/row: edge pixels are replicated outside the level, except for
-                    // `Cubic`, where GDAL treats a 4x4 window that leaves the level as unusable.
-                    let axis_tap = |i: isize, size: usize| -> Option<usize> {
-                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-                        if resampling == ResamplingMethod::Cubic {
-                            (0..size as isize).contains(&i).then_some(i as usize)
-                        } else {
-                            Some(i.max(0).min(size as isize - 1) as usize)
-                        }
-                    };
-                    let weight = cubic_family_weight(resampling);
-                    // Bilinear: columns x0, x0 + 1; the cubic kernels: x0 - 1 ..= x0 + 2
-                    let (first, count) = if resampling == ResamplingMethod::Bilinear { (0, 2) } else { (-1, 4) };
-                    let mut cols = [(None, 0.0f64); 4];
-                    let mut rows = [(None, 0.0f64); 4];
-                    for k in 0..count {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let i = first + k as isize;
-                        #[allow(clippy::cast_precision_loss)]
-                        let d = i as f64;
-                        let (wx, wy) = match (resampling, k) {
-                            (ResamplingMethod::Bilinear, 0) => (1.0 - fx, 1.0 - fy),
-                            (ResamplingMethod::Bilinear, _) => (fx, fy),
-                            _ => (weight(d - fx), weight(d - fy)),
-                        };
-                        cols[k] = (axis_tap(x0 + i, eff_width), wx);
-                        rows[k] = (axis_tap(y0_floor + i, eff_height), wy);
-                    }
-
-                    // Where each tap lives (one tile lookup per tap, not per band) and its weight
-                    let taps_per_axis = count;
-                    let mut at = [None; 16];
-                    let mut weights = [0.0f32; 16];
-                    let mut n = 0;
-                    for &(col, wx) in &cols[..taps_per_axis] {
-                        for &(row, wy) in &rows[..taps_per_axis] {
-                            if let (Some(c), Some(r)) = (col, row) {
-                                at[n] = locate(c, r);
-                            }
-                            #[allow(clippy::cast_possible_truncation)]
-                            {
-                                weights[n] = (wx * wy) as f32;
-                            }
-                            n += 1;
-                        }
-                    }
-                    let value = |tap: usize, band: usize| at[tap].and_then(|(tile, base)| tile.get(base + band).copied());
-                    // Taps are in (x, y) order; the bilinear ones are v00, v10, v01, v11: the 2x2
-                    // itself, or the four around (x0, y0) inside the 4x4
-                    let core = if n == 4 { [0, 2, 1, 3] } else { [5, 9, 6, 10] };
-
-                    // Every tap valid: the plain formula; any invalid tap in any band: see below
-                    let mut any_pending = false;
-                    for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
-                        let interpolated = if n == 4 {
-                            #[allow(clippy::cast_possible_truncation)]
-                            bilinear_if_valid(core.map(|t| value(t, source_band)), fx as f32, fy as f32, nodata_f32)
-                        } else {
-                            let mut values = [None; 16];
-                            for (t, v) in values.iter_mut().enumerate() {
-                                *v = value(t, source_band);
-                            }
-                            cubic_if_valid(&values, &weights, nodata_f32, fill)
-                        };
-                        pending[out_band_idx] = interpolated.is_none();
-                        any_pending |= interpolated.is_none();
-                        if let Some(v) = interpolated {
-                            pixel_data[out_idx + out_band_idx] = v;
-                        }
-                    }
-                    if any_pending {
-                        // Some tap is missing, NaN or nodata. GDAL (`GWKGeneralCase`/`GWKRealCase`):
-                        // a pixel whose own source pixel is nodata in every band is not written;
-                        // otherwise each band is interpolated over its valid taps.
-                        let centre_invalid = output_bands.iter().all(|&band| {
-                            !sample_pixel(src_px_clamped, src_pixel_y_nearest, band).is_some_and(|v| !is_invalid_sample(v, nodata_f32))
-                        });
-                        for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
-                            if !pending[out_band_idx] {
-                                continue;
-                            }
-                            pixel_data[out_idx + out_band_idx] = if centre_invalid {
-                                sample_pixel(src_px_clamped, src_pixel_y_nearest, source_band).unwrap_or(fill)
-                            } else {
-                                bilinear_renormalised(core.map(|t| value(t, source_band)), fx, fy, nodata_f32).unwrap_or(fill)
-                            };
-                        }
-                    }
-                }
+                sampler.render_linear(mapping, (tile_size_x, tile_size_y), &mut pixel_data);
+            } else if resampling == ResamplingMethod::Nearest {
+                render_nearest_linear(mapping, &grid, &layout, (tile_size_x, tile_size_y), (eff_width, eff_height), &output_bands, &mut pixel_data);
+            } else {
+                render_fixed_linear(
+                    mapping,
+                    &grid,
+                    &layout,
+                    (tile_size_x, tile_size_y),
+                    (eff_width, eff_height),
+                    resampling,
+                    &output_bands,
+                    nodata_f32,
+                    fill,
+                    &mut pixel_data,
+                );
             }
         }
+        SourceX::PerPixel(_) => {
+            render_per_pixel(
+                mapping,
+                &grid,
+                &layout,
+                (tile_size_x, tile_size_y),
+                (eff_width, eff_height),
+                resampling,
+                &output_bands,
+                nodata_f32,
+                fill,
+                scaled.as_mut(),
+                &mut pixel_data,
+            );
+        }
     }
-
-    // Drop the closures
-    let _ = (locate, sample_pixel);
 
     Ok(TileData {
         pixels: pixel_data,
@@ -2462,6 +2649,355 @@ fn render_extraction(
         overview_used: overview_idx,
         nodata: metadata.nodata,
     })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss, clippy::cast_possible_wrap, clippy::needless_range_loop)]
+fn render_nearest_linear(
+    mapping: &SourceMapping,
+    grid: &[Option<&[f32]>],
+    layout: &TileLayout,
+    tile_size: (usize, usize),
+    level: (usize, usize),
+    output_bands: &[usize],
+    pixel_data: &mut [f32],
+) {
+    let (width, height) = tile_size;
+    let (eff_width, eff_height) = level;
+    let n_bands = output_bands.len();
+    let mut cols: Vec<Option<(usize, usize)>> = vec![None; width];
+    for (out_x, slot) in cols.iter_mut().enumerate() {
+        let src_x = mapping.src_x(out_x, 0, width);
+        if !within_level(src_x, eff_width) {
+            continue;
+        }
+        let src_px_int = src_x.round() as isize;
+        let px = src_px_int.max(0).min(eff_width as isize - 1) as usize;
+        *slot = Some(layout.split_x(px));
+    }
+    let mut rows: Vec<Option<(usize, usize)>> = vec![None; height];
+    for (out_y, slot) in rows.iter_mut().enumerate() {
+        let Some(src_y) = mapping.rows[out_y] else { continue };
+        let py = src_y.round().max(0.0).min(eff_height as f64 - 1.0) as usize;
+        *slot = Some(layout.split_y(py));
+    }
+    for (out_y, row) in rows.iter().enumerate() {
+        let Some((tile_row, local_y)) = *row else { continue };
+        let mut out_x = 0;
+        while out_x < width {
+            let Some((tile_col, _)) = cols[out_x] else {
+                out_x += 1;
+                continue;
+            };
+            let mut end = out_x + 1;
+            while end < width {
+                match cols[end] {
+                    Some((c, _)) if c == tile_col => end += 1,
+                    _ => break,
+                }
+            }
+            let Some(tile) = grid.get(tile_row * layout.tiles_across + tile_col).copied().flatten() else {
+                out_x = end;
+                continue;
+            };
+            for x in out_x..end {
+                let local_x = cols[x].expect("run members have a column").1;
+                let base = (local_y * layout.tile_w + local_x) * layout.source_bands;
+                let out_idx = (out_y * width + x) * n_bands;
+                for (ob, &sb) in output_bands.iter().enumerate() {
+                    if let Some(&v) = tile.get(base + sb) {
+                        pixel_data[out_idx + ob] = v;
+                    }
+                }
+            }
+            out_x = end;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
+fn render_fixed_linear(
+    mapping: &SourceMapping,
+    grid: &[Option<&[f32]>],
+    layout: &TileLayout,
+    tile_size: (usize, usize),
+    level: (usize, usize),
+    resampling: ResamplingMethod,
+    output_bands: &[usize],
+    nodata: Option<f32>,
+    fill: f32,
+    pixel_data: &mut [f32],
+) {
+    let (width, height) = tile_size;
+    let (eff_width, eff_height) = level;
+    let n_bands = output_bands.len();
+    let count = if resampling == ResamplingMethod::Bilinear { 2 } else { 4 };
+    let weight = cubic_family_weight(resampling);
+    let mut cols: Vec<Option<AxisFootprint>> = vec![None; width];
+    for (out_x, slot) in cols.iter_mut().enumerate() {
+        let src_x = mapping.src_x(out_x, 0, width);
+        if !within_level(src_x, eff_width) {
+            continue;
+        }
+        *slot = Some(axis_footprint(src_x, eff_width, resampling, weight));
+    }
+    let mut rows: Vec<Option<AxisFootprint>> = vec![None; height];
+    for (out_y, slot) in rows.iter_mut().enumerate() {
+        let Some(src_y) = mapping.rows[out_y] else { continue };
+        *slot = Some(axis_footprint(src_y, eff_height, resampling, weight));
+    }
+    // Per output column/row: the tile and local offsets of its taps when they all lie in one
+    // tile column/row (the common case away from tile borders), for the single-tile fast path.
+    let in_one_tile = |axis: &AxisFootprint, split: &dyn Fn(usize) -> (usize, usize)| -> Option<(usize, [usize; 4])> {
+        let mut tile = None;
+        let mut local = [0; 4];
+        for (k, &(tap, _)) in axis.taps[..count].iter().enumerate() {
+            let (t, l) = split(tap?);
+            if *tile.get_or_insert(t) != t {
+                return None;
+            }
+            local[k] = l;
+        }
+        Some((tile?, local))
+    };
+    let col_tiles: Vec<Option<(usize, [usize; 4])>> =
+        cols.iter().map(|c| c.as_ref().and_then(|c| in_one_tile(c, &|px| layout.split_x(px)))).collect();
+    let row_tiles: Vec<Option<(usize, [usize; 4])>> =
+        rows.iter().map(|r| r.as_ref().and_then(|r| in_one_tile(r, &|py| layout.split_y(py)))).collect();
+
+    let mut pending = vec![false; n_bands];
+    let mut values = [0.0f32; 16];
+    let mut weights = [0.0f32; 16];
+    for (out_y, row) in rows.iter().enumerate() {
+        let Some(row) = row else { continue };
+        for (out_x, col) in cols.iter().enumerate() {
+            let Some(col) = col else { continue };
+            let out_idx = (out_y * width + out_x) * n_bands;
+            let out = &mut pixel_data[out_idx..out_idx + n_bands];
+            // Fast path: every tap in one fetched tile and valid in every band; same taps,
+            // weights and summation order as `apply_fixed_footprint`.
+            if let (Some((tile_col, lx)), Some((tile_row, ly))) = (col_tiles[out_x], row_tiles[out_y])
+                && let Some(tile) = grid.get(tile_row * layout.tiles_across + tile_col).copied().flatten()
+                && interpolate_in_tile(tile, layout, col, row, &lx, &ly, count, output_bands, nodata, fill, &mut values, &mut weights, out)
+            {
+                continue;
+            }
+            apply_fixed_footprint(grid, layout, col, row, count, output_bands, nodata, fill, &mut pending, out);
+        }
+    }
+}
+
+/// The fixed-footprint interpolation of one output pixel whose taps (local columns `lx`, rows
+/// `ly`, all inside `tile`) are valid in every output band, written to `out`; `false` (nothing
+/// written) when any tap is `NaN`/nodata, which the general path then resolves.
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+#[inline]
+fn interpolate_in_tile(
+    tile: &[f32],
+    layout: &TileLayout,
+    col: &AxisFootprint,
+    row: &AxisFootprint,
+    lx: &[usize; 4],
+    ly: &[usize; 4],
+    count: usize,
+    output_bands: &[usize],
+    nodata: Option<f32>,
+    fill: f32,
+    values: &mut [f32; 16],
+    weights: &mut [f32; 16],
+    out: &mut [f32],
+) -> bool {
+    let (tw, bands) = (layout.tile_w, layout.source_bands);
+    let Some(&last_ly) = ly[..count].iter().max() else { return false };
+    let Some(&last_lx) = lx[..count].iter().max() else { return false };
+    // One bounds check for the whole footprint (taps are within the tile by construction)
+    if (last_ly * tw + last_lx) * bands + output_bands.iter().copied().max().unwrap_or(0) >= tile.len() {
+        return false;
+    }
+    if count == 2 {
+        let (fx, fy) = (col.frac as f32, row.frac as f32);
+        let rows = [ly[0] * tw, ly[1] * tw];
+        for (ob, &sb) in output_bands.iter().enumerate() {
+            let at = |r: usize, c: usize| tile[(rows[r] + lx[c]) * bands + sb];
+            // v00, v10, v01, v11
+            let Some(v) = bilinear_loaded([at(0, 0), at(0, 1), at(1, 0), at(1, 1)], fx, fy, nodata) else {
+                return false;
+            };
+            out[ob] = v;
+        }
+        return true;
+    }
+    let mut n = 0;
+    for &(_, wx) in &col.taps[..4] {
+        for &(_, wy) in &row.taps[..4] {
+            weights[n] = (wx * wy) as f32;
+            n += 1;
+        }
+    }
+    for (ob, &sb) in output_bands.iter().enumerate() {
+        let mut n = 0;
+        for &cx in &lx[..4] {
+            for &ry in &ly[..4] {
+                values[n] = tile[(ry * tw + cx) * bands + sb];
+                n += 1;
+            }
+        }
+        let Some(v) = cubic_loaded(values, weights, nodata, fill) else {
+            return false;
+        };
+        out[ob] = v;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
+fn apply_fixed_footprint(
+    grid: &[Option<&[f32]>],
+    layout: &TileLayout,
+    col: &AxisFootprint,
+    row: &AxisFootprint,
+    count: usize,
+    output_bands: &[usize],
+    nodata: Option<f32>,
+    fill: f32,
+    pending: &mut [bool],
+    out: &mut [f32],
+) {
+    let mut at = [None; 16];
+    let mut weights = [0.0f32; 16];
+    let mut n = 0;
+    for &(c, wx) in &col.taps[..count] {
+        for &(r, wy) in &row.taps[..count] {
+            if let (Some(c), Some(r)) = (c, r) {
+                at[n] = layout.locate(grid, c, r);
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                weights[n] = (wx * wy) as f32;
+            }
+            n += 1;
+        }
+    }
+    let fx = col.frac;
+    let fy = row.frac;
+    let core = if n == 4 { [0, 2, 1, 3] } else { [5, 9, 6, 10] };
+    let all_located = at[..n].iter().all(Option::is_some);
+    let mut any_pending = false;
+    for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
+        let interpolated = if !all_located {
+            None
+        } else if n == 4 {
+            let mut loaded = [0.0f32; 4];
+            let mut missing = false;
+            for (i, &t) in core.iter().enumerate() {
+                match at[t].and_then(|(tile, base)| tile.get(base + source_band).copied()) {
+                    Some(v) => loaded[i] = v,
+                    None => {
+                        missing = true;
+                        break;
+                    }
+                }
+            }
+            if missing { None } else { bilinear_loaded(loaded, fx as f32, fy as f32, nodata) }
+        } else {
+            let mut values = [0.0f32; 16];
+            let mut missing = false;
+            for (t, slot) in values.iter_mut().enumerate() {
+                match at[t].and_then(|(tile, base)| tile.get(base + source_band).copied()) {
+                    Some(v) => *slot = v,
+                    None => {
+                        missing = true;
+                        break;
+                    }
+                }
+            }
+            if missing { None } else { cubic_loaded(&values, &weights, nodata, fill) }
+        };
+        pending[out_band_idx] = interpolated.is_none();
+        any_pending |= interpolated.is_none();
+        if let Some(v) = interpolated {
+            out[out_band_idx] = v;
+        }
+    }
+    if any_pending {
+        let centre_invalid = output_bands.iter().all(|&band| {
+            !layout.sample(grid, col.nearest, row.nearest, band).is_some_and(|v| !is_invalid_sample(v, nodata))
+        });
+        let value = |tap: usize, band: usize| at[tap].and_then(|(tile, base)| tile.get(base + band).copied());
+        for (out_band_idx, &source_band) in output_bands.iter().enumerate() {
+            if !pending[out_band_idx] {
+                continue;
+            }
+            out[out_band_idx] = if centre_invalid {
+                layout.sample(grid, col.nearest, row.nearest, source_band).unwrap_or(fill)
+            } else {
+                bilinear_renormalised(core.map(|t| value(t, source_band)), fx, fy, nodata).unwrap_or(fill)
+            };
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::needless_range_loop)]
+fn render_per_pixel(
+    mapping: &SourceMapping,
+    grid: &[Option<&[f32]>],
+    layout: &TileLayout,
+    tile_size: (usize, usize),
+    level: (usize, usize),
+    resampling: ResamplingMethod,
+    output_bands: &[usize],
+    nodata: Option<f32>,
+    fill: f32,
+    mut scaled: Option<&mut ScaledSampler<'_>>,
+    pixel_data: &mut [f32],
+) {
+    let (width, height) = tile_size;
+    let (eff_width, eff_height) = level;
+    let n_bands = output_bands.len();
+    let mut pending = vec![false; n_bands];
+    let weight = cubic_family_weight(resampling);
+    for out_y in 0..height {
+        for out_x in 0..width {
+            let src_pixel_x = mapping.src_x(out_x, out_y, width);
+            if !within_level(src_pixel_x, eff_width) {
+                continue;
+            }
+            let src_pixel_y = mapping.src_y(out_x, out_y, width);
+            if !within_level(src_pixel_y, eff_height) {
+                continue;
+            }
+            let out_idx = (out_y * width + out_x) * n_bands;
+            if let Some(sampler) = scaled.as_mut() {
+                sampler.sample(src_pixel_x, src_pixel_y, &mut pixel_data[out_idx..out_idx + n_bands]);
+                continue;
+            }
+            if resampling == ResamplingMethod::Nearest {
+                let (px, py) = (nearest_pixel(src_pixel_x, eff_width), nearest_pixel(src_pixel_y, eff_height));
+                if let Some((tile, base)) = layout.locate(grid, px, py) {
+                    for (ob, &sb) in output_bands.iter().enumerate() {
+                        if let Some(&v) = tile.get(base + sb) {
+                            pixel_data[out_idx + ob] = v;
+                        }
+                    }
+                }
+                continue;
+            }
+            let col = axis_footprint(src_pixel_x, eff_width, resampling, weight);
+            let row = axis_footprint(src_pixel_y, eff_height, resampling, weight);
+            let count = if resampling == ResamplingMethod::Bilinear { 2 } else { 4 };
+            apply_fixed_footprint(
+                grid,
+                layout,
+                &col,
+                &row,
+                count,
+                output_bands,
+                nodata,
+                fill,
+                &mut pending,
+                &mut pixel_data[out_idx..out_idx + n_bands],
+            );
+        }
+    }
 }
 
 /// Value used for output pixels that have no source data: the COG's declared
@@ -2490,19 +3026,27 @@ fn valid_tap(tap: Option<f32>, nodata: Option<f32>) -> Option<f32> {
     tap.filter(|&v| !is_invalid_sample(v, nodata))
 }
 
-/// Bilinear interpolation over taps `[v00, v10, v01, v11]` (x then y order) when all four are
-/// usable, `None` otherwise (see [`bilinear_renormalised`]).
 #[inline]
-fn bilinear_if_valid(taps: [Option<f32>; 4], weight_x: f32, weight_y: f32, nodata: Option<f32>) -> Option<f32> {
-    let [Some(v00), Some(v10), Some(v01), Some(v11)] = taps.map(|t| valid_tap(t, nodata)) else {
+fn bilinear_formula(v00: f32, v10: f32, v01: f32, v11: f32, weight_x: f32, weight_y: f32) -> f32 {
+    v00 * (1.0 - weight_x) * (1.0 - weight_y)
+        + v10 * weight_x * (1.0 - weight_y)
+        + v01 * (1.0 - weight_x) * weight_y
+        + v11 * weight_x * weight_y
+}
+
+/// Bilinear interpolation over taps `[v00, v10, v01, v11]` (x then y order) when all four are
+/// usable (neither `NaN` nor nodata), `None` otherwise (see [`bilinear_renormalised`]).
+#[inline]
+fn bilinear_loaded(taps: [f32; 4], weight_x: f32, weight_y: f32, nodata: Option<f32>) -> Option<f32> {
+    let [v00, v10, v01, v11] = taps;
+    if is_invalid_sample(v00, nodata)
+        || is_invalid_sample(v10, nodata)
+        || is_invalid_sample(v01, nodata)
+        || is_invalid_sample(v11, nodata)
+    {
         return None;
-    };
-    Some(
-        v00 * (1.0 - weight_x) * (1.0 - weight_y)
-            + v10 * weight_x * (1.0 - weight_y)
-            + v01 * (1.0 - weight_x) * weight_y
-            + v11 * weight_x * weight_y,
-    )
+    }
+    Some(bilinear_formula(v00, v10, v01, v11, weight_x, weight_y))
 }
 
 /// A bilinear weight total below this means no usable data (GDAL `GWKBilinearResample4Sample`:
@@ -2528,21 +3072,29 @@ fn bilinear_renormalised(taps: [Option<f32>; 4], fx: f64, fy: f64, nodata: Optio
     (total >= MIN_BILINEAR_WEIGHT).then(|| (sum / total) as f32)
 }
 
-/// Weighted bicubic / cubic interpolation over 16 taps and their weights when all taps are usable,
-/// `None` otherwise. GDAL does the same for `-r cubic` (`GWKCubicResample4Sample`): if any tap of
-/// the 4x4 window is missing, invalid or outside the level it does not renormalise the cubic
-/// weights (which have negative lobes) but falls back to bilinear over the 2x2 core, which
-/// [`bilinear_renormalised`] then does. `fill` is returned for degenerate weights.
+/// Weighted bicubic / cubic interpolation over 16 taps and their weights when all taps are usable
+/// (neither `NaN` nor nodata), `None` otherwise. GDAL does the same for `-r cubic`
+/// (`GWKCubicResample4Sample`): if any tap of the 4x4 window is missing, invalid or outside the
+/// level it does not renormalise the cubic weights (which have negative lobes) but falls back to
+/// bilinear over the 2x2 core, which [`bilinear_renormalised`] then does. `fill` is returned for
+/// degenerate weights.
 #[inline]
-fn cubic_if_valid(values: &[Option<f32>; 16], weights: &[f32; 16], nodata: Option<f32>, fill: f32) -> Option<f32> {
+fn cubic_loaded(values: &[f32; 16], weights: &[f32; 16], nodata: Option<f32>, fill: f32) -> Option<f32> {
+    if values.iter().any(|&v| is_invalid_sample(v, nodata)) {
+        return None;
+    }
+    Some(cubic_formula(values, weights, fill))
+}
+
+#[inline]
+fn cubic_formula(values: &[f32; 16], weights: &[f32; 16], fill: f32) -> f32 {
     let mut sum = 0.0f32;
     let mut weight_sum = 0.0f32;
     for (&v, &w) in values.iter().zip(weights) {
-        let v = valid_tap(v, nodata)?;
         sum += v * w;
         weight_sum += w;
     }
-    Some(if weight_sum > 0.0 { sum / weight_sum } else { fill })
+    if weight_sum > 0.0 { sum / weight_sum } else { fill }
 }
 
 /// Weights of the source pixels one scaled kernel reads along an axis, written to `out`
@@ -2570,7 +3122,7 @@ fn axis_weights(resampling: ResamplingMethod, axis: AxisKernel, v: f64, size: us
 /// accumulated weight). The fixed-footprint path renormalises over the 2x2 bilinear taps the same
 /// way (see [`bilinear_renormalised`]).
 struct ScaledSampler<'a> {
-    tiles: &'a ahash::AHashMap<usize, std::sync::Arc<Vec<f32>>>,
+    grid: &'a [Option<&'a [f32]>],
     resampling: ResamplingMethod,
     kernel: DownsampleKernel,
     /// Level size, source tile size and tiles per row.
@@ -2606,7 +3158,6 @@ impl ScaledSampler<'_> {
         let bands = self.output_bands.len();
         let (x_lo, x_hi) = axis_weights(self.resampling, self.kernel.x, vx, self.size.0, &mut self.wx);
         let (y_lo, y_hi) = axis_weights(self.resampling, self.kernel.y, vy, self.size.1, &mut self.wy);
-        let (tile_w, tile_h) = self.tile;
         self.sum.clear();
         self.sum.resize(bands, 0.0);
         self.weight.clear();
@@ -2619,8 +3170,173 @@ impl ScaledSampler<'_> {
         // `-b` bands only): the pixel must be invalid in every one of them. A pixel that is
         // nodata in some bands only is a valid centre, and each band is interpolated from its
         // own valid taps.
+        self.evaluate_centre(vx, vy);
+
+        for py in y_lo..=y_hi {
+            self.accumulate_row(py, x_lo, x_hi);
+            let wy = self.wy[py - y_lo];
+            for b in 0..bands {
+                self.sum[b] += wy * self.row_sum[b];
+                self.weight[b] += wy * self.row_weight[b];
+            }
+        }
+
+        self.write_out(out);
+    }
+
+    /// Horizontal pass of the scaled kernel along source row `py` for columns `x_lo..=x_hi`
+    /// with weights `wx` (index `x - x_lo`). Writes `row_sum` / `row_weight`.
+    fn accumulate_row(&mut self, py: usize, x_lo: usize, x_hi: usize) {
+        let bands = self.output_bands.len();
+        let (tile_w, tile_h) = self.tile;
+        self.row_sum.clear();
+        self.row_sum.resize(bands, 0.0);
+        self.row_weight.clear();
+        self.row_weight.resize(bands, 0.0);
+        if x_lo > x_hi {
+            return;
+        }
+        let (tile_row, row_base) = (py / tile_h, (py % tile_h) * tile_w);
+        let mut px = x_lo;
+        while px <= x_hi {
+            let tile_col = px / tile_w;
+            let run_end = x_hi.min((tile_col + 1) * tile_w - 1);
+            if let Some(tile) = self.grid.get(tile_row * self.tiles_across + tile_col).copied().flatten() {
+                for x in px..=run_end {
+                    let w = self.wx[x - x_lo];
+                    let pixel = (row_base + x - tile_col * tile_w) * self.source_bands;
+                    for (b, &source_band) in self.output_bands.iter().enumerate() {
+                        if let Some(&v) = tile.get(pixel + source_band)
+                            && !is_invalid_sample(v, self.nodata)
+                        {
+                            self.row_sum[b] += f64::from(v) * w;
+                            self.row_weight[b] += w;
+                        }
+                    }
+                }
+            }
+            px = run_end + 1;
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn write_out(&self, out: &mut [f32]) {
+        for (b, value) in out.iter_mut().enumerate() {
+            *value = if self.centre_invalid {
+                self.centre[b]
+            } else if self.weight[b] > MIN_KERNEL_WEIGHT {
+                (self.sum[b] / self.weight[b]) as f32
+            } else {
+                self.fill
+            };
+        }
+    }
+
+    /// Separable Linear-X path: horizontal convolution per (source row, output column) once,
+    /// then a vertical pass per output pixel. Summation order matches [`Self::sample`].
+    #[allow(clippy::too_many_lines, clippy::needless_range_loop)]
+    fn render_linear(&mut self, mapping: &SourceMapping, tile_size: (usize, usize), pixel_data: &mut [f32]) {
+        let (width, height) = tile_size;
+        let bands = self.output_bands.len();
+        let mut x_ok = vec![false; width];
+        let mut x_lohi = vec![(1usize, 0usize); width];
+        let mut x_wx = vec![Vec::new(); width];
+        let mut x_v = vec![0.0f64; width];
+        for out_x in 0..width {
+            let vx = mapping.src_x(out_x, 0, width);
+            if !within_level(vx, self.size.0) {
+                continue;
+            }
+            x_ok[out_x] = true;
+            x_v[out_x] = vx;
+            let (lo, hi) = axis_weights(self.resampling, self.kernel.x, vx, self.size.0, &mut self.wx);
+            x_lohi[out_x] = (lo, hi);
+            x_wx[out_x].clone_from(&self.wx);
+        }
+        let mut y_ok = vec![false; height];
+        let mut y_lohi = vec![(1usize, 0usize); height];
+        let mut y_wy = vec![Vec::new(); height];
+        let mut y_v = vec![0.0f64; height];
+        for out_y in 0..height {
+            let Some(vy) = mapping.rows[out_y] else { continue };
+            y_ok[out_y] = true;
+            y_v[out_y] = vy;
+            let (lo, hi) = axis_weights(self.resampling, self.kernel.y, vy, self.size.1, &mut self.wy);
+            y_lohi[out_y] = (lo, hi);
+            y_wy[out_y].clone_from(&self.wy);
+        }
+        let mut py_min = usize::MAX;
+        let mut py_max = 0usize;
+        for out_y in 0..height {
+            if !y_ok[out_y] {
+                continue;
+            }
+            let (lo, hi) = y_lohi[out_y];
+            if lo > hi {
+                continue;
+            }
+            py_min = py_min.min(lo);
+            py_max = py_max.max(hi);
+        }
+        let mut horiz_sum = Vec::new();
+        let mut horiz_weight = Vec::new();
+        let stride = width * bands;
+        if py_min <= py_max {
+            let n_py = py_max - py_min + 1;
+            horiz_sum.resize(n_py * stride, 0.0);
+            horiz_weight.resize(n_py * stride, 0.0);
+            for py in py_min..=py_max {
+                for out_x in 0..width {
+                    if !x_ok[out_x] {
+                        continue;
+                    }
+                    let (x_lo, x_hi) = x_lohi[out_x];
+                    std::mem::swap(&mut self.wx, &mut x_wx[out_x]);
+                    self.accumulate_row(py, x_lo, x_hi);
+                    std::mem::swap(&mut self.wx, &mut x_wx[out_x]);
+                    let base = (py - py_min) * stride + out_x * bands;
+                    horiz_sum[base..base + bands].copy_from_slice(&self.row_sum);
+                    horiz_weight[base..base + bands].copy_from_slice(&self.row_weight);
+                }
+            }
+        }
+        for out_y in 0..height {
+            if !y_ok[out_y] {
+                continue;
+            }
+            let (y_lo, y_hi) = y_lohi[out_y];
+            let wy = &y_wy[out_y];
+            let vy = y_v[out_y];
+            for out_x in 0..width {
+                if !x_ok[out_x] {
+                    continue;
+                }
+                let vx = x_v[out_x];
+                self.evaluate_centre(vx, vy);
+                self.sum.clear();
+                self.sum.resize(bands, 0.0);
+                self.weight.clear();
+                self.weight.resize(bands, 0.0);
+                if y_lo <= y_hi && py_min <= py_max {
+                    for py in y_lo..=y_hi {
+                        let w = wy[py - y_lo];
+                        let base = (py - py_min) * stride + out_x * bands;
+                        for b in 0..bands {
+                            self.sum[b] += w * horiz_sum[base + b];
+                            self.weight[b] += w * horiz_weight[base + b];
+                        }
+                    }
+                }
+                let out_idx = (out_y * width + out_x) * bands;
+                self.write_out(&mut pixel_data[out_idx..out_idx + bands]);
+            }
+        }
+    }
+
+    fn evaluate_centre(&mut self, vx: f64, vy: f64) {
+        let (tile_w, tile_h) = self.tile;
         let nearest = (nearest_pixel(vx, self.size.0), nearest_pixel(vy, self.size.1));
-        let tile = self.tiles.get(&(nearest.1 / tile_h * self.tiles_across + nearest.0 / tile_w));
+        let tile = self.grid.get(nearest.1 / tile_h * self.tiles_across + nearest.0 / tile_w).copied().flatten();
         let pixel = (nearest.1 % tile_h * tile_w + nearest.0 % tile_w) * self.source_bands;
         self.centre.clear();
         let mut all_invalid = true;
@@ -2636,50 +3352,6 @@ impl ScaledSampler<'_> {
             });
         }
         self.centre_invalid = all_invalid;
-
-        for py in y_lo..=y_hi {
-            self.row_sum.clear();
-            self.row_sum.resize(bands, 0.0);
-            self.row_weight.clear();
-            self.row_weight.resize(bands, 0.0);
-            let (tile_row, row_base) = (py / tile_h, (py % tile_h) * tile_w);
-            // One tile lookup per run of taps inside the same source tile
-            let mut px = x_lo;
-            while px <= x_hi {
-                let tile_col = px / tile_w;
-                let run_end = x_hi.min((tile_col + 1) * tile_w - 1);
-                if let Some(tile) = self.tiles.get(&(tile_row * self.tiles_across + tile_col)) {
-                    for x in px..=run_end {
-                        let w = self.wx[x - x_lo];
-                        let pixel = (row_base + x - tile_col * tile_w) * self.source_bands;
-                        for (b, &source_band) in self.output_bands.iter().enumerate() {
-                            if let Some(&v) = tile.get(pixel + source_band)
-                                && !is_invalid_sample(v, self.nodata)
-                            {
-                                self.row_sum[b] += f64::from(v) * w;
-                                self.row_weight[b] += w;
-                            }
-                        }
-                    }
-                }
-                px = run_end + 1;
-            }
-            let wy = self.wy[py - y_lo];
-            for b in 0..bands {
-                self.sum[b] += wy * self.row_sum[b];
-                self.weight[b] += wy * self.row_weight[b];
-            }
-        }
-
-        for (b, value) in out.iter_mut().enumerate() {
-            *value = if self.centre_invalid {
-                self.centre[b]
-            } else if self.weight[b] > MIN_KERNEL_WEIGHT {
-                (self.sum[b] / self.weight[b]) as f32
-            } else {
-                self.fill
-            };
-        }
     }
 }
 
@@ -2719,25 +3391,25 @@ mod tests {
     }
 
     #[test]
-    fn test_bilinear_if_valid_matches_formula_when_all_valid() {
+    fn test_bilinear_loaded_matches_formula_when_all_valid() {
         let t = [10.0, 20.0, 30.0, 40.0];
         for &(wx, wy) in &[(0.0, 0.0), (0.25, 0.75), (0.5, 0.5), (1.0, 1.0)] {
-            assert_eq!(bilinear_if_valid(t.map(Some), wx, wy, Some(0.0)), Some(bilinear_reference(t, wx, wy)));
+            assert_eq!(bilinear_loaded(t, wx, wy, Some(0.0)), Some(bilinear_reference(t, wx, wy)));
         }
         // 0.0 is a valid sample when no nodata is declared
-        assert_eq!(bilinear_if_valid([Some(0.0), Some(4.0), Some(0.0), Some(4.0)], 0.5, 0.5, None), Some(2.0));
+        assert_eq!(bilinear_loaded([0.0, 4.0, 0.0, 4.0], 0.5, 0.5, None), Some(2.0));
     }
 
     #[test]
-    fn test_bilinear_if_valid_rejects_any_unusable_tap() {
-        let ok = [Some(10.0), Some(20.0), Some(30.0), Some(40.0)];
-        assert!(bilinear_if_valid(ok, 0.3, 0.3, None).is_some());
-        for bad in [Some(f32::NAN), Some(0.0), None] {
+    fn test_bilinear_loaded_rejects_any_unusable_tap() {
+        let ok = [10.0, 20.0, 30.0, 40.0];
+        assert!(bilinear_loaded(ok, 0.3, 0.3, None).is_some());
+        for bad in [f32::NAN, 0.0] {
             for i in 0..4 {
                 let mut taps = ok;
                 taps[i] = bad;
                 // a nodata or NaN tap is rejected even at zero weight
-                assert_eq!(bilinear_if_valid(taps, 0.0, 0.0, Some(0.0)), None, "{bad:?} at {i}");
+                assert_eq!(bilinear_loaded(taps, 0.0, 0.0, Some(0.0)), None, "{bad:?} at {i}");
             }
         }
     }
@@ -2803,35 +3475,35 @@ mod tests {
     }
 
     #[test]
-    fn test_cubic_if_valid_matches_formula_when_all_valid() {
+    fn test_cubic_loaded_matches_formula_when_all_valid() {
         for weight in [bicubic_weight, cubic_weight] {
-            let (mut values, mut weights) = ([None; 16], [0.0f32; 16]);
+            let (mut values, mut weights) = ([0.0f32; 16], [0.0f32; 16]);
             let (mut sum, mut wsum) = (0.0f32, 0.0f32);
             for i in 0..16 {
                 let v = 10.0 + i as f32;
                 let w = weight(i as f64 * 0.1 - 0.7) as f32;
-                (values[i], weights[i]) = (Some(v), w);
+                (values[i], weights[i]) = (v, w);
                 sum += v * w;
                 wsum += w;
             }
-            assert_eq!(cubic_if_valid(&values, &weights, Some(0.0), f32::NAN), Some(sum / wsum));
+            assert_eq!(cubic_loaded(&values, &weights, Some(0.0), f32::NAN), Some(sum / wsum));
         }
     }
 
     #[test]
-    fn test_cubic_if_valid_rejects_any_unusable_tap() {
+    fn test_cubic_loaded_rejects_any_unusable_tap() {
         let weights = [1.0f32 / 16.0; 16];
-        let mut values = [Some(50.0f32); 16];
-        assert_eq!(cubic_if_valid(&values, &weights, None, -1.0), Some(50.0));
-        for bad in [Some(f32::NAN), Some(0.0), None] {
+        let mut values = [50.0f32; 16];
+        assert_eq!(cubic_loaded(&values, &weights, None, -1.0), Some(50.0));
+        for bad in [f32::NAN, 0.0] {
             values[7] = bad;
-            assert_eq!(cubic_if_valid(&values, &weights, Some(0.0), -1.0), None, "{bad:?}");
+            assert_eq!(cubic_loaded(&values, &weights, Some(0.0), -1.0), None, "{bad:?}");
         }
         // a nodata value is only invalid when declared
-        values[7] = Some(0.0);
-        assert!(cubic_if_valid(&values, &weights, None, -1.0).is_some());
+        values[7] = 0.0;
+        assert!(cubic_loaded(&values, &weights, None, -1.0).is_some());
         // degenerate weights with all-valid taps -> fill
-        assert_eq!(cubic_if_valid(&[Some(5.0); 16], &[0.0; 16], None, -1.0), Some(-1.0));
+        assert_eq!(cubic_loaded(&[5.0; 16], &[0.0; 16], None, -1.0), Some(-1.0));
     }
 
     // ------------------------------------------------------------------
@@ -2988,6 +3660,86 @@ mod tests {
         assert!(err.to_string().contains("Failed to read source tile"), "{err}");
     }
 
+    /// Fills `w` x `h` through [`ApproxTransform`] for `exact`, counting the exact evaluations.
+    fn approx(w: usize, h: usize, max_error: f64, exact: impl Fn(f64, f64) -> Option<(f64, f64)>) -> (Vec<f64>, Vec<f64>, usize) {
+        let calls = std::cell::Cell::new(0);
+        let counted = |x, y| {
+            calls.set(calls.get() + 1);
+            exact(x, y)
+        };
+        let (mut xs, mut ys) = (vec![f64::NAN; w * h], vec![f64::NAN; w * h]);
+        ApproxTransform { exact: &counted, max_error, width: w, xs: &mut xs, ys: &mut ys }.fill(h);
+        (xs, ys, calls.get())
+    }
+
+    /// A gently curved map (like a projection over a tile): interpolated within the bound from
+    /// few exact evaluations; a sharply curved one is split until it is.
+    #[test]
+    fn approximate_transform_stays_within_the_error_bound() {
+        let gentle = |x: f64, y: f64| Some((x * 1.5 + y * 0.01 + x * x * 1e-5, y * 0.75 - x * 0.02 + y * y * 2e-5));
+        let (xs, ys, calls) = approx(256, 256, 0.01, gentle);
+        let mut worst = 0.0f64;
+        for y in 0..256 {
+            for x in 0..256 {
+                let (ex, ey) = gentle(x as f64, y as f64).unwrap();
+                worst = worst.max((xs[y * 256 + x] - ex).abs()).max((ys[y * 256 + x] - ey).abs());
+            }
+        }
+        assert!(worst <= 0.01, "max error {worst}");
+        assert!(calls < 1000, "{calls} exact transforms for 65536 pixels");
+
+        let sharp = |x: f64, y: f64| Some(((x * 0.3).sin() * 40.0 + x, (y * 0.2).cos() * 30.0 + y));
+        let (xs, ys, calls) = approx(64, 48, 0.01, sharp);
+        let mut worst = 0.0f64;
+        for y in 0..48 {
+            for x in 0..64 {
+                let (ex, ey) = sharp(x as f64, y as f64).unwrap();
+                worst = worst.max((xs[y * 64 + x] - ex).abs()).max((ys[y * 64 + x] - ey).abs());
+            }
+        }
+        // the centre test bounds the error at the centre; the corners are exact; in between a
+        // smooth map stays within a small multiple
+        assert!(worst <= 0.05, "max error {worst}");
+        assert!(calls > 64 * 48 / 4, "{calls} exact transforms: a sharply curved map should be split");
+    }
+
+    /// Pixels the projection rejects stay `NaN`, exactly where the exact transform rejects them.
+    #[test]
+    fn approximate_transform_keeps_rejected_pixels_nan() {
+        let domain = |x: f64, y: f64| (x + y < 100.0).then_some((x, y));
+        let (xs, ys, _) = approx(96, 96, 0.01, domain);
+        for y in 0..96 {
+            for x in 0..96 {
+                let want = domain(x as f64, y as f64);
+                let got = (xs[y * 96 + x], ys[y * 96 + x]);
+                match want {
+                    Some((ex, ey)) => assert!((got.0 - ex).abs() <= 0.01 && (got.1 - ey).abs() <= 0.01, "({x},{y}): {got:?}"),
+                    None => assert!(got.0.is_nan() && got.1.is_nan(), "({x},{y}) rejected but got {got:?}"),
+                }
+            }
+        }
+        // exact mode: every pixel evaluated
+        let (_, _, calls) = approx(20, 10, 0.0, domain);
+        assert_eq!(calls, 200);
+    }
+
+    /// An output one pixel wide or high has no grid cells to interpolate across: every pixel is
+    /// transformed exactly (not only every 16th, the grid nodes).
+    #[test]
+    fn approximate_transform_fills_one_pixel_wide_and_high_outputs() {
+        let map = |x: f64, y: f64| Some((x * 2.0 + 1.0, y * 3.0 - 1.0));
+        for (w, h) in [(1, 40), (40, 1), (1, 1), (17, 1)] {
+            let (xs, ys, calls) = approx(w, h, 0.01, map);
+            assert_eq!(calls, w * h, "{w}x{h}");
+            for y in 0..h {
+                for x in 0..w {
+                    let (ex, ey) = map(x as f64, y as f64).unwrap();
+                    assert_eq!((xs[y * w + x], ys[y * w + x]), (ex, ey), "{w}x{h} pixel ({x},{y})");
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_bbox_from_xyz() {
         // Tile 0/0/0 should cover the whole world in Web Mercator
@@ -2999,13 +3751,6 @@ mod tests {
         let bbox_1_0_0 = BoundingBox::from_xyz(1, 0, 0);
         let bbox_1_1_0 = BoundingBox::from_xyz(1, 1, 0);
         assert!((bbox_1_0_0.maxx - bbox_1_1_0.minx).abs() < 1.0);
-    }
-
-    #[test]
-    fn test_epsg_proj_strings() {
-        assert!(get_proj_string(4326).is_some());
-        assert!(get_proj_string(3857).is_some());
-        assert!(get_proj_string(99999).is_none());
     }
 
     #[test]
@@ -3968,6 +4713,17 @@ mod downsample_tests {
         sample_bands(tiles, 1, &[0], nodata, v)[0]
     }
 
+    fn dense_from(tiles: &AHashMap<usize, Arc<Vec<f32>>>) -> Vec<Option<&[f32]>> {
+        let n = tiles.keys().copied().max().map_or(0, |m| m + 1);
+        let mut grid = vec![None; n];
+        for (&k, data) in tiles {
+            if let Some(slot) = grid.get_mut(k) {
+                *slot = Some(data.as_slice());
+            }
+        }
+        grid
+    }
+
     /// Scaled bilinear sample (ratio 2) of the `output_bands` of an 8x4 level with `source_bands`.
     fn sample_bands(
         tiles: &AHashMap<usize, Arc<Vec<f32>>>,
@@ -3976,8 +4732,9 @@ mod downsample_tests {
         nodata: Option<f32>,
         v: (f64, f64),
     ) -> Vec<f32> {
+        let grid = dense_from(tiles);
         let mut sampler = ScaledSampler {
-            tiles,
+            grid: &grid,
             resampling: ResamplingMethod::Bilinear,
             kernel: kernel([2.0, 2.0], ResamplingMethod::Bilinear).unwrap(),
             size: (8, 4),

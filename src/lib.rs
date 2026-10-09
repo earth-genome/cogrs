@@ -101,6 +101,7 @@ pub use xyz_tile::{
     BoundingBox,
     CoordTransformer,
     ResamplingMethod,
+    DEFAULT_TRANSFORM_ERROR,
 };
 
 pub use webp::WebpOptions;

@@ -1,20 +1,22 @@
 //! Asynchronous point queries.
 //!
 //! The [`PointQuery`](crate::PointQuery) trait is synchronous: reading a tile blocks the calling
-//! thread. These `*_async` counterparts on [`CogReader`] fetch the one tile containing the
-//! point without holding a thread while waiting (decoding runs on tokio's blocking pool) and
+//! thread. These `*_async` counterparts on [`CogReader`] fetch tiles containing the
+//! points without holding a thread while waiting (decoding runs on tokio's blocking pool) and
 //! share the process-wide tile cache and in-flight de-duplication with tile extraction.
 //!
-//! All bands of a point come from a single tile fetch.
+//! A batch groups points by full-resolution tile index, de-duplicates, and calls
+//! [`crate::tile_fetch::fetch_tiles`] once per chunk of unique tiles.
 
-use futures::{StreamExt, TryStreamExt};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::cog_reader::{CogReader, TileRef};
 use crate::point_query::PointQueryResult;
 use crate::tiff_utils::AnyResult;
 
-/// How many points of a batch are looked up concurrently.
-const BATCH_CONCURRENCY: usize = 16;
+/// Unique tiles fetched together; sequential chunks keep in-flight work bounded.
+const TILE_FETCH_CHUNK: usize = 64;
 
 impl CogReader {
     /// Async counterpart of [`CogReader::sample`]: one pixel value, or `None` outside the image.
@@ -81,15 +83,30 @@ impl CogReader {
     }
 
     /// Async counterpart of [`PointQuery::sample_points_crs`](crate::PointQuery::sample_points_crs):
-    /// points are looked up concurrently (up to 16 at a time), results keep the input order.
+    /// unique tiles are fetched together (chunks of 64), results keep the input order.
     ///
     /// # Errors
     /// Returns the first error from projecting a point or reading a tile.
     pub async fn sample_points_crs_async(&self, crs: i32, points: &[(f64, f64)]) -> AnyResult<Vec<PointQueryResult>> {
-        futures::stream::iter(points.iter().map(|&(x, y)| self.sample_crs_async(crs, x, y)))
-            .buffered(BATCH_CONCURRENCY)
-            .try_collect()
-            .await
+        let points = Arc::<[_]>::from(points);
+        self.with_revalidation({
+            let points = Arc::clone(&points);
+            move |reader| {
+                let points = Arc::clone(&points);
+                Box::pin(async move { reader.sample_points_crs_once(crs, &points).await })
+            }
+        })
+        .await
+    }
+
+    async fn sample_points_crs_once(&self, crs: i32, points: &[(f64, f64)]) -> AnyResult<Vec<PointQueryResult>> {
+        let (located, unique) = self.locate_batch(crs, points)?;
+        let mut tiles = HashMap::with_capacity(unique.len());
+        for chunk in unique.chunks(TILE_FETCH_CHUNK) {
+            let fetched = crate::tile_fetch::fetch_tiles(self, None, chunk).await?;
+            tiles.extend(fetched.tiles);
+        }
+        self.resolve_batch(crs, located, &tiles)
     }
 
     /// Async counterpart of [`PointQuery::sample_points_lonlat`](crate::PointQuery::sample_points_lonlat).
@@ -164,7 +181,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn batch_sampling_is_concurrent_and_ordered() {
+    async fn batch_sampling_is_deduped_and_ordered() {
         let latency = Duration::from_millis(100);
         let mock = Arc::new(MockReader::new(build_cog(&spec()), "mock://pq/batch", latency));
         let remote = CogReader::from_async_reader_with_hint(mock.clone(), OverviewQualityHint::NoneUsable).await.unwrap();
@@ -184,6 +201,7 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert_eq!((g.pixel_coords, sorted(g)), (w.pixel_coords, sorted(w)));
         }
-        assert!(mock.max_in_flight() > 1);
+        let distinct_tiles: std::collections::HashSet<_> = mock.calls().into_iter().collect();
+        assert_eq!(mock.call_count(), distinct_tiles.len(), "{:?}", mock.calls());
     }
 }

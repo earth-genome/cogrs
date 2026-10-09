@@ -19,9 +19,13 @@
 //! designed to be read via HTTP Range requests.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(not(unix))]
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::async_io::{block_on_io, AsyncToSync};
 use crate::remote::ObjectStoreRangeReader;
@@ -71,6 +75,11 @@ pub struct LocalRangeReader {
     size: u64,
     /// `"{size}:{modification time in ns}"` as of opening
     version: String,
+    /// Kept open so each range read is a positioned read, not a new `open`.
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
+    file: std::sync::Mutex<File>,
 }
 
 impl LocalRangeReader {
@@ -84,10 +93,15 @@ impl LocalRangeReader {
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_nanos());
+        let file = File::open(&path)?;
         Ok(Self {
             path,
             size: metadata.len(),
             version: format!("{}:{modified_ns}", metadata.len()),
+            #[cfg(unix)]
+            file,
+            #[cfg(not(unix))]
+            file: std::sync::Mutex::new(file),
         })
     }
 }
@@ -167,10 +181,17 @@ impl RangeReader for MemoryRangeReader {
 
 impl RangeReader for LocalRangeReader {
     fn read_range(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(offset))?;
         let mut buffer = vec![0u8; length];
-        file.read_exact(&mut buffer)?;
+        #[cfg(unix)]
+        {
+            self.file.read_exact_at(&mut buffer, offset)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = self.file.lock().map_err(|e| format!("local file lock: {e}"))?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut buffer)?;
+        }
         Ok(buffer)
     }
 

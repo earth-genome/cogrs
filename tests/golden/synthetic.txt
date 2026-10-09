@@ -1,22 +1,22 @@
-rgb_u8_3857/meta	1000x800 tile=64x64 across=16 down=13 bands=3 UInt8 Deflate predictor=2 crs=Some(3857) nodata=None tiled=true scale=Some([5009.377085697311, 5009.377085697311, 0.0]) tie=Some([0.0, 0.0, 0.0, -10018754.171394622, 5009377.085697312, 0.0]) offsets=089b7f3e572db6e6 counts=b5c7ce851ba75834
-rgb_u8_3857/overview0	500x400 tile=64x64 across=8 down=7 scale=2 offsets=8d2171e2e20314e8 counts=b502633d48e94c41
-rgb_u8_3857/overview1	250x200 tile=64x64 across=4 down=4 scale=4 offsets=6f42b6ccf35ab9fd counts=38ef27355287d4e5
-rgb_u8_3857/overview2	125x100 tile=64x64 across=2 down=2 scale=8 offsets=f04f1abd4143e271 counts=9e29d86d487335f4
+rgb_u8_3857/meta	1000x800 tile=64x64 across=16 down=13 bands=3 UInt8 Deflate predictor=2 crs=Some(3857) nodata=None tiled=true scale=Some([5009.377085697311, 5009.377085697311, 0.0]) tie=Some([0.0, 0.0, 0.0, -10018754.171394622, 5009377.085697312, 0.0]) offsets=b225e11e64fbdb89 counts=a26a024eede23546
+rgb_u8_3857/overview0	500x400 tile=64x64 across=8 down=7 scale=2 offsets=107a285160efe88f counts=d16b3684e7f3ee3d
+rgb_u8_3857/overview1	250x200 tile=64x64 across=4 down=4 scale=4 offsets=49444969c0e5cf08 counts=caec5789245550af
+rgb_u8_3857/overview2	125x100 tile=64x64 across=2 down=2 scale=8 offsets=0cbddb97fae7f570 counts=cd23b511bd450a0a
 rgb_u8_3857/min_usable	Some(2)
 rgb_u8_3857/hint	MinUsable(2)
-rgb_u8_3857/xyz/2/1/1/nearest	128x128x3 bytes=8943 tiles=16 ovr=Some(1) nodata=None n=49152 valid=9792 digest=19f0574f3001aceb
+rgb_u8_3857/xyz/2/1/1/nearest	128x128x3 bytes=7598 tiles=16 ovr=Some(1) nodata=None n=49152 valid=9792 digest=19f0574f3001aceb
 rgb_u8_3857/xyz/2/1/1/bilinear	128x128x3 bytes=0 tiles=0 ovr=Some(1) nodata=None n=49152 valid=9792 digest=96a8803b33600fff
 rgb_u8_3857/xyz/2/1/1/bicubic	128x128x3 bytes=0 tiles=0 ovr=Some(1) nodata=None n=49152 valid=9792 digest=a6667625e15cf0cd
 rgb_u8_3857/xyz/2/1/1/cubic	128x128x3 bytes=0 tiles=0 ovr=Some(1) nodata=None n=49152 valid=9792 digest=63ed97e471af5bfd
-rgb_u8_3857/xyz/3/2/3/nearest	128x128x3 bytes=32807 tiles=55 ovr=Some(0) nodata=None n=49152 valid=38352 digest=e8f669c84e4ab4f4
+rgb_u8_3857/xyz/3/2/3/nearest	128x128x3 bytes=31464 tiles=55 ovr=Some(0) nodata=None n=49152 valid=38352 digest=e8f669c84e4ab4f4
 rgb_u8_3857/xyz/3/2/3/bilinear	128x128x3 bytes=0 tiles=0 ovr=Some(0) nodata=None n=49152 valid=38352 digest=78eaf9f61a359d60
 rgb_u8_3857/xyz/3/2/3/bicubic	128x128x3 bytes=0 tiles=0 ovr=Some(0) nodata=None n=49152 valid=38352 digest=b533410b7ee6452c
 rgb_u8_3857/xyz/3/2/3/cubic	128x128x3 bytes=0 tiles=0 ovr=Some(0) nodata=None n=49152 valid=38352 digest=f4c839eeaf2f0cb9
-rgb_u8_3857/xyz/4/4/6/nearest	128x128x3 bytes=37312 tiles=62 ovr=None nodata=None n=49152 valid=47568 digest=e5d6169db0fac2e0
+rgb_u8_3857/xyz/4/4/6/nearest	128x128x3 bytes=35279 tiles=62 ovr=None nodata=None n=49152 valid=47568 digest=e5d6169db0fac2e0
 rgb_u8_3857/xyz/4/4/6/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=None n=49152 valid=47568 digest=ec8320d184c03438
 rgb_u8_3857/xyz/4/4/6/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=None n=49152 valid=47568 digest=a19f6add4fd92119
 rgb_u8_3857/xyz/4/4/6/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=None n=49152 valid=47568 digest=bfec633c476688cc
-rgb_u8_3857/xyz/4/5/7/nearest	128x128x3 bytes=30836 tiles=53 ovr=None nodata=None n=49152 valid=29568 digest=6f9a53ecc30f77f6
+rgb_u8_3857/xyz/4/5/7/nearest	128x128x3 bytes=29187 tiles=53 ovr=None nodata=None n=49152 valid=29568 digest=6f9a53ecc30f77f6
 rgb_u8_3857/xyz/4/5/7/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=None n=49152 valid=29568 digest=bb12c6401f91968d
 rgb_u8_3857/xyz/4/5/7/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=None n=49152 valid=29568 digest=fb5b9b645e830280
 rgb_u8_3857/xyz/4/5/7/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=None n=49152 valid=29568 digest=97920ef482b39e7d
@@ -55,28 +55,28 @@ rgb_u8_3857/minmax_fast	0 251
 rgb_u8_3857/sample_crs/3857/-7514065.628545966/2504688.5428486564	[(0, 1131151360), (1, 1103626240), (2, 1115815936)]
 rgb_u8_3857/sample_crs/3857/-10018744.171394622/5009367.085697312	[(0, 1065353216), (1, 1109655552), (2, 1117913088)]
 rgb_u8_3857/sample_crs/3857/-7514065.628545966/-0.9999999990686774	[]
-rgb_u8_3857/reproject/4326	100x80x3 crs=4326 bounds=(-90.000000,8.963216,-45.000000,40.979898) nodata=None n=24000 valid=23571 digest=d2b342cf3614c7c6
-rgb_u8_3857/reproject_streaming/4326	(0, 0):48x48:6fc511274335c6cb (1, 0):48x48:deb9af6e50918857 (2, 0):4x48:cfb7e4bdd14a4ad9 (0, 1):48x32:8b2724a90eb165d0 (1, 1):48x32:11de28a3df15f20d (2, 1):4x32:2af160cd9a3e4fb7
+rgb_u8_3857/reproject/4326	100x80x3 crs=4326 bounds=(-90.000000,8.963216,-45.000000,40.979898) nodata=None n=24000 valid=23571 digest=6af649bfacd69b13
+rgb_u8_3857/reproject_streaming/4326	(0, 0):48x48:765e7e4042a75823 (1, 0):48x48:74b92615dca0b9db (2, 0):4x48:cfb7e4bdd14a4ad9 (0, 1):48x32:ee8f3f0f3ce7f160 (1, 1):48x32:d6b4ecb8e39347be (2, 1):4x32:2af160cd9a3e4fb7
 rgb_u8_3857/hinted/none_usable/min_usable	None
-rgb_u8_3857/hinted/none_usable/xyz/4/4/6	128x128x3 bytes=37312 tiles=62 ovr=None nodata=None n=49152 valid=47568 digest=e5d6169db0fac2e0
+rgb_u8_3857/hinted/none_usable/xyz/4/4/6	128x128x3 bytes=35279 tiles=62 ovr=None nodata=None n=49152 valid=47568 digest=e5d6169db0fac2e0
 rgb_u8_3857/hinted/all_usable/min_usable	Some(2)
-rgb_u8_3857/hinted/all_usable/xyz/4/4/6	128x128x3 bytes=37312 tiles=62 ovr=None nodata=None n=49152 valid=47568 digest=e5d6169db0fac2e0
+rgb_u8_3857/hinted/all_usable/xyz/4/4/6	128x128x3 bytes=35279 tiles=62 ovr=None nodata=None n=49152 valid=47568 digest=e5d6169db0fac2e0
 rgb_u8_3857/hinted/min_usable_1/min_usable	Some(1)
-rgb_u8_3857/hinted/min_usable_1/xyz/4/4/6	128x128x3 bytes=37312 tiles=62 ovr=None nodata=None n=49152 valid=47568 digest=e5d6169db0fac2e0
-rgb_u8_partial_nodata/meta	1000x800 tile=64x64 across=16 down=13 bands=3 UInt8 Deflate predictor=2 crs=Some(3857) nodata=Some(0.0) tiled=true scale=Some([5009.377085697311, 5009.377085697311, 0.0]) tie=Some([0.0, 0.0, 0.0, -10018754.171394622, 5009377.085697312, 0.0]) offsets=82e4ae58abf0184c counts=bb0bd74b6b533fef
-rgb_u8_partial_nodata/overview0	500x400 tile=64x64 across=8 down=7 scale=2 offsets=895bb27b7b8d6781 counts=5dcdf27befb330d4
-rgb_u8_partial_nodata/overview1	250x200 tile=64x64 across=4 down=4 scale=4 offsets=808f89cdbe1a94bf counts=f3893432e0d892e2
+rgb_u8_3857/hinted/min_usable_1/xyz/4/4/6	128x128x3 bytes=35279 tiles=62 ovr=None nodata=None n=49152 valid=47568 digest=e5d6169db0fac2e0
+rgb_u8_partial_nodata/meta	1000x800 tile=64x64 across=16 down=13 bands=3 UInt8 Deflate predictor=2 crs=Some(3857) nodata=Some(0.0) tiled=true scale=Some([5009.377085697311, 5009.377085697311, 0.0]) tie=Some([0.0, 0.0, 0.0, -10018754.171394622, 5009377.085697312, 0.0]) offsets=a24d74295e5141f0 counts=552a4f1db45c32a7
+rgb_u8_partial_nodata/overview0	500x400 tile=64x64 across=8 down=7 scale=2 offsets=0a437b4b9f65aa4b counts=3955ae31e40d6df4
+rgb_u8_partial_nodata/overview1	250x200 tile=64x64 across=4 down=4 scale=4 offsets=036dfc1ee952fda0 counts=b1be96de043643b2
 rgb_u8_partial_nodata/min_usable	Some(1)
 rgb_u8_partial_nodata/hint	MinUsable(1)
-rgb_u8_partial_nodata/xyz/3/2/3/nearest	128x128x3 bytes=93360 tiles=56 ovr=Some(0) nodata=Some(0.0) n=49152 valid=49152 digest=f3f4f9214b892164
+rgb_u8_partial_nodata/xyz/3/2/3/nearest	128x128x3 bytes=88789 tiles=56 ovr=Some(0) nodata=Some(0.0) n=49152 valid=49152 digest=f3f4f9214b892164
 rgb_u8_partial_nodata/xyz/3/2/3/bilinear	128x128x3 bytes=0 tiles=0 ovr=Some(0) nodata=Some(0.0) n=49152 valid=49152 digest=f4b611c8715f6f34
 rgb_u8_partial_nodata/xyz/3/2/3/bicubic	128x128x3 bytes=0 tiles=0 ovr=Some(0) nodata=Some(0.0) n=49152 valid=49152 digest=540bea988d4fec75
 rgb_u8_partial_nodata/xyz/3/2/3/cubic	128x128x3 bytes=0 tiles=0 ovr=Some(0) nodata=Some(0.0) n=49152 valid=49152 digest=24ba019a22da7911
-rgb_u8_partial_nodata/xyz/4/4/6/nearest	128x128x3 bytes=87343 tiles=64 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=176f27b6fd5ad161
+rgb_u8_partial_nodata/xyz/4/4/6/nearest	128x128x3 bytes=82175 tiles=64 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=176f27b6fd5ad161
 rgb_u8_partial_nodata/xyz/4/4/6/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=4542a07f10224b95
 rgb_u8_partial_nodata/xyz/4/4/6/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=66c29bb2e07d45f7
 rgb_u8_partial_nodata/xyz/4/4/6/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=040508b14bf662c4
-rgb_u8_partial_nodata/xyz/4/5/7/nearest	128x128x3 bytes=94204 tiles=53 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=e819a6a084923a7b
+rgb_u8_partial_nodata/xyz/4/5/7/nearest	128x128x3 bytes=88629 tiles=53 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=e819a6a084923a7b
 rgb_u8_partial_nodata/xyz/4/5/7/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=4dd8bc007ea09b44
 rgb_u8_partial_nodata/xyz/4/5/7/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=fd26ddb76627030b
 rgb_u8_partial_nodata/xyz/4/5/7/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=2cd17855926bc15c
@@ -106,29 +106,29 @@ rgb_u8_partial_nodata/shifted/7/35/51/nearest	128x128x3 bytes=0 tiles=0 ovr=None
 rgb_u8_partial_nodata/shifted/7/35/51/bilinear	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=b667aba9ec25c2c3
 rgb_u8_partial_nodata/shifted/7/35/51/bicubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=e443804c73551a24
 rgb_u8_partial_nodata/shifted/7/35/51/cubic	128x128x3 bytes=0 tiles=0 ovr=None nodata=Some(0.0) n=49152 valid=49152 digest=bac8d636e2f4e3b4
-f32_4326_nodata/meta	1000x800 tile=128x128 across=8 down=7 bands=1 Float32 Deflate predictor=1 crs=Some(4326) nodata=Some(-9999.0) tiled=true scale=Some([0.01, 0.01, 0.0]) tie=Some([0.0, 0.0, 0.0, -10.0, 50.0, 0.0]) offsets=4f86df026e066c75 counts=6257020806cebe7d
-f32_4326_nodata/overview0	500x400 tile=128x128 across=4 down=4 scale=2 offsets=3cb3d0904f7d5694 counts=3295187e3afa25fd
-f32_4326_nodata/overview1	250x200 tile=128x128 across=2 down=2 scale=4 offsets=97eb13183d277322 counts=395a3f91f45a9953
-f32_4326_nodata/overview2	125x100 tile=128x128 across=1 down=1 scale=8 offsets=c3ce98f725dfaee9 counts=2350b3391afa0633
+f32_4326_nodata/meta	1000x800 tile=128x128 across=8 down=7 bands=1 Float32 Deflate predictor=1 crs=Some(4326) nodata=Some(-9999.0) tiled=true scale=Some([0.01, 0.01, 0.0]) tie=Some([0.0, 0.0, 0.0, -10.0, 50.0, 0.0]) offsets=52115fb7d9af5bd2 counts=a6e120e8e2f30dc0
+f32_4326_nodata/overview0	500x400 tile=128x128 across=4 down=4 scale=2 offsets=db5c76db117db94e counts=1697e9a19611ce63
+f32_4326_nodata/overview1	250x200 tile=128x128 across=2 down=2 scale=4 offsets=0e6e02df89228895 counts=8db7219f060b1ac9
+f32_4326_nodata/overview2	125x100 tile=128x128 across=1 down=1 scale=8 offsets=62de5b8e3b5c173c counts=f81512f8cec2fa3f
 f32_4326_nodata/min_usable	Some(2)
 f32_4326_nodata/hint	MinUsable(2)
 f32_4326_nodata/xyz/4/7/5/nearest	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=Some(-9999.0) n=16384 valid=16384 digest=b91423d256bdd458
 f32_4326_nodata/xyz/4/7/5/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=Some(-9999.0) n=16384 valid=16384 digest=47b90bac2dccbd36
 f32_4326_nodata/xyz/4/7/5/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=Some(-9999.0) n=16384 valid=16384 digest=4a019c16307b2d9a
 f32_4326_nodata/xyz/4/7/5/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=Some(-9999.0) n=16384 valid=16384 digest=698e7644e0cf3264
-f32_4326_nodata/xyz/5/15/11/nearest	128x128x1 bytes=39127 tiles=3 ovr=Some(1) nodata=Some(-9999.0) n=16384 valid=12632 digest=af4211093f6efac8
+f32_4326_nodata/xyz/5/15/11/nearest	128x128x1 bytes=49531 tiles=3 ovr=Some(1) nodata=Some(-9999.0) n=16384 valid=12632 digest=af4211093f6efac8
 f32_4326_nodata/xyz/5/15/11/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=Some(-9999.0) n=16384 valid=12632 digest=288fa533f5d25fbf
 f32_4326_nodata/xyz/5/15/11/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=Some(-9999.0) n=16384 valid=12632 digest=942b24097c696ba7
 f32_4326_nodata/xyz/5/15/11/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=Some(-9999.0) n=16384 valid=12632 digest=8ae07ac3f9d4657f
-f32_4326_nodata/xyz/6/31/22/nearest	128x128x1 bytes=94593 tiles=6 ovr=Some(0) nodata=Some(-9999.0) n=16384 valid=16384 digest=b0fd116f2845d094
+f32_4326_nodata/xyz/6/31/22/nearest	128x128x1 bytes=128670 tiles=6 ovr=Some(0) nodata=Some(-9999.0) n=16384 valid=16384 digest=b0fd116f2845d094
 f32_4326_nodata/xyz/6/31/22/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=Some(-9999.0) n=16384 valid=16384 digest=c549aff1379cbc9f
 f32_4326_nodata/xyz/6/31/22/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=Some(-9999.0) n=16384 valid=16384 digest=50d63d9979ce6e58
 f32_4326_nodata/xyz/6/31/22/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=Some(-9999.0) n=16384 valid=16384 digest=24d7d54f104cb28c
-f32_4326_nodata/xyz/7/62/45/nearest	128x128x1 bytes=88018 tiles=6 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=b9486ef23a425658
+f32_4326_nodata/xyz/7/62/45/nearest	128x128x1 bytes=126999 tiles=6 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=b9486ef23a425658
 f32_4326_nodata/xyz/7/62/45/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=130c8d76851ca947
 f32_4326_nodata/xyz/7/62/45/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=69840e645c8a9af8
 f32_4326_nodata/xyz/7/62/45/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=93c32ab935319bdf
-f32_4326_nodata/xyz/8/120/86/nearest	128x128x1 bytes=11403 tiles=1 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=589146bcb1ba2325
+f32_4326_nodata/xyz/8/120/86/nearest	128x128x1 bytes=14618 tiles=1 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=589146bcb1ba2325
 f32_4326_nodata/xyz/8/120/86/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=589146bcb1ba2325
 f32_4326_nodata/xyz/8/120/86/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=589146bcb1ba2325
 f32_4326_nodata/xyz/8/120/86/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=Some(-9999.0) n=16384 valid=16384 digest=589146bcb1ba2325
@@ -163,39 +163,39 @@ u16_utm10/overview0	300x300 tile=64x64 across=5 down=5 scale=2 offsets=a87d2f03e
 u16_utm10/overview1	150x150 tile=64x64 across=3 down=3 scale=4 offsets=561ff14834f571ee counts=b78fe399cc538633
 u16_utm10/min_usable	Some(1)
 u16_utm10/hint	MinUsable(1)
-u16_utm10/xyz/10/163/395/nearest	128x128x1 bytes=49152 tiles=6 ovr=Some(1) nodata=None n=16384 valid=5484 digest=36b42c6f387f249e
-u16_utm10/xyz/10/163/395/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5484 digest=c20110b12d9271b0
-u16_utm10/xyz/10/163/395/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5484 digest=0db8283c3bb93adb
-u16_utm10/xyz/10/163/395/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5484 digest=6099d3fd414ccc49
+u16_utm10/xyz/10/163/395/nearest	128x128x1 bytes=49152 tiles=6 ovr=Some(1) nodata=None n=16384 valid=5484 digest=77a95e930bce028f
+u16_utm10/xyz/10/163/395/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5484 digest=448e4f432a24a7aa
+u16_utm10/xyz/10/163/395/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5484 digest=633c58e25d51bd43
+u16_utm10/xyz/10/163/395/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=5484 digest=fdeff36bd3d25a00
 u16_utm10/xyz/10/164/395/nearest	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=996506f8006395e8
-u16_utm10/xyz/10/164/395/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=542ed6da54d32ccd
-u16_utm10/xyz/10/164/395/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=6eb3ff453b382fcd
-u16_utm10/xyz/10/164/395/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=501d185e4ef545a7
+u16_utm10/xyz/10/164/395/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=70a519aea4d5d924
+u16_utm10/xyz/10/164/395/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=80255c7edd4392df
+u16_utm10/xyz/10/164/395/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=75 digest=48986829ce916e88
 u16_utm10/xyz/11/327/791/nearest	128x128x1 bytes=122880 tiles=15 ovr=Some(0) nodata=None n=16384 valid=8688 digest=af9b804e45bacf5d
-u16_utm10/xyz/11/327/791/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8688 digest=7b4f3459c8e9f29a
-u16_utm10/xyz/11/327/791/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8688 digest=b67c53be7fc67e6c
-u16_utm10/xyz/11/327/791/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8688 digest=42f00056bba6907f
+u16_utm10/xyz/11/327/791/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8688 digest=f2d2c426a82dfbb4
+u16_utm10/xyz/11/327/791/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8688 digest=cb333b8f2a01d401
+u16_utm10/xyz/11/327/791/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8688 digest=2fa91d5f6ed1a35c
 u16_utm10/xyz/11/328/791/nearest	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=355d7e065ac1b76c
-u16_utm10/xyz/11/328/791/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=b99099e35b583084
-u16_utm10/xyz/11/328/791/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=0985a3097146b63b
-u16_utm10/xyz/11/328/791/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=ed2cadb9c8a4fdfc
-u16_utm10/xyz/12/655/1582/nearest	128x128x1 bytes=204800 tiles=25 ovr=None nodata=None n=16384 valid=16384 digest=84409f581a3c52e5
-u16_utm10/xyz/12/655/1582/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=fe7e36af1648c29b
-u16_utm10/xyz/12/655/1582/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=e8b827e4a5333371
-u16_utm10/xyz/12/655/1582/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=97737fcf03f0f655
+u16_utm10/xyz/11/328/791/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=ddc889238dfbea8e
+u16_utm10/xyz/11/328/791/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=05a8fa93d6b46eeb
+u16_utm10/xyz/11/328/791/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=136 digest=b4fe18d6aec417de
+u16_utm10/xyz/12/655/1582/nearest	128x128x1 bytes=204800 tiles=25 ovr=None nodata=None n=16384 valid=16384 digest=cc53d3b8e43023f5
+u16_utm10/xyz/12/655/1582/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=7a7e53ec01662fbc
+u16_utm10/xyz/12/655/1582/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=e64a2e543c870d5f
+u16_utm10/xyz/12/655/1582/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=69e7aa3f655f330b
 u16_utm10/xyz/12/656/1582/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=4ccf5d5123a139b1
-u16_utm10/xyz/12/656/1582/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=ea79e3d5e35adb24
-u16_utm10/xyz/12/656/1582/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=67cfb2968387ef81
-u16_utm10/xyz/12/656/1582/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=411f5183da061057
+u16_utm10/xyz/12/656/1582/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=b0ccbb32180adfbe
+u16_utm10/xyz/12/656/1582/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=2af94bc6df5e269d
+u16_utm10/xyz/12/656/1582/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=512 digest=ed7410fe75780f17
 u16_utm10/xyz/13/1310/3165/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=d4c3fdf19fc394a6
-u16_utm10/xyz/13/1310/3165/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=72efc756bbb184d5
-u16_utm10/xyz/13/1310/3165/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=017ddcf1edbde34c
-u16_utm10/xyz/13/1310/3165/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=5a517b636de330b2
+u16_utm10/xyz/13/1310/3165/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=d8562090242e3810
+u16_utm10/xyz/13/1310/3165/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=a67fa9015cc8ea54
+u16_utm10/xyz/13/1310/3165/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=0e77b8aad6559aa7
 u16_utm10/xyz/13/1311/3165/nearest	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=18a42e7f2ea7e39f
-u16_utm10/xyz/13/1311/3165/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=2bd9357b534be175
-u16_utm10/xyz/13/1311/3165/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=3fd744e7d55760c1
-u16_utm10/xyz/13/1311/3165/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=28bfd47898fa3750
-u16_utm10/xyz/10/163/395/96x64	96x64x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=6144 valid=2057 digest=201b6e1650af7829
+u16_utm10/xyz/13/1311/3165/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=3f4fa88afc0b2073
+u16_utm10/xyz/13/1311/3165/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=63c588c39268696e
+u16_utm10/xyz/13/1311/3165/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=df403295f6ec1f46
+u16_utm10/xyz/10/163/395/96x64	96x64x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=6144 valid=2058 digest=f6227f711816856a
 u16_utm10/read_tile/0	n=4096 valid=4096 digest=3096daa55164ab96
 u16_utm10/read_tile/50	n=4096 valid=4096 digest=9704ca2293ff8c25
 u16_utm10/read_tile/99	n=4096 valid=4096 digest=fb956b9a6eb3b68d
@@ -207,40 +207,40 @@ u16_utm10/minmax_fast	0 4096
 u16_utm10/sample_lonlat/-122.4/37.8	[(0, 1152573440)]
 u16_utm10/sample_lonlat/-122.3/37.75	[]
 u16_utm10/sample_crs/32610/550000/4190000	[(0, 1160544256)]
-u16_utm10/reproject/4326	64x64x1 crs=4326 bounds=(-122.545733,37.783513,-122.339877,37.946709) nodata=None n=4096 valid=4096 digest=e63e1bf5476b2f21
-u16_utm10/reproject_streaming/4326	(0, 0):48x48:f0d7e63bbfc93f04 (1, 0):16x48:d8a62147c1a81dff (0, 1):48x16:764ac898f531c38b (1, 1):16x16:b198d034ede41fdd
-u16_odd_size_overviews/meta	1030x770 tile=64x64 across=17 down=13 bands=1 UInt16 Deflate predictor=1 crs=Some(3857) nodata=None tiled=true scale=Some([4863.472898735254, 4863.472898735254, 0.0]) tie=Some([0.0, 0.0, 0.0, -10018754.171394622, 5009377.085697312, 0.0]) offsets=2839337e6e7d02e3 counts=a7add024adab99ff
-u16_odd_size_overviews/overview0	515x385 tile=64x64 across=9 down=7 scale=2 offsets=23d75496ba3b8b0b counts=5b0ed15f4294bdae
-u16_odd_size_overviews/overview1	258x193 tile=64x64 across=5 down=4 scale=4 offsets=e93845aa102dccef counts=c6058ee0dca9d0f7
-u16_odd_size_overviews/overview2	129x97 tile=64x64 across=3 down=2 scale=8 offsets=6f91ad02899b4c21 counts=11ab07406638aa11
+u16_utm10/reproject/4326	64x64x1 crs=4326 bounds=(-122.545733,37.783513,-122.339877,37.946709) nodata=None n=4096 valid=4096 digest=649e1a1ce00e364f
+u16_utm10/reproject_streaming/4326	(0, 0):48x48:c2a7df1cbf7571ce (1, 0):16x48:8e68ac73c12fb804 (0, 1):48x16:12d6e322bc496a7b (1, 1):16x16:b198d034ede41fdd
+u16_odd_size_overviews/meta	1030x770 tile=64x64 across=17 down=13 bands=1 UInt16 Deflate predictor=1 crs=Some(3857) nodata=None tiled=true scale=Some([4863.472898735254, 4863.472898735254, 0.0]) tie=Some([0.0, 0.0, 0.0, -10018754.171394622, 5009377.085697312, 0.0]) offsets=78cadadce24f29fa counts=739035f3a50652c1
+u16_odd_size_overviews/overview0	515x385 tile=64x64 across=9 down=7 scale=2 offsets=f8f69720a50600b1 counts=98bef2f54f90d7b1
+u16_odd_size_overviews/overview1	258x193 tile=64x64 across=5 down=4 scale=4 offsets=0df3298aabd7559e counts=c3dd7ec9c2248f0c
+u16_odd_size_overviews/overview2	129x97 tile=64x64 across=3 down=2 scale=8 offsets=f2f3fab1124b3ba3 counts=5a9bec773b957eaa
 u16_odd_size_overviews/min_usable	Some(2)
 u16_odd_size_overviews/hint	MinUsable(2)
 u16_odd_size_overviews/ratio0	515x385 scale=2 x=2.000000000 y=2.000000000
 u16_odd_size_overviews/ratio1	258x193 scale=4 x=3.992248062 y=3.989637306
 u16_odd_size_overviews/ratio2	129x97 scale=8 x=7.984496124 y=7.938144330
-u16_odd_size_overviews/xyz/2/1/1/nearest	128x128x1 bytes=1859 tiles=2 ovr=Some(2) nodata=None n=16384 valid=3072 digest=4a108d8c11f94e33
-u16_odd_size_overviews/xyz/2/1/1/bilinear	128x128x1 bytes=217 tiles=1 ovr=Some(2) nodata=None n=16384 valid=3072 digest=6c05eae8a4c72849
+u16_odd_size_overviews/xyz/2/1/1/nearest	128x128x1 bytes=1860 tiles=2 ovr=Some(2) nodata=None n=16384 valid=3072 digest=4a108d8c11f94e33
+u16_odd_size_overviews/xyz/2/1/1/bilinear	128x128x1 bytes=215 tiles=1 ovr=Some(2) nodata=None n=16384 valid=3072 digest=6c05eae8a4c72849
 u16_odd_size_overviews/xyz/2/1/1/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=3072 digest=2d2e8d222d404cf8
 u16_odd_size_overviews/xyz/2/1/1/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=16384 valid=3072 digest=9d2cd9729d075f21
-u16_odd_size_overviews/xyz/3/2/3/nearest	128x128x1 bytes=22611 tiles=20 ovr=Some(1) nodata=None n=16384 valid=12288 digest=44a8dfaf7eb286ac
+u16_odd_size_overviews/xyz/3/2/3/nearest	128x128x1 bytes=22638 tiles=20 ovr=Some(1) nodata=None n=16384 valid=12288 digest=44a8dfaf7eb286ac
 u16_odd_size_overviews/xyz/3/2/3/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=12288 digest=5ed1fcd92bca0851
 u16_odd_size_overviews/xyz/3/2/3/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=12288 digest=312782b88fce2dc6
 u16_odd_size_overviews/xyz/3/2/3/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(1) nodata=None n=16384 valid=12288 digest=a8c6bc88dd927814
-u16_odd_size_overviews/xyz/4/4/6/nearest	128x128x1 bytes=50658 tiles=25 ovr=Some(0) nodata=None n=16384 valid=16384 digest=80dd43343e916f6f
+u16_odd_size_overviews/xyz/4/4/6/nearest	128x128x1 bytes=50688 tiles=25 ovr=Some(0) nodata=None n=16384 valid=16384 digest=80dd43343e916f6f
 u16_odd_size_overviews/xyz/4/4/6/bilinear	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=16384 digest=49de0bf358871d54
 u16_odd_size_overviews/xyz/4/4/6/bicubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=16384 digest=5719b83bd38a7e9c
 u16_odd_size_overviews/xyz/4/4/6/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=16384 digest=6dc8648bff49b04a
-u16_odd_size_overviews/xyz/4/5/7/nearest	128x128x1 bytes=15081 tiles=9 ovr=Some(0) nodata=None n=16384 valid=8064 digest=f7956c6075b83592
-u16_odd_size_overviews/xyz/4/5/7/bilinear	128x128x1 bytes=715 tiles=5 ovr=Some(0) nodata=None n=16384 valid=8064 digest=56b6f519a7630df4
-u16_odd_size_overviews/xyz/4/5/7/bicubic	128x128x1 bytes=8719 tiles=6 ovr=Some(0) nodata=None n=16384 valid=8064 digest=11f1efb001a08501
+u16_odd_size_overviews/xyz/4/5/7/nearest	128x128x1 bytes=15090 tiles=9 ovr=Some(0) nodata=None n=16384 valid=8064 digest=f7956c6075b83592
+u16_odd_size_overviews/xyz/4/5/7/bilinear	128x128x1 bytes=722 tiles=5 ovr=Some(0) nodata=None n=16384 valid=8064 digest=56b6f519a7630df4
+u16_odd_size_overviews/xyz/4/5/7/bicubic	128x128x1 bytes=8728 tiles=6 ovr=Some(0) nodata=None n=16384 valid=8064 digest=11f1efb001a08501
 u16_odd_size_overviews/xyz/4/5/7/cubic	128x128x1 bytes=0 tiles=0 ovr=Some(0) nodata=None n=16384 valid=8064 digest=680fe52210923b45
-u16_odd_size_overviews/xyz/5/8/12/nearest	128x128x1 bytes=50462 tiles=25 ovr=None nodata=None n=16384 valid=16384 digest=a3f1faea04d942cf
+u16_odd_size_overviews/xyz/5/8/12/nearest	128x128x1 bytes=50571 tiles=25 ovr=None nodata=None n=16384 valid=16384 digest=a3f1faea04d942cf
 u16_odd_size_overviews/xyz/5/8/12/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=22a54ecb12693751
 u16_odd_size_overviews/xyz/5/8/12/bicubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=162ee28f79b1e2a7
 u16_odd_size_overviews/xyz/5/8/12/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=3a91de2dd9d027af
-u16_odd_size_overviews/xyz/5/9/13/nearest	128x128x1 bytes=48526 tiles=24 ovr=None nodata=None n=16384 valid=16384 digest=fb9945ad53835c2c
+u16_odd_size_overviews/xyz/5/9/13/nearest	128x128x1 bytes=48641 tiles=24 ovr=None nodata=None n=16384 valid=16384 digest=fb9945ad53835c2c
 u16_odd_size_overviews/xyz/5/9/13/bilinear	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=c5826dfac0fab3ae
-u16_odd_size_overviews/xyz/5/9/13/bicubic	128x128x1 bytes=16113 tiles=8 ovr=None nodata=None n=16384 valid=16384 digest=86a5d551129b8187
+u16_odd_size_overviews/xyz/5/9/13/bicubic	128x128x1 bytes=16155 tiles=8 ovr=None nodata=None n=16384 valid=16384 digest=86a5d551129b8187
 u16_odd_size_overviews/xyz/5/9/13/cubic	128x128x1 bytes=0 tiles=0 ovr=None nodata=None n=16384 valid=16384 digest=b3c88c23e13995c6
 u16_odd_size_overviews/xyz/2/1/1/96x64	96x64x1 bytes=0 tiles=0 ovr=Some(2) nodata=None n=6144 valid=1152 digest=bedde8bcc63e04bb
 u16_odd_size_overviews/read_tile/0	n=4096 valid=4096 digest=4f1123961d32abd0
@@ -253,6 +253,6 @@ u16_odd_size_overviews/read_overview_tile/1/19	n=4096 valid=4096 digest=403cbf23
 u16_odd_size_overviews/read_overview_tile/2/0	n=4096 valid=4096 digest=4721f2138d04464d
 u16_odd_size_overviews/read_overview_tile/2/5	n=4096 valid=4096 digest=22098f489e5617b3
 u16_odd_size_overviews/minmax_fast	0 3993
-corrupt_tile/avoiding	64x64x1 bytes=229 tiles=1 ovr=None nodata=None n=4096 valid=4096 digest=78f9a712cc583338
+corrupt_tile/avoiding	64x64x1 bytes=244 tiles=1 ovr=None nodata=None n=4096 valid=4096 digest=78f9a712cc583338
 corrupt_tile/err_prefix	Failed to read source tile 5 (overview None)
 corrupt_tile/read_tile_err	true

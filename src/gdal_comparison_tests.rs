@@ -69,17 +69,19 @@ fn compare(ours: &[f32], gdal: &[f32]) -> Comparison {
 }
 
 async fn run(name: &str, path: &str, bounds: &BoundingBox, method: ResamplingMethod, alg: &str) -> Option<Comparison> {
-    run_at(name, path, bounds, method, alg, None).await
+    run_with(name, path, bounds, method, alg, None, 0.0).await
 }
 
-/// [`run`] for a window that both cogrs and GDAL serve from overview `expected_overview`.
-async fn run_at(
+/// Warps with `gdalwarp -et 0` (exact transform) and extracts with `transform_error` (`0.0`:
+/// exact too, so only the resampling conventions are compared) from the expected source level.
+async fn run_with(
     name: &str,
     path: &str,
     bounds: &BoundingBox,
     method: ResamplingMethod,
     alg: &str,
     expected_overview: Option<usize>,
+    transform_error: f64,
 ) -> Option<Comparison> {
     // Compares band 0 (gdalwarp's output band 1).
     if !Path::new(path).exists() {
@@ -91,8 +93,15 @@ async fn run_at(
         return None;
     };
     let reader = CogReader::open(path).expect("open");
-    let tile =
-        TileExtractor::new(&reader).bounds(*bounds).size(256).resampling(method).bands(&[0]).extract().await.expect("extract");
+    let tile = TileExtractor::new(&reader)
+        .bounds(*bounds)
+        .size(256)
+        .resampling(method)
+        .bands(&[0])
+        .transform_error(transform_error)
+        .extract()
+        .await
+        .expect("extract");
     assert_eq!(tile.overview_used, expected_overview, "{name}: unexpected source level");
     let c = compare(&tile.pixels, &reference);
     println!(
@@ -234,6 +243,32 @@ async fn bilinear_downsampling_matches_gdalwarp_through_a_rotated_grid() {
     assert_eq!(c.validity_mismatch, 0);
     assert!(c.identical_pct > 99.0, "{:.2}% identical", c.identical_pct);
     assert!(c.max_abs_diff < 0.01, "max |diff| {}", c.max_abs_diff);
+}
+
+/// The default approximate transform ([`crate::DEFAULT_TRANSFORM_ERROR`] = 0.01 source px) on
+/// the rotated grid, against `gdalwarp -et 0`: nearest picks the same source pixel except within
+/// 0.01 px of a rounding boundary, and bilinear moves by at most 0.01 px times the gradient (the
+/// raster's is up to 48 per pixel). Measured: nearest 99.98% identical; bilinear mean |diff|
+/// 0.003, max 0.5.
+#[tokio::test]
+async fn approximate_transform_stays_within_its_error_bound_on_a_rotated_grid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = utm10_raster(dir.path(), 800);
+    let bounds = utm10_window(800);
+    let approx = crate::DEFAULT_TRANSFORM_ERROR;
+    let Some(near) = run_with("synthetic utm10 near approx", &path, &bounds, ResamplingMethod::Nearest, "near", None, approx).await
+    else {
+        return;
+    };
+    assert_eq!(near.validity_mismatch, 0);
+    assert!(near.identical_pct > 99.9, "{:.2}% identical", near.identical_pct);
+    let Some(bil) = run_with("synthetic utm10 bilinear approx", &path, &bounds, ResamplingMethod::Bilinear, "bilinear", None, approx).await
+    else {
+        return;
+    };
+    assert_eq!(bil.validity_mismatch, 0);
+    assert!(bil.mean_abs_diff < 0.01, "mean |diff| {:.4}", bil.mean_abs_diff);
+    assert!(bil.max_abs_diff < 48.0 * approx * 1.5, "max |diff| {}", bil.max_abs_diff);
 }
 
 // ---------------------------------------------------------------------------------------------

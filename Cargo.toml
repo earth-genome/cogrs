@@ -25,7 +25,7 @@ image = "0.25.6"
 
 # Compression
 weezl = "0.1.10"
-flate2 = "1.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 zstd = "0.13"
 
 # Coordinate transforms
@@ -70,3 +70,9 @@ gdal = { git = "https://github.com/georust/gdal", features = ["bindgen"] }  # Us
 [[bench]]
 name = "tile_extraction"
 harness = false
+
+# Applies only when this crate is the build root (benches, examples, tests), not when
+# it is a dependency of another crate.
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -24,6 +24,8 @@ use crate::tile_cache;
 use crate::tiff_utils::AnyResult;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -423,6 +425,29 @@ pub struct CogReader {
     hint: OverviewQualityHint,
     /// Where the reader came from, for remote sources opened through the header cache.
     origin: Option<Arc<ReaderOrigin>>,
+    /// Shared all-NaN buffers, one per tile geometry `(width, height, bands)`.
+    sparse_tiles: Arc<SparseTileCache>,
+}
+
+type SparseByShape = HashMap<(usize, usize, usize), Arc<Vec<f32>>>;
+
+/// One all-NaN tile per geometry, shared across clones (cheap `Arc` clones of the reader).
+struct SparseTileCache {
+    by_shape: Mutex<SparseByShape>,
+}
+
+impl SparseTileCache {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { by_shape: Mutex::new(HashMap::new()) })
+    }
+
+    fn tile(&self, width: usize, height: usize, bands: usize) -> Arc<Vec<f32>> {
+        self.by_shape
+            .lock()
+            .entry((width, height, bands))
+            .or_insert_with(|| Arc::new(vec![f32::NAN; width * height * bands]))
+            .clone()
+    }
 }
 
 /// Opens a [`CogReader`] with explicit settings; start with [`CogReader::builder`].
@@ -763,7 +788,17 @@ impl CogReader {
             Some(n) => OverviewQualityHint::MinUsable(n),
             None => OverviewQualityHint::NoneUsable,
         };
-        Self { async_io: reader, sync_io, metadata, overviews, min_usable_overview, cache_id, hint, origin: None }
+        Self {
+            async_io: reader,
+            sync_io,
+            metadata,
+            overviews,
+            min_usable_overview,
+            cache_id,
+            hint,
+            origin: None,
+            sparse_tiles: SparseTileCache::new(),
+        }
     }
 
     /// Source identifier (path or URL).
@@ -810,6 +845,7 @@ impl CogReader {
             cache_id,
             hint,
             origin: None,
+            sparse_tiles: SparseTileCache::new(),
         }
     }
 
@@ -1029,29 +1065,42 @@ impl CogReader {
 
     /// All-NaN data for a sparse tile.
     pub(crate) fn sparse_tile(&self, span: &TileSpan) -> Arc<Vec<f32>> {
-        Arc::new(vec![f32::NAN; span.width * span.height * self.metadata.bands])
+        self.sparse_tiles.tile(span.width, span.height, self.metadata.bands)
     }
 
     /// Decompress, un-predict and convert a tile's compressed bytes to `f32` samples (CPU only).
     pub(crate) fn decode_tile(&self, span: &TileSpan, compressed: &[u8]) -> AnyResult<Vec<f32>> {
         let meta = &*self.metadata;
-        let mut samples = decompress_tile(
-            compressed,
-            meta.compression,
-            span.width,
-            span.height,
-            meta.bands,
-            meta.data_type.bytes_per_sample(),
-        )?;
-        crate::predictor::undo_predictor(
-            &mut samples,
-            meta.predictor,
-            span.width,
-            meta.bands,
-            meta.data_type.bytes_per_sample(),
-            meta.little_endian,
-        )?;
-        Ok(convert_to_f32(&samples, meta.data_type, meta.little_endian))
+        let bytes_per_sample = meta.data_type.bytes_per_sample();
+        let expected_size = span.width * span.height * meta.bands * bytes_per_sample;
+        if bytes_per_sample == 4 {
+            return decode_tile_4byte(compressed, span, meta);
+        }
+        // Uncompressed + no predictor: convert from the source slice (no intermediate copy).
+        if meta.compression == Compression::None && meta.predictor <= 1 && compressed.len() >= expected_size {
+            return Ok(convert_to_f32(&compressed[..expected_size], meta.data_type, meta.little_endian));
+        }
+        DECODE_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            decompress_tile_into(
+                &mut scratch,
+                compressed,
+                meta.compression,
+                span.width,
+                span.height,
+                meta.bands,
+                bytes_per_sample,
+            )?;
+            crate::predictor::undo_predictor(
+                &mut scratch,
+                meta.predictor,
+                span.width,
+                meta.bands,
+                bytes_per_sample,
+                meta.little_endian,
+            )?;
+            Ok(convert_to_f32(&scratch, meta.data_type, meta.little_endian))
+        })
     }
 
     /// Tile from the process-wide decompressed-tile cache.
@@ -1095,9 +1144,9 @@ impl CogReader {
     /// # Errors
     /// Returns an error if the overview or tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
-    pub fn read_overview_tile(&self, overview_idx: usize, tile_index: usize) -> AnyResult<Vec<f32>> {
+    pub fn read_overview_tile(&self, overview_idx: usize, tile_index: usize) -> AnyResult<Arc<Vec<f32>>> {
         let (data, _) = self.read_tile_sync(TileRef { overview: Some(overview_idx), index: tile_index })?;
-        Ok((*data).clone())
+        Ok(data)
     }
 
     /// Read a single tile's raw data and decompress
@@ -1106,9 +1155,9 @@ impl CogReader {
     /// # Errors
     /// Returns an error if the tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
-    pub fn read_tile(&self, tile_index: usize) -> AnyResult<Vec<f32>> {
+    pub fn read_tile(&self, tile_index: usize) -> AnyResult<Arc<Vec<f32>>> {
         let (data, _) = self.read_tile_sync(TileRef { overview: None, index: tile_index })?;
-        Ok((*data).clone())
+        Ok(data)
     }
 
     /// Read a single tile and return both data and bytes fetched from source
@@ -1118,9 +1167,8 @@ impl CogReader {
     /// # Errors
     /// Returns an error if the tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
-    pub fn read_tile_with_bytes(&self, tile_index: usize) -> AnyResult<(Vec<f32>, usize)> {
-        let (data, bytes) = self.read_tile_sync(TileRef { overview: None, index: tile_index })?;
-        Ok(((*data).clone(), bytes))
+    pub fn read_tile_with_bytes(&self, tile_index: usize) -> AnyResult<(Arc<Vec<f32>>, usize)> {
+        self.read_tile_sync(TileRef { overview: None, index: tile_index })
     }
 
     /// Read an overview tile and return both data and bytes fetched from source
@@ -1130,9 +1178,8 @@ impl CogReader {
     /// # Errors
     /// Returns an error if the overview or tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
-    pub fn read_overview_tile_with_bytes(&self, overview_idx: usize, tile_index: usize) -> AnyResult<(Vec<f32>, usize)> {
-        let (data, bytes) = self.read_tile_sync(TileRef { overview: Some(overview_idx), index: tile_index })?;
-        Ok(((*data).clone(), bytes))
+    pub fn read_overview_tile_with_bytes(&self, overview_idx: usize, tile_index: usize) -> AnyResult<(Arc<Vec<f32>>, usize)> {
+        self.read_tile_sync(TileRef { overview: Some(overview_idx), index: tile_index })
     }
 
     /// Async counterpart of [`CogReader::read_tile`]: the fetch is awaited and decoding runs on
@@ -1141,9 +1188,9 @@ impl CogReader {
     /// # Errors
     /// Returns an error if the tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
-    pub async fn read_tile_async(&self, tile_index: usize) -> AnyResult<Vec<f32>> {
+    pub async fn read_tile_async(&self, tile_index: usize) -> AnyResult<Arc<Vec<f32>>> {
         let (data, _) = self.read_tile_async_ref(TileRef { overview: None, index: tile_index }).await?;
-        Ok((*data).clone())
+        Ok(data)
     }
 
     /// Async counterpart of [`CogReader::read_overview_tile`].
@@ -1151,11 +1198,11 @@ impl CogReader {
     /// # Errors
     /// Returns an error if the overview or tile index is out of range, if reading tile data fails,
     /// or if decompression fails.
-    pub async fn read_overview_tile_async(&self, overview_idx: usize, tile_index: usize) -> AnyResult<Vec<f32>> {
+    pub async fn read_overview_tile_async(&self, overview_idx: usize, tile_index: usize) -> AnyResult<Arc<Vec<f32>>> {
         let (data, _) = self
             .read_tile_async_ref(TileRef { overview: Some(overview_idx), index: tile_index })
             .await?;
-        Ok((*data).clone())
+        Ok(data)
     }
 
     /// Sample a single pixel value
@@ -1287,7 +1334,7 @@ impl CogReader {
                 self.read_tile(tile_idx)?
             };
 
-            for &val in &tile_data {
+            for &val in tile_data.iter() {
                 // Skip NaN and nodata values
                 if val.is_nan() {
                     continue;
@@ -2198,93 +2245,145 @@ fn read_gdal_nodata(
 // Decompression and data conversion
 // ============================================================================
 
-fn decompress_tile(
+thread_local! {
+    /// Reused decompressed-byte buffer for sample widths other than 4, so the 4 MiB page-fault
+    /// cost is paid once per thread rather than per tile.
+    static DECODE_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Exclusive byte view of `samples`. The caller must only read those bytes as `f32` after
+/// they have been written and converted in place.
+fn f32_as_bytes_mut(samples: &mut [f32]) -> &mut [u8] {
+    // SAFETY: `f32` is a 4-byte plain-old-data value; this exclusive borrow lasts only while
+    // we inflate, undo the predictor, and convert those same bytes in place.
+    unsafe { std::slice::from_raw_parts_mut(samples.as_mut_ptr().cast::<u8>(), samples.len().saturating_mul(4)) }
+}
+
+fn decode_tile_4byte(compressed: &[u8], span: &TileSpan, meta: &CogMetadata) -> AnyResult<Vec<f32>> {
+    let samples = span.width * span.height * meta.bands;
+    let mut out = vec![0f32; samples];
+    let bytes = f32_as_bytes_mut(&mut out);
+    decompress_into_slice(bytes, compressed, meta.compression)?;
+    crate::predictor::undo_predictor(
+        bytes,
+        meta.predictor,
+        span.width,
+        meta.bands,
+        4,
+        meta.little_endian,
+    )?;
+    convert_4byte_in_place(&mut out, meta.data_type, meta.little_endian);
+    Ok(out)
+}
+
+/// File-endian 4-byte samples already sitting in `out`'s storage, as native `f32`.
+#[allow(clippy::cast_precision_loss)] // Int32/UInt32 → f32 is the documented conversion
+fn convert_4byte_in_place(out: &mut [f32], data_type: CogDataType, little_endian: bool) {
+    if !little_endian {
+        for chunk in f32_as_bytes_mut(out).as_chunks_mut::<4>().0 {
+            chunk.swap(0, 3);
+            chunk.swap(1, 2);
+        }
+    }
+    match data_type {
+        CogDataType::Float32 => {}
+        CogDataType::UInt32 => {
+            for x in out.iter_mut() {
+                *x = x.to_bits() as f32;
+            }
+        }
+        CogDataType::Int32 => {
+            for x in out.iter_mut() {
+                *x = (x.to_bits() as i32) as f32;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn copy_or_pad(dest: &mut [u8], src: &[u8]) {
+    let n = src.len().min(dest.len());
+    dest[..n].copy_from_slice(&src[..n]);
+    if n < dest.len() {
+        dest[n..].fill(0);
+    }
+}
+
+fn decompress_image_raw(compressed: &[u8], format: image::ImageFormat) -> AnyResult<Vec<u8>> {
+    use image::ImageReader;
+    use std::io::Cursor;
+    let reader = ImageReader::with_format(Cursor::new(compressed), format);
+    let img = reader.decode().map_err(|e| format!("{format:?} decode error: {e}"))?;
+    Ok(match img {
+        image::DynamicImage::ImageRgb8(rgb) => rgb.into_raw(),
+        image::DynamicImage::ImageRgba8(rgba) => rgba.into_raw(),
+        image::DynamicImage::ImageLuma8(gray) => gray.into_raw(),
+        image::DynamicImage::ImageLumaA8(gray_alpha) => gray_alpha.into_raw(),
+        other => other.to_rgb8().into_raw(),
+    })
+}
+
+fn decompress_into_slice(dest: &mut [u8], compressed: &[u8], compression: Compression) -> AnyResult<()> {
+    use std::io::Read;
+    match compression {
+        Compression::None => copy_or_pad(dest, compressed),
+        Compression::Deflate => {
+            let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+            let mut written = 0;
+            while written < dest.len() {
+                let n = decoder.read(&mut dest[written..])?;
+                if n == 0 {
+                    dest[written..].fill(0);
+                    break;
+                }
+                written += n;
+            }
+        }
+        Compression::Lzw => {
+            let mut decoder = weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
+            copy_or_pad(dest, &decoder.decode(compressed)?);
+        }
+        Compression::Jpeg => copy_or_pad(dest, &decompress_image_raw(compressed, image::ImageFormat::Jpeg)?),
+        Compression::Zstd => copy_or_pad(dest, &zstd::stream::decode_all(compressed)?),
+        Compression::Webp => copy_or_pad(dest, &decompress_image_raw(compressed, image::ImageFormat::WebP)?),
+    }
+    Ok(())
+}
+
+fn decompress_tile_into(
+    dest: &mut Vec<u8>,
     compressed: &[u8],
     compression: Compression,
     tile_width: usize,
     tile_height: usize,
     bands: usize,
     bytes_per_sample: usize,
-) -> AnyResult<Vec<u8>> {
+) -> AnyResult<()> {
+    use std::io::Read;
     let expected_size = tile_width * tile_height * bands * bytes_per_sample;
-
+    dest.clear();
+    dest.reserve(expected_size);
     match compression {
         Compression::None => {
             if compressed.len() >= expected_size {
-                Ok(compressed[..expected_size].to_vec())
+                dest.extend_from_slice(&compressed[..expected_size]);
             } else {
-                // Pad with zeros
-                let mut result = compressed.to_vec();
-                result.resize(expected_size, 0);
-                Ok(result)
+                dest.extend_from_slice(compressed);
+                dest.resize(expected_size, 0);
             }
         }
         Compression::Deflate => {
-            use std::io::Read;
-            let mut decoder = flate2::read::ZlibDecoder::new(compressed);
-            let mut decompressed = Vec::with_capacity(expected_size);
-            decoder.read_to_end(&mut decompressed)?;
-            Ok(decompressed)
+            flate2::read::ZlibDecoder::new(compressed).read_to_end(dest)?;
         }
         Compression::Lzw => {
-            // Use weezl for LZW decompression
             let mut decoder = weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
-            let decompressed = decoder.decode(compressed)?;
-            Ok(decompressed)
+            dest.extend_from_slice(&decoder.decode(compressed)?);
         }
-        Compression::Jpeg => {
-            // JPEG decompression using the image crate
-            use image::ImageReader;
-            use std::io::Cursor;
-
-            let cursor = Cursor::new(compressed);
-            let reader = ImageReader::with_format(cursor, image::ImageFormat::Jpeg);
-            let img = reader.decode()
-                .map_err(|e| format!("JPEG decode error: {e}"))?;
-
-            // Convert to raw bytes based on the image type
-            let raw = match img {
-                image::DynamicImage::ImageRgb8(rgb) => rgb.into_raw(),
-                image::DynamicImage::ImageRgba8(rgba) => rgba.into_raw(),
-                image::DynamicImage::ImageLuma8(gray) => gray.into_raw(),
-                image::DynamicImage::ImageLumaA8(gray_alpha) => gray_alpha.into_raw(),
-                other => {
-                    // Convert other formats to RGB8
-                    other.to_rgb8().into_raw()
-                }
-            };
-
-            Ok(raw)
-        }
-        Compression::Zstd => {
-            let decompressed = zstd::stream::decode_all(compressed)?;
-            Ok(decompressed)
-        }
-        Compression::Webp => {
-            // WebP decompression using the image crate
-            use image::ImageReader;
-            use std::io::Cursor;
-
-            let cursor = Cursor::new(compressed);
-            let reader = ImageReader::with_format(cursor, image::ImageFormat::WebP);
-            let img = reader.decode()
-                .map_err(|e| format!("WebP decode error: {e}"))?;
-
-            // Convert to raw bytes based on the image type
-            let raw = match img {
-                image::DynamicImage::ImageRgb8(rgb) => rgb.into_raw(),
-                image::DynamicImage::ImageRgba8(rgba) => rgba.into_raw(),
-                image::DynamicImage::ImageLuma8(gray) => gray.into_raw(),
-                image::DynamicImage::ImageLumaA8(gray_alpha) => gray_alpha.into_raw(),
-                other => {
-                    // Convert other formats to RGB8
-                    other.to_rgb8().into_raw()
-                }
-            };
-
-            Ok(raw)
-        }
+        Compression::Jpeg => dest.extend_from_slice(&decompress_image_raw(compressed, image::ImageFormat::Jpeg)?),
+        Compression::Zstd => dest.extend_from_slice(&zstd::stream::decode_all(compressed)?),
+        Compression::Webp => dest.extend_from_slice(&decompress_image_raw(compressed, image::ImageFormat::WebP)?),
     }
+    Ok(())
 }
 
 /// Samples of `data_type` in the given byte order, as `f32`.
@@ -2326,6 +2425,22 @@ fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn four_byte_in_place_matches_convert_to_f32() {
+        let data: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(17)).collect();
+        for little_endian in [true, false] {
+            for data_type in [CogDataType::Float32, CogDataType::Int32, CogDataType::UInt32] {
+                let expected = convert_to_f32(&data, data_type, little_endian);
+                let mut got = vec![0f32; data.len() / 4];
+                f32_as_bytes_mut(&mut got).copy_from_slice(&data);
+                convert_4byte_in_place(&mut got, data_type, little_endian);
+                for (a, b) in expected.iter().zip(&got) {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{data_type:?} le={little_endian}");
+                }
+            }
+        }
+    }
 
     /// Debug test comparing our predictor 3 implementation with tiff crate
     #[test]
@@ -2893,7 +3008,9 @@ mod tests {
             .expect("Failed to encode WebP");
 
         // Decompress using our function
-        let result = decompress_tile(
+        let mut result = Vec::new();
+        decompress_tile_into(
+            &mut result,
             webp_data.get_ref(),
             Compression::Webp,
             2,  // tile_width
