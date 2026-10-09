@@ -2,6 +2,14 @@
 
 Pure Rust COG (Cloud Optimized `GeoTIFF`) reader library.
 
+Published on crates.io as [`cogrs-eg`](https://crates.io/crates/cogrs-eg): Earth Genome's fork
+of [evanjt/cogrs](https://github.com/evanjt/cogrs). The library is still imported as `cogrs`:
+
+```toml
+[dependencies]
+cogrs-eg = "0.2"
+```
+
 ## Features
 
 - [Local, HTTP, and S3 sources](#sources)
@@ -297,4 +305,5 @@ Supported formats are detected automatically:
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE). Originally written by Evan Thomas
+([evanjt/cogrs](https://github.com/evanjt/cogrs)).

@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Published on crates.io as `cogrs-eg` (Earth Genome's fork of `evanjt/cogrs`); the library is
+  still imported as `cogrs`. Added the MIT `LICENSE` file
 - Reprojection from a source CRS other than the output CRS or WGS84 (UTM and other projected
   sources) transforms a 16 px grid of output pixels exactly and interpolates between its nodes,
   splitting any grid cell that would err by more than `transform_error` (default 0.01 source

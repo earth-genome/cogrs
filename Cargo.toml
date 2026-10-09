@@ -1,12 +1,12 @@
 [package]
-name = "cogrs"
+name = "cogrs-eg"
 version = "0.2.0"
 edition = "2024"
-description = "Tools for creating COG-based tilers"
+description = "Tools for creating COG-based tilers (Earth Genome fork of cogrs)"
 license = "MIT"
-repository = "https://github.com/evanjt/cogrs"
-documentation = "https://docs.rs/cogrs"
-homepage = "https://github.com/evanjt/cogrs"
+repository = "https://github.com/earth-genome/cogrs"
+documentation = "https://docs.rs/cogrs-eg"
+homepage = "https://github.com/earth-genome/cogrs"
 readme = "README.md"
 keywords = ["cog", "geotiff", "tiff", "raster", "geo"]
 categories = ["science::geo", "encoding"]
